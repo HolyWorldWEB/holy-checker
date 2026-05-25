@@ -22,12 +22,13 @@ jobs:
         id: tag
         shell: pwsh
         run: |
-          if ("${{ github.event.inputs.tag }}" -ne "") {
-            $tag = "${{ github.event.inputs.tag }}"
+          $inputTag = "${{ github.event.inputs.tag }}"
+          if ($inputTag -ne "") {
+            $tag = $inputTag
           } else {
             # Найти последний тег, иначе начать с v1.0.0
             $lastTag = git describe --tags --abbrev=0 2>$null
-            if (-not $lastTag) {
+            if ($LASTEXITCODE -ne 0) {
               $tag = "v1.0.0"
             } else {
               # Автоинкремент patch-версии
