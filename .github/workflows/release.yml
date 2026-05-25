@@ -27,8 +27,14 @@ jobs:
             $tag = $inputTag
           } else {
             # Найти последний тег, иначе начать с v1.0.0
-            $lastTag = git describe --tags --abbrev=0 2>$null
-            if ($LASTEXITCODE -ne 0) {
+            # Используем try/catch, чтобы LASTEXITCODE не сломал шаг
+            $lastTag = $null
+            try {
+              $lastTag = git describe --tags --abbrev=0 2>$null
+            } catch {
+              # нет тегов — игнорируем
+            }
+            if (-not $lastTag) {
               $tag = "v1.0.0"
             } else {
               # Автоинкремент patch-версии
@@ -39,6 +45,7 @@ jobs:
           }
           Write-Host "tag=$tag"
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          $LASTEXITCODE = 0
 
       - name: Generate changelog
         id: changelog
