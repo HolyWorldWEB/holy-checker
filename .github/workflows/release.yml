@@ -52,22 +52,30 @@ jobs:
         shell: pwsh
         run: |
           $lastTag = git describe --tags --abbrev=0 2>$null
+          if ($LASTEXITCODE -ne 0) { $lastTag = $null }
+
+          # Последние 10 коммитов
           if ($lastTag) {
-            $log = git log "$lastTag..HEAD" --pretty=format:"- %s (%h)" --no-merges
+            $log = git log "$lastTag..HEAD" --pretty=format:"- %s (%h)" --no-merges --max-count=10
+            $compareUrl = "https://github.com/${{ github.repository }}/compare/${lastTag}...${{ steps.tag.outputs.tag }}"
           } else {
-            $log = git log --pretty=format:"- %s (%h)" --no-merges
+            $log = git log --pretty=format:"- %s (%h)" --no-merges --max-count=10
+            $compareUrl = "https://github.com/${{ github.repository }}/commits/${{ steps.tag.outputs.tag }}"
           }
 
           if (-not $log) {
             $log = "- Initial release"
           }
 
-          # Экранируем для GITHUB_OUTPUT (multiline)
-          $log = $log -replace '%','%25'
-          $log = $log -replace "`n",'%0A'
-          $log = $log -replace "`r",'%0D'
+          echo "lastTag=$lastTag" >> $env:GITHUB_OUTPUT
+          echo "compareUrl=$compareUrl" >> $env:GITHUB_OUTPUT
 
-          echo "log=$log" >> $env:GITHUB_OUTPUT
+          # Multiline output через heredoc (EOF) — сохраняет реальные переносы строк
+          echo "log<<EOF" >> $env:GITHUB_OUTPUT
+          $log
+          echo "EOF" >> $env:GITHUB_OUTPUT
+
+          $LASTEXITCODE = 0
 
       - name: Add MSVC to PATH
         uses: ilammy/msvc-dev-cmd@v1
@@ -80,12 +88,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: Holy Checker ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           body: |
-            ## Holy Checker ${{ steps.tag.outputs.tag }}
-
-            ### Коммиты с момента последнего релиза
             ${{ steps.changelog.outputs.log }}
+
+            ---
+            **[Полный список изменений](${{ steps.changelog.outputs.compareUrl }})**
 
             ### Инструкция по запуску
 
