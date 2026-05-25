@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for release (e.g., v1.0.0). Оставьте пустым — будет взят из последнего коммита по версии файла или автоинкремент.'
+        required: false
+        default: ''
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.tag }}" -ne "") {
+            $tag = "${{ github.event.inputs.tag }}"
+          } else {
+            # Найти последний тег, иначе начать с v1.0.0
+            $lastTag = git describe --tags --abbrev=0 2>$null
+            if (-not $lastTag) {
+              $tag = "v1.0.0"
+            } else {
+              # Автоинкремент patch-версии
+              $parts = $lastTag -replace '^v','' -split '\.'
+              $patch = [int]$parts[2] + 1
+              $tag = "v$($parts[0]).$($parts[1]).$patch"
+            }
+          }
+          Write-Host "tag=$tag"
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        shell: pwsh
+        run: |
+          $lastTag = git describe --tags --abbrev=0 2>$null
+          if ($lastTag) {
+            $log = git log "$lastTag..HEAD" --pretty=format:"- %s (%h)" --no-merges
+          } else {
+            $log = git log --pretty=format:"- %s (%h)" --no-merges
+          }
+
+          if (-not $log) {
+            $log = "- Initial release"
+          }
+
+          # Экранируем для GITHUB_OUTPUT (multiline)
+          $log = $log -replace '%','%25'
+          $log = $log -replace "`n",'%0A'
+          $log = $log -replace "`r",'%0D'
+
+          echo "log=$log" >> $env:GITHUB_OUTPUT
+
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build HolyCheck.exe
+        run: |
+          cl /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE main.cpp /Fe:HolyCheck.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shell32.lib shlwapi.lib winhttp.lib wininet.lib ole32.lib oleaut32.lib uuid.lib dwmapi.lib gdiplus.lib advapi32.lib
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Holy Checker ${{ steps.tag.outputs.tag }}
+          body: |
+            ## Holy Checker ${{ steps.tag.outputs.tag }}
+
+            ### Коммиты с момента последнего релиза
+            ${{ steps.changelog.outputs.log }}
+
+            ### Инструкция по запуску
+
+            1. Скачайте `HolyCheck.exe` из этого релиза (секция **Assets** ниже).
+            2. Запустите `HolyCheck.exe` — установка не требуется.
+            3. Выберите нужную вкладку (Мл.сотрудник, Сотрудник, Вед.сотрудник, Доп.программы).
+            4. Нажмите на отдельную программу или кнопку **Скачать все**.
+            5. Дождитесь окончания загрузки.
+
+            Скачанные файлы сохраняются в папки, которые создаёт программа.
+
+            ### Требования для запуска
+
+            - **OS**: Windows 10 или Windows 11
+            - **Интернет**: подключение к сети
+
+            Для самой программы не требуется установка Visual Studio или дополнительных библиотек.
+          draft: false
+          prerelease: false
+          files: HolyCheck.exe
