@@ -60,7 +60,7 @@ Holy Checker — Windows-утилита для быстрого скачиван
 Откройте `Developer Command Prompt for VS` или терминал VS Code, где доступна команда `cl.exe`, и выполните:
 
 ```bat
-cl /std:c++17 /EHsc /O2 /MT /utf-8 /DUNICODE /D_UNICODE main.cpp /Fe:HolyCheck.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shell32.lib shlwapi.lib winhttp.lib wininet.lib ole32.lib oleaut32.lib uuid.lib dwmapi.lib gdiplus.lib advapi32.lib
+cl /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE main.cpp /Fe:HolyCheck.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shell32.lib shlwapi.lib winhttp.lib wininet.lib ole32.lib oleaut32.lib uuid.lib dwmapi.lib gdiplus.lib advapi32.lib
 ```
 
 После сборки появится файл:

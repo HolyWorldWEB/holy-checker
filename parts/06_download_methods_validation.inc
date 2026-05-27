@@ -25,6 +25,9 @@ static unsigned long long GetMinCompleteExeSizeForName(const std::wstring& itemN
         (lower.find(L"journal") != std::wstring::npos && lower.find(L"trace") != std::wstring::npos))
         return 100ull * 1024ull;
 
+    if (lower.find(L"recuva") != std::wstring::npos)
+        return 2ull * 1024ull * 1024ull;
+
     return 4096ull;
 }
 
@@ -46,13 +49,9 @@ static bool TryFinalizeAbortedPartFile(
 
     std::wstring lowerTarget = ToLower(targetPath);
 
-    if (EndsWithI(lowerTarget, L".exe"))
+    if (EndsWithI(lowerTarget, L".exe") || EndsWithI(lowerTarget, L".msi"))
     {
-        if (!StartsWithBytes(head, { 0x4D, 0x5A }))
-            return false;
-
-        if (partSize < GetMinCompleteExeSizeForName(itemName))
-            return false;
+        return false;
     }
     else if (EndsWithI(lowerTarget, L".zip") || EndsWithI(lowerTarget, L".jar"))
     {
@@ -132,17 +131,17 @@ static unsigned long long GetMethodMinSpeedBps(const DownloadItem& item)
 static DWORD GetMethodLowSpeedWindowMs(const DownloadItem& item)
 {
     if (IsFastSpeedSwitchItem(item))
-        return 8000;
+        return 2500;
 
-    return 15000;
+    return 3000;
 }
 
 static DWORD GetMethodNoProgressAbortMs(const DownloadItem& item)
 {
     if (IsFastSpeedSwitchItem(item))
-        return 12000;
+        return 3000;
 
-    return 30000;
+    return 3500;
 }
 
 static unsigned long long GetPowerShellMinSpeedBps(const DownloadItem& item)
@@ -307,13 +306,13 @@ static bool DownloadWithCurlFallback(
 
     std::wstring curlExe = GetSystemToolPath(L"curl.exe");
     DWORD maxTimeSeconds = std::max<DWORD>(180, timeoutMs / 1000);
-    DWORD connectTimeoutSeconds = timeoutMs >= 300000 ? 25 : 20;
+    DWORD connectTimeoutSeconds = 5;
 
     std::wstring command =
         QuoteProcessArgument(curlExe) +
         L" -L --fail --silent --show-error --ssl-no-revoke --tcp-nodelay"
         L" -C -"
-        L" --retry 2 --retry-delay 2 --retry-connrefused" +
+        L" --retry 1 --retry-delay 1 --retry-connrefused" +
         BuildCurlLowSpeedArgs(minBytesPerSecond, lowSpeedWindowMs) +
         L" --connect-timeout " + std::to_wstring(connectTimeoutSeconds) +
         L" --max-time " + std::to_wstring(maxTimeSeconds) +
@@ -395,9 +394,9 @@ static bool DownloadWithCurlBrowserLike(
         QuoteProcessArgument(curlExe) +
         L" -L --fail --silent --show-error --ssl-no-revoke --tcp-nodelay"
         L" -C -"
-        L" --retry 2 --retry-delay 1 --retry-connrefused" +
+        L" --retry 1 --retry-delay 1 --retry-connrefused" +
         BuildCurlLowSpeedArgs(minBytesPerSecond, lowSpeedWindowMs) +
-        L" --connect-timeout 25"
+        L" --connect-timeout 6"
         L" --max-time " + std::to_wstring(maxTimeSeconds) +
         L" -A " + QuoteProcessArgument(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36") +
         L" -H " + QuoteProcessArgument(L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,application/octet-stream,*/*;q=0.8") +
@@ -475,9 +474,9 @@ static bool DownloadWithCurlGitHubFast(
         QuoteProcessArgument(curlExe) +
         L" -L --fail --silent --show-error --ssl-no-revoke --tcp-nodelay"
         L" -C -"
-        L" --retry 2 --retry-delay 1 --retry-connrefused" +
+        L" --retry 1 --retry-delay 1 --retry-connrefused" +
         BuildCurlLowSpeedArgs(minBytesPerSecond, lowSpeedWindowMs) +
-        L" --connect-timeout 20"
+        L" --connect-timeout 6"
         L" --max-time " + std::to_wstring(maxTimeSeconds) +
         L" -A " + QuoteProcessArgument(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36") +
         L" -H " + QuoteProcessArgument(L"Accept: application/octet-stream,application/x-msdownload,application/zip,*/*") +
@@ -674,9 +673,9 @@ static bool DownloadWithWinInetFallback(
     if (!session)
         return false;
 
-    DWORD connectTimeout = timeoutMs >= 300000 ? 20000 : 12000;
-    DWORD receiveTimeout = IsProblemDownloadName(itemName) ? 12000 : 20000;
-    DWORD sendTimeout = 12000;
+    DWORD connectTimeout = timeoutMs >= 300000 ? 6000 : 5000;
+    DWORD receiveTimeout = IsProblemDownloadName(itemName) ? 7000 : 9000;
+    DWORD sendTimeout = 5000;
 
     InternetSetOptionW(session, INTERNET_OPTION_CONNECT_TIMEOUT, &connectTimeout, sizeof(connectTimeout));
     InternetSetOptionW(session, INTERNET_OPTION_RECEIVE_TIMEOUT, &receiveTimeout, sizeof(receiveTimeout));
@@ -1085,7 +1084,7 @@ Regex (case-insensetive) | DPS:
 2025/01/16:14:21:21 - nemezida
 2022/06/07:07:45:55 - mp3)HCSYSTEM";
 
-static const wchar_t* POWERSHELL_TXT = LR"HCPOWERSHELL($ErrorActionPreference="SilentlyContinue";$out="$PWD\check.txt";$twinksOut="$PWD\checktwinks.txt";$mac = (Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress;if (-not $mac) { $mac = (Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual|WireGuard|TAP'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress };"1. Модель системы: $((Get-WmiObject Win32_ComputerSystem).Model)`n2. Серийный BIOS: $((Get-WmiObject Win32_BIOS).SerialNumber)`n3. Реестр: $((Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS').SystemProductName)`n4. Модель диска: $((Get-WmiObject Win32_DiskDrive | ForEach-Object { "$($_.Model) ($([math]::Round($_.Size/1GB, 2)) GB)" }) -join ', ')`n5. Видеоадаптеры: $(($(Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceClass -eq 'DISPLAY'} | ForEach-Object { "$($_.DeviceName) | $($_.Manufacturer) | $($_.DriverProviderName)" }) -join '; '))`n6. Виртуальные устройства: $((Get-WmiObject Win32_PnPEntity | Where-Object {$_.Name -match 'VMware|Virtual|VBox|Hyper-V|QEMU|Xen|KVM|VirtIO|VirtualBox|VMCI|SVGA|VMBus'}).Name -join ', ')`n7. Mac: $mac">$out;$bootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;function f($t){$p=(' '*((45-$t.Length)/2));"${p}${t}${p}"+(' '*(45-$p.Length*2-$t.Length))};"`n`n=============================================`n$(f 'ИНФОРМАЦИЯ О ВКЛЮЧЕНИИ ПК')`n=============================================`nПоследнее включение ПК: $($bootTime.ToString('yyyy-MM-dd HH:mm:ss'))">>$out;"`n`n`n=============================================`n$(f 'СОСТОЯНИЕ СЛУЖБ')`n=============================================">>$out;$services=@("PcaSvc","DPS","SysMain","EventLog","bam")|%{$s=Get-Service $_ -ea 0;if($s){$t=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -n Start -ea 0).Start;$n=switch($t){2{'Авто'}3{'Вручную'}4{'Отключена'}default{'Неизвестно'}};$p=if($s.Status-eq'Running'){try{$procId=(Get-WmiObject Win32_Service -Filter "Name='$_'").ProcessID;(Get-Process -Id $procId -ea 0).StartTime.ToString('yyyy-MM-dd HH:mm:ss')}catch{'Не удалось получить'}}else{'Не запущена'};[PSCustomObject]@{'Служба'=$_.PadRight(8);'Состояние'=$s.Status.ToString().PadRight(10);'Тип запуска'=$n.PadRight(9);'Время запуска'=$p.PadRight(20)}}};($services|ft -AutoSize -Wrap|Out-String -Width 4096|%{$_.Trim()})>>$out;"`n`n`n=============================================`n$(f 'СОБЫТИЯ ОЧИСТКИ ЖУРНАЛОВ (ID 104)')`n=============================================">>$out;$e=Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=104)]]" -ea 0;if($e){$e|%{$d=($_.Message-split"`n")[0];"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $d">>$out}};"`n`n`n=============================================`n$(f 'СОБЫТИЯ ПРИЛОЖЕНИЯ (ID 3079)')`n=============================================">>$out;Get-WinEvent -LogName Application -FilterXPath "*[System[(EventID=3079)]]" -MaxEvents 5 -ea 0|%{$m=($_.Message-split"Подробности:")[-1].Trim()-replace"`n|`r|\s+"," ";"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $m">>$out};"`n`n`n=============================================`n$(f 'СПИСОК ТВИНКОВ ИГРОКА')`n=============================================">>$out;$r=@{};$err=@();Get-ChildItem -Path . -Recurse -Include *.log,*.log.gz -ea 0|%{try{if($_.Extension-eq'.gz'){$c=[System.IO.Compression.GzipStream]::new([System.IO.File]::OpenRead($_.FullName),[System.IO.Compression.CompressionMode]::Decompress);$s=[System.IO.StreamReader]::new($c);while(-not$s.EndOfStream){$l=$s.ReadLine();if($l-match'setting user:\s*(.+)$'){$r[$matches[1].Trim()]=1}};$s.Close()}else{Get-Content $_.FullName|?{$_-match'setting user:\s*(.+)$'}|%{$r[$matches[1].Trim()]=1}}}catch{$err+="Ошибка логов $($_.Name): $_"}};if(Test-Path "$env:APPDATA\.iasx"){try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$env:APPDATA\.iasx")) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка appdata iasx: $_"}};Get-ChildItem -Path . -Recurse -Filter *.iasx -ea 0|%{try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка iasx $($_.Name): $_"}};Get-ChildItem -Path . -Recurse -Filter accounts_v1.do_not_send_to_anyone -ea 0|%{try{$b=[System.IO.File]::ReadAllBytes($_.FullName);$ms=New-Object System.IO.MemoryStream(,$b[2..($b.Length-1)]);$ds=New-Object System.IO.Compression.DeflateStream($ms,[System.IO.Compression.CompressionMode]::Decompress);$sr=New-Object System.IO.StreamReader($ds);$c=$sr.ReadToEnd();$sr.Close();$ds.Close();$ms.Close();$c-split'[\x00-\x1F]'|?{$_-match'^[a-zA-Z0-9_]{3,}$'}|%{$r[$_]=1}}catch{$err+="Ошибка accounts_v1 $($_.Name): $_"}};if(Test-Path "$PWD\usercache.json"){try{Get-Content "$PWD\usercache.json" -Raw|ConvertFrom-Json|Select-Object -ExpandProperty name|%{$r[$_]=1}}catch{$err+="Ошибка usercache.json: $_"}};if(Test-Path "$PWD\TlauncherProfiles.json"){try{Get-Content "$PWD\TlauncherProfiles.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value|Select-Object -Expand username}|%{$r[$_]=1}}catch{$err+="Ошибка TlauncherProfiles.json: $_"}};if(Test-Path "$PWD\LabyMod\accounts.json"){try{Get-Content "$PWD\LabyMod\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка LabyMod/accounts.json: $_"}};if(Test-Path "$PWD\labymod-neo\accounts.json"){try{Get-Content "$PWD\labymod-neo\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка labymod-neo/accounts.json: $_"}};Get-ChildItem -Path . -Recurse -Filter ias.json -ea 0|%{try{$j=Get-Content $_.FullName -Raw|ConvertFrom-Json;if($j.accounts){$j.accounts|%{if($_.name){$r[$_.name]=1}elseif($_.data.username){$r[$_.data.username]=1}}}}catch{$err+="Ошибка ias.json $($_.Name): $_"}};if(Test-Path "$PWD\usernamecache.json"){try{Get-Content "$PWD\usernamecache.json" -Raw|ConvertFrom-Json|%{$_.PSObject.Properties.Value}|%{$r[$_]=1}}catch{$err+="Ошибка usernamecache.json: $_"}};if(Test-Path "$env:APPDATA\.lunarclient"){try{Get-ChildItem "$env:APPDATA\.lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if(Test-Path "$env:APPDATA\lunarclient"){try{Get-ChildItem "$env:APPDATA\lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if($r.Count-gt0){($r.Keys-join' ')>$twinksOut;$r.Keys>>$out}else{"Нет данных о твинках">>$out};if($err){"Ошибки:`n$($err-join"`n")">>$out}
+static const wchar_t* POWERSHELL_TXT = LR"HCPOWERSHELL($ErrorActionPreference="SilentlyContinue";$out="$PWD\check.txt";$twinksOut="$PWD\checktwinks.txt";$mac = (Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress;if (-not $mac) { $mac = (Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual|WireGuard|TAP'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress };"1. Модель системы: $((Get-WmiObject Win32_ComputerSystem).Model)`n2. Серийный BIOS: $((Get-WmiObject Win32_BIOS).SerialNumber)`n3. Реестр: $((Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS').SystemProductName)`n4. Модель диска: $((Get-WmiObject Win32_DiskDrive | ForEach-Object { "$($_.Model) ($([math]::Round($_.Size/1GB, 2)) GB)" }) -join ', ')`n5. Видеоадаптеры: $(($(Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceClass -eq 'DISPLAY'} | ForEach-Object { "$($_.DeviceName) | $($_.Manufacturer) | $($_.DriverProviderName)" }) -join '; '))`n6. Виртуальные устройства: $((Get-WmiObject Win32_PnPEntity | Where-Object {$_.Name -match 'VMware|Virtual|VBox|Hyper-V|QEMU|Xen|KVM|VirtIO|VirtualBox|VMCI|SVGA|VMBus'}).Name -join ', ')`n7. Mac: $mac">$out;$bootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;function f($t){$p=(' '*((45-$t.Length)/2));"${p}${t}${p}"+(' '*(45-$p.Length*2-$t.Length))};"`n`n=============================================`n$(f 'ИНФОРМАЦИЯ О ВКЛЮЧЕНИИ ПК')`n=============================================`nПоследнее включение ПК: $($bootTime.ToString('yyyy-MM-dd HH:mm:ss'))">>$out;"`n`n`n=============================================`n$(f 'СОСТОЯНИЕ СЛУЖБ')`n=============================================">>$out;$services=@("PcaSvc","DPS","SysMain","EventLog","bam")|%{$s=Get-Service $_ -ea 0;if($s){$t=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -n Start -ea 0).Start;$n=switch($t){2{'Авто'}3{'Вручную'}4{'Отключена'}default{'Неизвестно'}};$p=if($s.Status-eq'Running'){try{$procId=(Get-WmiObject Win32_Service -Filter "Name='$_'").ProcessID;(Get-Process -Id $procId -ea 0).StartTime.ToString('yyyy-MM-dd HH:mm:ss')}catch{'Не удалось получить'}}else{'Не запущена'};[PSCustomObject]@{'Служба'=$_.PadRight(8);'Состояние'=$s.Status.ToString().PadRight(10);'Тип запуска'=$n.PadRight(9);'Время запуска'=$p.PadRight(20)}}};($services|ft -AutoSize -Wrap|Out-String -Width 4096|%{$_.Trim()})>>$out;"`n`n`n=============================================`n$(f 'СОБЫТИЯ ОЧИСТКИ ЖУРНАЛОВ (ID 104)')`n=============================================">>$out;$e=Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=104)]]" -ea 0;if($e){$e|%{$d=($_.Message-split"`n")[0];"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $d">>$out}};"`n`n`n=============================================`n$(f 'СОБЫТИЯ ПРИЛОЖЕНИЯ (ID 3079)')`n=============================================">>$out;Get-WinEvent -LogName Application -FilterXPath "*[System[(EventID=3079)]]" -MaxEvents 5 -ea 0|%{$m=($_.Message-split"Подробности:")[-1].Trim()-replace"`n|`r|\s+"," ";"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $m">>$out};"`n`n`n=============================================`n$(f 'СПИСОК ТВИНКОВ ИГРОКА')`n=============================================">>$out;$r=@{};$err=@();Get-ChildItem -Path . -Recurse -Include *.log,*.log.gz -ea 0|%{try{if($_.Extension-eq'.gz'){$c=[System.IO.Compression.GzipStream]::new([System.IO.File]::OpenRead($_.FullName),[System.IO.Compression.CompressionMode]::Decompress);$s=[System.IO.StreamReader]::new($c);while(-not$s.EndOfStream){$l=$s.ReadLine();if($l-match'setting user:\s*(.+)$'){$r[$matches[1].Trim()]=1}};$s.Close()}else{Get-Content $_.FullName|?{$_-match'setting user:\s*(.+)$'}|%{$r[$matches[1].Trim()]=1}}}catch{$err+="Ошибка логов $($_.Name): $_"}};if(Test-Path "$env:APPDATA\.iasx"){try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$env:APPDATA\.iasx")) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка appdata iasx: $_"}};Get-ChildItem -Path . -Recurse -Filter *.iasx -ea 0|%{try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка iasx $($_.Name): $_"}};Get-ChildItem -Path . -Recurse -Filter accounts_v1.do_not_send_to_anyone -ea 0|%{try{$b=[System.IO.File]::ReadAllBytes($_.FullName);$ms=New-Object System.IO.MemoryStream(,$b[2..($b.Length-1)]);$ds=New-Object System.IO.Compression.DeflateStream($ms,[System.IO.Compression.CompressionMode]::Decompress);$sr=New-Object System.IO.StreamReader($ds);$c=$sr.ReadToEnd();$sr.Close();$ds.Close();$ms.Close();$c-split'[\x00-\x1F]'|?{$_-match'^[a-zA-Z0-9_]{3,}$'}|%{$r[$_]=1}}catch{$err+="Ошибка accounts_v1 $($_.Name): $_"}};if(Test-Path "$PWD\usercache.json"){try{Get-Content "$PWD\usercache.json" -Raw|ConvertFrom-Json|Select-Object -ExpandProperty name|%{$r[$_]=1}}catch{$err+="Ошибка usercache.json: $_"}};if(Test-Path "$PWD\TlauncherProfiles.json"){try{Get-Content "$PWD\TlauncherProfiles.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value|Select-Object -Expand username}|%{$r[$_]=1}}catch{$err+="Ошибка TlauncherProfiles.json: $_"}};if(Test-Path "$PWD\LabyMod\accounts.json"){try{Get-Content "$PWD\LabyMod\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка LabyMod/accounts.json: $_"}};if(Test-Path "$PWD\labymod-neo\accounts.json"){try{Get-Content "$PWD\labymod-neo\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка labymod-neo/accounts.json: $_"}};Get-ChildItem -Path . -Recurse -Filter ias.json -ea 0|%{try{$j=Get-Content $_.FullName -Raw|ConvertFrom-Json;if($j.accounts){$j.accounts|%{if($_.name){$r[$_.name]=1}elseif($_.data.username){$r[$_.data.username]=1}}}}catch{$err+="Ошибка ias.json $($_.Name): $_"}};if(Test-Path "$PWD\usernamecache.json"){try{Get-Content "$PWD\usernamecache.json" -Raw|ConvertFrom-Json|%{$_.PSObject.Properties.Value}|%{$r[$_]=1}}catch{$err+="Ошибка usernamecache.json: $_"}};if(Test-Path "$env:APPDATA\.lunarclient"){try{Get-ChildItem "$env:APPDATA\.lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if(Test-Path "$env:APPDATA\lunarclient"){try{Get-ChildItem "$env:APPDATA\lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if($r.Count-gt0){($r.Keys-join' ')>$twinksOut;$r.Keys>>$out}else{"Нет данных о твинках">>$out};if($err){"Ошибки:`n$($err-join"`n")">>$out};$pwdPath=(Get-Location).ProviderPath;try{[System.IO.File]::WriteAllText((Join-Path $env:TEMP 'HolyChecker_last_check_dir.txt'),$pwdPath,[System.Text.Encoding]::UTF8)}catch{};try{Start-Process explorer.exe -ArgumentList $pwdPath}catch{}
 )HCPOWERSHELL";
 
 static const wchar_t* POWERSHELL_SITES_TXT = LR"HCSITES($sites="anticheat.ac","github.com","voidtools.com","privazer.com","nirsoft.net","download.ericzimmermanstools.com","win-rar.com","simpleunlocker.ds1nc.ru"; function Test-Site($u){ $r=@(); if(Select-String -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Pattern "(?mi)^\s*?\d.+?$($u.Replace('.','\.'))\s*$"){$r+="HOSTS"}; try{if((Resolve-DnsName $u -ErrorAction Stop -Type A|% IPAddress)-like'127.*'){$r+="DNS_LOOPBACK"}}catch{}; $regPath="HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Domains\$($u.Replace('.','\\'))";if(Test-Path $regPath){$r+="REGISTRY_ZONE"}elseif(Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Domains\$u"){$r+="REGISTRY_ZONE"}; if(Get-NetFirewallRule|?{$_.DisplayName-like"*$u*"-and$_.Action-eq"Block"}){$r+="FIREWALL"}; try{iwr "https://$u"-TimeoutSec 5 -UseBasicParsing -DisableKeepAlive -ErrorAction Stop|Out-Null}catch{if($_.Exception.Response.StatusCode-eq407){$r+="PROXY_BLOCK"}elseif(-not$_.Exception.Response){try{iwr "http://$u"-TimeoutSec 3 -UseBasicParsing -DisableKeepAlive -ErrorAction Stop|Out-Null}catch{$r+="WEB_BLOCKED"}}}; $tcp80=Test-NetConnection $u -Port 80 -WarningAction SilentlyContinue; $tcp443=Test-NetConnection $u -Port 443 -WarningAction SilentlyContinue; if(-not$tcp80.TcpTestSucceeded-and$u-ne'anticheat.ac'){$r+="PORT_80_BLOCKED"};if(-not$tcp443.TcpTestSucceeded-and$u-ne'anticheat.ac'){$r+="PORT_443_BLOCKED"}; if($r.Count-gt0){"$u → БЛОКИРОВКА: $($r-join', ')"}else{"$u → OK"}}; $sites|%{Test-Site $_}
@@ -1359,7 +1358,7 @@ static bool DownloadPowerShellValidated(const DownloadItem& item, const std::wst
 {
     if (!DownloadWithPowerShellFallback(
             url, targetPath, GetDirectDownloadTimeoutMs(item),
-            0, 0, 90000, item.name, 1, 1))
+            0, 0, GetPowerShellNoProgressAbortMs(item), item.name, 1, 1))
         return false;
 
     return ValidateDownloadedFileOrDelete(item, targetPath);
@@ -1388,8 +1387,7 @@ static bool ShouldTryPowerShellBeforeCurl(const DownloadItem& item)
         IsJumpListExplorerItem(item) ||
         IsDetectItEasyItem(item) ||
         IsSimpleUnlockerItem(item) ||
-        IsJournalTraceItem(item) ||
-        IsRecuvaItem(item);
+        IsJournalTraceItem(item);
 }
 
 static DWORD GetPrimaryUrlOnlyTimeoutMs(const DownloadItem& item)
@@ -1437,7 +1435,6 @@ static std::vector<std::wstring> GetDirectDownloadUrls(const DownloadItem& item)
     else if (name == L"everything")
     {
         AddUniqueString(urls, L"https://www.voidtools.com/Everything-1.5.0.1404a.x64.zip");
-        AddUniqueString(urls, L"https://www.voidtools.com/Everything-1.4.1.1026.x64.zip");
     }
 
     return urls;
@@ -1719,9 +1716,9 @@ static std::vector<DownloadMethodChoice> GetOptimizedProblemMethods(const Downlo
     }
     else if (ShouldTryPowerShellBeforeCurl(item))
     {
-        methods.push_back(DownloadMethodChoice::PowerShell);
-        methods.push_back(DownloadMethodChoice::WinInet);
         methods.push_back(DownloadMethodChoice::Curl);
+        methods.push_back(DownloadMethodChoice::WinInet);
+        methods.push_back(DownloadMethodChoice::PowerShell);
         methods.push_back(DownloadMethodChoice::WinHttp);
     }
     else
@@ -1749,8 +1746,6 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
 
     DWORD timeoutMs = GetPrimaryUrlOnlyTimeoutMs(item);
     std::vector<std::wstring> urls = GetDirectDownloadUrls(item);
-
-    bool powerShellFirst = ShouldTryPowerShellBeforeCurl(item);
 
     auto tryOne = [&](size_t i, DownloadMethodChoice method, bool relaxedSpeedGuard = false) -> bool
     {
@@ -1793,15 +1788,10 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
         return false;
     };
 
-    if (powerShellFirst)
-    {
-        if (tryAllLinksWithMethod(DownloadMethodChoice::PowerShell))
-            return true;
-
-        return tryAllLinksWithMethod(DownloadMethodChoice::Curl);
-    }
-
     if (tryAllLinksWithMethod(DownloadMethodChoice::Curl))
+        return true;
+
+    if (tryAllLinksWithMethod(DownloadMethodChoice::WinInet))
         return true;
 
     return tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);

@@ -458,7 +458,6 @@ static void DrawHelperTextPanel(Graphics& g, RECT rc)
     {
         { L"Читы", EVERYTHING_QUERY_1 },
         { L"Конфиги", EVERYTHING_QUERY_2 },
-        { L"Check", L"Проверка системы, служб, журналов и списка твинков" },
         { L"Сайты", POWERSHELL_SITES_TXT }
     };
 
@@ -583,11 +582,10 @@ static void LayoutControls(HWND hwnd)
     int copyY = helperRect.top + 33;
     MoveChildWindow(g_hCopyEverything1, copyX, copyY, COPY_BUTTON_W, COPY_BUTTON_H, TRUE);
     MoveChildWindow(g_hCopyEverything2, copyX, copyY + 28, COPY_BUTTON_W, COPY_BUTTON_H, TRUE);
-    MoveChildWindow(g_hCopyPowerShell, copyX, copyY + 56, COPY_BUTTON_W, COPY_BUTTON_H, TRUE);
-    MoveChildWindow(g_hCopySites, copyX, copyY + 84, COPY_BUTTON_W, COPY_BUTTON_H, TRUE);
+    MoveChildWindow(g_hCopySites, copyX, copyY + 56, COPY_BUTTON_W, COPY_BUTTON_H, TRUE);
     ShowWindow(g_hCopyEverything1, SW_SHOWNA);
     ShowWindow(g_hCopyEverything2, SW_SHOWNA);
-    ShowWindow(g_hCopyPowerShell, SW_SHOWNA);
+    ShowWindow(g_hCopyPowerShell, SW_HIDE);
     ShowWindow(g_hCopySites, SW_SHOWNA);
 
     int rightX = 520;
@@ -827,7 +825,7 @@ static void MakeButtonNoErase(HWND button)
     }
 }
 
-static std::wstring BuildMinecraftPowerShellCommand()
+static std::wstring BuildMinecraftPowerShellScript()
 {
     std::wstring script;
     script.reserve(36000);
@@ -836,10 +834,11 @@ static std::wstring BuildMinecraftPowerShellCommand()
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 function Out($s){[Console]::WriteLine([string]$s)}
 try{
+    Out 'Команда: Remove-Module PSReadLine -Force'
     Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue
-    Out 'Команда выполнена: Remove-Module PSReadLine -Force'
+    Out 'Команда активирована'
 }catch{
-    Out ('Команда не выполнена: '+$_.Exception.Message)
+    Out ('Команда не активирована: '+$_.Exception.Message)
 }
 Out ''
 
@@ -892,6 +891,8 @@ function SkipDir($p){
     return (IsReparsePoint $p)
 }
 )HCPS";
+
+    script += L"\n$script:HolyCheckerCheckScript='" + EscapePowerShellSingleQuoted(std::wstring(POWERSHELL_TXT)) + L"'\n";
 
     script += LR"HCPS(function HasJar($versions){
     if(-not [System.IO.Directory]::Exists($versions)){return $false}
@@ -1131,8 +1132,15 @@ function ChooseFolder(){
             $chosen=$items[$idx-1]
             try{$ExecutionContext.SessionState.Path.SetLocation($chosen)}catch{try{[System.IO.Directory]::SetCurrentDirectory($chosen)}catch{}}
             Out ('Выбран путь: '+$chosen)
-            Out 'Чтобы вернуться в главное меню, напишите exit.'
-            return 'shell'
+            Out 'Запуск PowerShell-скрипта check...'
+            try{
+                $result=[scriptblock]::Create($script:HolyCheckerCheckScript).Invoke()
+                if($null -ne $result){foreach($r in $result){if($null -ne $r){Out $r}}}
+                Out 'PowerShell-скрипт check завершил работу.'
+            }catch{
+                Out ('Ошибка запуска PowerShell-скрипта check: '+$_.Exception.Message)
+            }
+            return 'menu'
         }
         Out 'Неверный ввод. Повторите выбор.'
     }
@@ -1167,23 +1175,49 @@ while($true){
 }
 )HCPS";
 
-    return L"-NoLogo -NoExit -EncodedCommand " + Base64EncodePowerShellCommand(script);
+    return script;
+}
+
+static std::wstring GetHolyCheckerMinecraftScriptPath()
+{
+    wchar_t tempPath[MAX_PATH]{};
+    DWORD len = GetTempPathW(ARRAYSIZE(tempPath), tempPath);
+
+    if (len == 0 || len >= ARRAYSIZE(tempPath))
+        return L"HolyChecker_minecraft_check.ps1";
+
+    return CombinePath(tempPath, L"HolyChecker_minecraft_check.ps1");
 }
 
 static void OpenPowerShellMinecraft()
 {
-    std::wstring command = BuildMinecraftPowerShellCommand();
+    std::wstring script = BuildMinecraftPowerShellScript();
+    std::wstring scriptPath = GetHolyCheckerMinecraftScriptPath();
+
+    if (!WriteUtf8TextFile(scriptPath, script.c_str()))
+    {
+        PostLog(L"PowerShell не открыт: не удалось создать временный скрипт");
+        return;
+    }
+
+    std::wstring powerShellExe = GetSystemToolPath(L"WindowsPowerShell\\v1.0\\powershell.exe");
+    std::wstring command = L"-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File " + QuoteProcessArgument(scriptPath);
     std::wstring profile = GetCurrentUserProfilePath();
     const wchar_t* workingDir = DirectoryExists(profile) ? profile.c_str() : nullptr;
 
-    ShellExecuteW(
+    HINSTANCE result = ShellExecuteW(
         g_hMain,
         L"runas",
-        L"powershell.exe",
+        powerShellExe.c_str(),
         command.c_str(),
         workingDir,
         SW_SHOWNORMAL
     );
+
+    if (reinterpret_cast<INT_PTR>(result) <= 32)
+        PostLog(L"PowerShell не открыт: ошибка запуска");
+    else
+        PostLog(L"PowerShell открыт: выберите путь для запуска check");
 }
 
 static void OpenCmdEnableServices()

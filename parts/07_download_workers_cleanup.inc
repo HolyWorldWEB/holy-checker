@@ -251,22 +251,58 @@ static void PostDownloadSummary(const std::vector<std::wstring>& downloaded, con
     PostDownloadSummaryLine(L"не скачалось: итог: ", failed);
 }
 
+
+static unsigned long long GetEstimatedDownloadOrderBytes(const DownloadItem& item)
+{
+    std::wstring name = ToLower(item.name);
+    std::wstring file = ToLower(item.file);
+    std::wstring url = ToLower(item.url);
+
+    if (name.find(L"recentfilesview") != std::wstring::npos) return 90ull * 1024ull;
+    if (name.find(L"lastactivityview") != std::wstring::npos) return 120ull * 1024ull;
+    if (name.find(L"executedprogramslist") != std::wstring::npos) return 120ull * 1024ull;
+    if (name.find(L"usbdrivelog") != std::wstring::npos) return 150ull * 1024ull;
+    if (name.find(L"usbdeview") != std::wstring::npos) return 180ull * 1024ull;
+    if (name.find(L"browserdownloadsview") != std::wstring::npos) return 200ull * 1024ull;
+    if (name.find(L"browsinghistoryview") != std::wstring::npos) return 220ull * 1024ull;
+    if (name.find(L"regscanner") != std::wstring::npos) return 250ull * 1024ull;
+    if (name.find(L"winprefetchview") != std::wstring::npos) return 350ull * 1024ull;
+    if (name.find(L"alternatestreamview") != std::wstring::npos) return 450ull * 1024ull;
+    if (name.find(L"windeflogview") != std::wstring::npos) return 500ull * 1024ull;
+    if (name.find(L"everything") != std::wstring::npos) return 6ull * 1024ull * 1024ull;
+    if (name.find(L"recuva") != std::wstring::npos) return 25ull * 1024ull * 1024ull;
+    if (name.find(L"detect") != std::wstring::npos) return 30ull * 1024ull * 1024ull;
+    if (name.find(L"winrar") != std::wstring::npos) return 4ull * 1024ull * 1024ull;
+    if (name.find(L"systeminformer") != std::wstring::npos) return 20ull * 1024ull * 1024ull;
+    if (name.find(L"processhacker") != std::wstring::npos) return 4ull * 1024ull * 1024ull;
+    if (name.find(L"registryexplorer") != std::wstring::npos) return 75ull * 1024ull * 1024ull;
+    if (name.find(L"jumplistexplorer") != std::wstring::npos) return 70ull * 1024ull * 1024ull;
+    if (name.find(L"volatility") != std::wstring::npos) return 80ull * 1024ull * 1024ull;
+    if (name.find(L"simpleunlocker") != std::wstring::npos) return 20ull * 1024ull * 1024ull;
+
+    if (EndsWithI(file, L".zip")) return 2ull * 1024ull * 1024ull;
+    if (EndsWithI(file, L".exe")) return 8ull * 1024ull * 1024ull;
+    if (EndsWithI(file, L".msi")) return 12ull * 1024ull * 1024ull;
+
+    return 1024ull * 1024ull;
+}
+
 static void DownloadWorker(std::vector<DownloadItem> items)
 {
     g_working = true;
 
     std::stable_sort(items.begin(), items.end(), [](const DownloadItem& a, const DownloadItem& b)
     {
+        unsigned long long as = GetEstimatedDownloadOrderBytes(a);
+        unsigned long long bs = GetEstimatedDownloadOrderBytes(b);
+
+        if (as != bs)
+            return as < bs;
+
         if (a.tab != b.tab)
             return a.tab < b.tab;
 
-        bool aPowerShellFirst = ShouldTryPowerShellBeforeCurl(a);
-        bool bPowerShellFirst = ShouldTryPowerShellBeforeCurl(b);
-
-        if (aPowerShellFirst != bPowerShellFirst)
-            return aPowerShellFirst;
-
-        return !IsFastFailItem(a) && IsFastFailItem(b);
+        return ToLower(a.name) < ToLower(b.name);
     });
 
     std::wstring folder = GetHolyCheckFolder();
@@ -351,25 +387,7 @@ static void DownloadWorker(std::vector<DownloadItem> items)
         }
     };
 
-    for (int tab = 0; tab < TAB_COUNT && !IsCancelRequested(); ++tab)
-    {
-        std::vector<DownloadItem> powerShellFirstBatch;
-        std::vector<DownloadItem> curlFirstBatch;
-
-        for (const auto& item : items)
-        {
-            if (item.tab != tab)
-                continue;
-
-            if (ShouldTryPowerShellBeforeCurl(item))
-                powerShellFirstBatch.push_back(item);
-            else
-                curlFirstBatch.push_back(item);
-        }
-
-        runDownloadBatch(powerShellFirstBatch);
-        runDownloadBatch(curlFirstBatch);
-    }
+    runDownloadBatch(items);
 
     CleanupXmlFiles(folder);
 
@@ -460,6 +478,25 @@ static void DownloadCurrentTab()
     StartDownload(selected);
 }
 
+
+// Быстрая проверка уже скачанного файла для UI-потока.
+// Важно: для ZIP здесь НЕ делаем рекурсивный поиск .exe внутри папки распаковки.
+// Такой поиск может занимать заметное время и из-за него после клика кажется,
+// что скачивание началось не сразу. Полная проверка/распаковка/открытие остаются
+// в OpenOrDownloadSingleWorker, то есть выполняются в фоновом потоке.
+static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, const std::wstring& baseFolder)
+{
+    std::wstring target = GetItemTargetPath(item, baseFolder);
+
+    if (EndsWithI(target, L".zip"))
+        return L"";
+
+    if (FileExists(target))
+        return target;
+
+    return L"";
+}
+
 static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
 {
     std::wstring folder = GetHolyCheckFolder();
@@ -538,7 +575,7 @@ static void OpenOrDownloadSingleById(int id)
         return;
     }
 
-    std::wstring quickLaunchPath = FindLaunchPathForItem(item, folder);
+    std::wstring quickLaunchPath = FindQuickLaunchPathForItemNoScan(item, folder);
 
     if (!quickLaunchPath.empty() && FileExists(quickLaunchPath))
     {
@@ -565,6 +602,12 @@ static void OpenOrDownloadSingleById(int id)
     g_singleTotal.fetch_add(1);
     SetItemBusyIndex(index, true);
     SetTileEnabledByIndex(index, false);
+
+    // Показываем старт сразу после клика, до запуска фонового потока.
+    // Это убирает визуальную паузу перед началом скачивания.
+    AddActiveDownload(item.name);
+    UpdateActiveDownloadStatus(item.name, L"старт", 1, 1, 0, 0);
+    PostProgress(0);
     InvalidateBottomPanel();
 
     std::thread(OpenOrDownloadSingleWorker, index, item).detach();
@@ -921,6 +964,137 @@ static void CloseProcessesFromFolder(const std::wstring& folder)
     CloseHandle(snapshot);
 }
 
+
+static std::wstring GetHolyCheckerLastCheckDirMarkerPath()
+{
+    wchar_t tempPath[MAX_PATH * 4]{};
+    DWORD len = GetTempPathW(ARRAYSIZE(tempPath), tempPath);
+
+    if (len == 0 || len >= ARRAYSIZE(tempPath))
+        return L"";
+
+    return CombinePath(tempPath, L"HolyChecker_last_check_dir.txt");
+}
+
+static std::wstring TrimText(std::wstring text)
+{
+    while (!text.empty() && (text.front() == static_cast<wchar_t>(0xFEFF) || iswspace(text.front())))
+        text.erase(text.begin());
+
+    while (!text.empty() && iswspace(text.back()))
+        text.pop_back();
+
+    return text;
+}
+
+static std::wstring ReadSmallUtf8TextFile(const std::wstring& path)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (file == INVALID_HANDLE_VALUE)
+        return L"";
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 32768)
+    {
+        CloseHandle(file);
+        return L"";
+    }
+
+    std::string bytes(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    BOOL ok = ReadFile(file, &bytes[0], static_cast<DWORD>(bytes.size()), &read, nullptr);
+    CloseHandle(file);
+
+    if (!ok || read == 0)
+        return L"";
+
+    bytes.resize(read);
+
+    int wideLen = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+    if (wideLen <= 0)
+        return L"";
+
+    std::wstring text(wideLen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), &text[0], wideLen);
+    return TrimText(text);
+}
+
+static bool IsSafeCheckOutputFolder(const std::wstring& folder)
+{
+    if (folder.empty() || !DirectoryExists(folder))
+        return false;
+
+    std::wstring profile = GetCurrentUserProfilePath();
+    std::wstring holyCheck = GetHolyCheckFolderPathOnly();
+
+    if (!profile.empty() && IsPathUnderFolder(folder, profile))
+        return true;
+
+    if (!holyCheck.empty() && IsPathUnderFolder(folder, holyCheck))
+        return true;
+
+    if (IsPathUnderFolder(folder, L"C:\\PulseVisuals\\game"))
+        return true;
+
+    return false;
+}
+
+static void DeleteCheckOutputFilesInFolder(const std::wstring& folder, int& deletedCount)
+{
+    if (!IsSafeCheckOutputFolder(folder))
+        return;
+
+    const wchar_t* names[] = { L"check.txt", L"checktwinks.txt" };
+
+    for (const wchar_t* name : names)
+    {
+        std::wstring path = CombinePath(folder, name);
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+            continue;
+
+        if (DeleteFileOrFolderPermanent(path))
+            ++deletedCount;
+    }
+}
+
+static void DeletePowerShellCheckOutputFiles()
+{
+    std::vector<std::wstring> folders;
+
+    std::wstring marker = GetHolyCheckerLastCheckDirMarkerPath();
+    if (!marker.empty())
+    {
+        std::wstring lastFolder = ReadSmallUtf8TextFile(marker);
+        if (!lastFolder.empty())
+            AddUniquePath(folders, lastFolder);
+    }
+
+    AddUniquePath(folders, GetHolyCheckFolderPathOnly());
+
+    std::wstring profile = GetCurrentUserProfilePath();
+    if (!profile.empty())
+    {
+        AddUniquePath(folders, CombinePath(CombinePath(profile, L"AppData\\Roaming"), L".minecraft"));
+        AddUniquePath(folders, CombinePath(CombinePath(profile, L"AppData\\Roaming"), L".tlauncher\\legacy\\Minecraft\\game"));
+        AddUniquePath(folders, CombinePath(profile, L"Desktop"));
+        AddUniquePath(folders, CombinePath(profile, L"Downloads"));
+    }
+
+    AddUniquePath(folders, L"C:\\PulseVisuals\\game");
+
+    int deletedCount = 0;
+    for (const std::wstring& folder : folders)
+        DeleteCheckOutputFilesInFolder(folder, deletedCount);
+
+    if (!marker.empty())
+        DeleteFileW(marker.c_str());
+
+    if (deletedCount > 0)
+        PostLog(L"Удалены check.txt/checktwinks.txt: " + std::to_wstring(deletedCount));
+}
+
 static void DeleteHolyCheckWorker()
 {
     RequestCancelDownloads();
@@ -931,6 +1105,8 @@ static void DeleteHolyCheckWorker()
         Sleep(100);
 
     std::wstring folder = GetHolyCheckFolderPathOnly();
+
+    DeletePowerShellCheckOutputFiles();
 
     PostLog(L"Закрываю программы");
     CloseProcessesFromFolder(folder);

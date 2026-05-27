@@ -55,9 +55,7 @@ static void ClearDownloadLog()
 
 static bool IsAllowedDownloadLogLine(const std::wstring& line)
 {
-    return line.rfind(L"скачиваеться:", 0) == 0 ||
-        line.rfind(L"скачивается:", 0) == 0 ||
-        line.rfind(L"скачалось:", 0) == 0 ||
+    return line.rfind(L"скачивается:", 0) == 0 ||
         line.rfind(L"не скачалось:", 0) == 0;
 }
 
@@ -760,15 +758,10 @@ static void LogDownloadAttemptFailure(const std::wstring& displayName, int attem
 
 static DWORD GetRetryDelayMs(int attempt)
 {
-    static const DWORD delays[] = { 0, 1000, 3000, 7000 };
-    if (attempt <= 0)
-        return 0;
-
-    size_t index = static_cast<size_t>(attempt);
-    if (index >= ARRAYSIZE(delays))
-        index = ARRAYSIZE(delays) - 1;
-
-    return delays[index];
+    UNREFERENCED_PARAMETER(attempt);
+    // Не добавляем искусственные паузы между попытками: следующая ссылка/метод
+    // пробуется сразу, чтобы пользователь не ждал перед началом загрузки.
+    return 0;
 }
 
 static bool SleepRetryDelay(DWORD delayMs)

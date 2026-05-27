@@ -421,10 +421,7 @@ static DownloadResult DownloadRecursiveOnce(
                 CloseTrackedHttpHandle(connectSlot);
                 CloseTrackedHttpHandle(sessionSlot);
 
-                PostLog(L"SourceForge: ждём 5 секунд: " + displayName);
-
-                if (!SleepRetryDelay(5000))
-                    return MakeDownloadError(DownloadError::Cancelled, 0, false);
+                PostLog(L"SourceForge: повторяем без ожидания: " + displayName);
 
                 DownloadResult retry = DownloadRecursiveOnce(url, targetPath, displayName, depth + 1);
                 if (retry.finalUrl.empty())

@@ -275,6 +275,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_POWERSHELL)
         {
+            CopyHelperText(POWERSHELL_TXT, L"PowerShell");
             OpenPowerShellMinecraft();
             return 0;
         }
