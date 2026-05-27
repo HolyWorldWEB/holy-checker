@@ -263,7 +263,7 @@ static std::wstring FormatSpeedForLog(unsigned long long bps)
 
 static bool StartsWithDownloadLineForName(const std::wstring& line, const std::wstring& name)
 {
-    const std::wstring p1 = L"скачиваеться: " + name;
+    const std::wstring p1 = L"скачивается: " + name;
     const std::wstring p2 = L"скачивается: " + name;
 
     return line.rfind(p1, 0) == 0 || line.rfind(p2, 0) == 0;
@@ -274,7 +274,7 @@ static void UpsertLiveDownloadLogLine(const std::wstring& name, unsigned long lo
     if (name.empty())
         return;
 
-    std::wstring line = L"скачиваеться: " + name;
+    std::wstring line = L"скачивается: " + name;
 
     if (speedBps > 0)
         line += L" | " + FormatSpeedForLog(speedBps);
