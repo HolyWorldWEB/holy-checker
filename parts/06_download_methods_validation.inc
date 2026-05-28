@@ -83,9 +83,6 @@ static bool IsFastSpeedSwitchItem(const DownloadItem& item)
     return IsSystemInformerItem(item) ||
         IsProcessHackerItem(item) ||
         IsBamParserItem(item) ||
-        IsJumpListExplorerItem(item) ||
-        IsRegistryExplorerItem(item) ||
-        IsSimpleUnlockerItem(item) ||
         lower.find(L"journaltrace") != std::wstring::npos ||
         (lower.find(L"journal") != std::wstring::npos && lower.find(L"trace") != std::wstring::npos);
 }
@@ -100,12 +97,6 @@ static bool IsProblemDownloadName(const std::wstring& name)
         (lower.find(L"process") != std::wstring::npos && lower.find(L"hacker") != std::wstring::npos) ||
         lower.find(L"bamparser") != std::wstring::npos ||
         lower.find(L"bam parser") != std::wstring::npos ||
-        lower.find(L"registryexplorer") != std::wstring::npos ||
-        (lower.find(L"registry") != std::wstring::npos && lower.find(L"explorer") != std::wstring::npos) ||
-        lower.find(L"jumplistexplorer") != std::wstring::npos ||
-        (lower.find(L"jumplist") != std::wstring::npos && lower.find(L"explorer") != std::wstring::npos) ||
-        lower.find(L"simpleunlocker") != std::wstring::npos ||
-        (lower.find(L"simple") != std::wstring::npos && lower.find(L"unlocker") != std::wstring::npos) ||
         lower.find(L"journaltrace") != std::wstring::npos ||
         (lower.find(L"journal") != std::wstring::npos && lower.find(L"trace") != std::wstring::npos);
 }
@@ -123,7 +114,7 @@ static bool ShouldUseWinHttpFirst(const DownloadItem& item)
 static unsigned long long GetMethodMinSpeedBps(const DownloadItem& item)
 {
     if (IsFastSpeedSwitchItem(item))
-        return FAST_SWITCH_DOWNLOAD_SPEED_BPS; // меньше ~96 КБ/сек -> другой метод/ссылка
+        return FAST_SWITCH_DOWNLOAD_SPEED_BPS;
 
     return MIN_ACCEPTABLE_DOWNLOAD_SPEED_BPS;
 }
@@ -1366,7 +1357,8 @@ static bool DownloadPowerShellValidated(const DownloadItem& item, const std::wst
 
 static bool IsPrimaryUrlOnlyItem(const DownloadItem& item)
 {
-    return IsRegistryExplorerItem(item) || IsJumpListExplorerItem(item) || IsSimpleUnlockerItem(item);
+    UNREFERENCED_PARAMETER(item);
+    return false;
 }
 
 static bool IsJournalTraceItem(const DownloadItem& item)
@@ -1383,11 +1375,7 @@ static bool IsRecuvaItem(const DownloadItem& item)
 
 static bool ShouldTryPowerShellBeforeCurl(const DownloadItem& item)
 {
-    return IsRegistryExplorerItem(item) ||
-        IsJumpListExplorerItem(item) ||
-        IsDetectItEasyItem(item) ||
-        IsSimpleUnlockerItem(item) ||
-        IsJournalTraceItem(item);
+    return IsDetectItEasyItem(item) || IsJournalTraceItem(item);
 }
 
 static DWORD GetPrimaryUrlOnlyTimeoutMs(const DownloadItem& item)
@@ -1408,7 +1396,15 @@ static std::vector<std::wstring> GetDirectDownloadUrls(const DownloadItem& item)
 
     std::wstring name = ToLower(item.name);
 
-    if (IsSystemInformerItem(item))
+    if (IsRegistryExplorerItem(item))
+    {
+        AddUniqueString(urls, L"https://download.ericzimmermanstools.com/net9/RegistryExplorer.zip");
+    }
+    else if (IsJumpListExplorerItem(item))
+    {
+        AddUniqueString(urls, L"https://download.ericzimmermanstools.com/net9/JumpListExplorer.zip");
+    }
+    else if (IsSystemInformerItem(item))
     {
         AddUniqueString(urls, L"https://github.com/winsiderss/systeminformer/releases/download/v3.2.25011.2103/systeminformer-3.2.25011-release-setup.exe");
         AddUniqueString(urls, L"https://downloads.sourceforge.net/project/systeminformer/systeminformer-3.2.25011-release-setup.exe");
@@ -1707,13 +1703,6 @@ static std::vector<DownloadMethodChoice> GetOptimizedProblemMethods(const Downlo
         methods.push_back(DownloadMethodChoice::PowerShell);
         methods.push_back(DownloadMethodChoice::WinHttp);
     }
-    else if (IsEricZimmermanUrl(url) || IsRegistryExplorerItem(item) || IsJumpListExplorerItem(item) || IsSimpleUnlockerItem(item))
-    {
-        methods.push_back(DownloadMethodChoice::WinInet);
-        methods.push_back(DownloadMethodChoice::PowerShell);
-        methods.push_back(DownloadMethodChoice::Curl);
-        methods.push_back(DownloadMethodChoice::WinHttp);
-    }
     else if (ShouldTryPowerShellBeforeCurl(item))
     {
         methods.push_back(DownloadMethodChoice::Curl);
@@ -1794,7 +1783,13 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
     if (tryAllLinksWithMethod(DownloadMethodChoice::WinInet))
         return true;
 
-    return tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);
+    if (tryAllLinksWithMethod(DownloadMethodChoice::PowerShell))
+        return true;
+
+    if (tryAllLinksWithMethod(DownloadMethodChoice::WinHttp))
+        return true;
+
+    return tryAllLinksWithMethod(DownloadMethodChoice::Bits);
 }
 
 static void AddEricZimmermanKnownUrls(const DownloadItem& item, std::vector<std::wstring>& urls)

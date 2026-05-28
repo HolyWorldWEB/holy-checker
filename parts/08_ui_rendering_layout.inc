@@ -471,6 +471,525 @@ static void DrawHelperTextPanel(Graphics& g, RECT rc)
     }
 }
 
+
+static std::vector<std::wstring> SplitAutomationPipeColumns(const std::wstring& line)
+{
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+
+    while (start <= line.size())
+    {
+        size_t pos = line.find(L" | ", start);
+
+        if (pos == std::wstring::npos)
+        {
+            parts.push_back(line.substr(start));
+            break;
+        }
+
+        parts.push_back(line.substr(start, pos - start));
+        start = pos + 3;
+    }
+
+    return parts;
+}
+
+static bool IsBamDataRowForColumns(const std::wstring& line)
+{
+    if (line.size() < 5 || !iswdigit(line[0]))
+        return false;
+
+    std::vector<std::wstring> cols = SplitAutomationPipeColumns(line);
+    return cols.size() == 4;
+}
+
+static void DrawBamDataRow(Graphics& g, const std::wstring& line, const Font& lineFont, float x, float y, float panelW, float lineH)
+{
+    std::vector<std::wstring> cols = SplitAutomationPipeColumns(line);
+
+    if (cols.size() != 4)
+        return;
+
+    SolidBrush textBrush(Color(255, 235, 235, 240));
+    SolidBrush sepBrush(Color(180, 150, 150, 158));
+    SolidBrush sigBrush(Color(255, 255, 75, 75));
+
+    StringFormat fmt;
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    const float left = x + 10.0f;
+    const float usableW = panelW - 30.0f; // keep clear of the blue scrollbar
+    const float sepW = 6.0f;
+    float dateW = 126.0f;
+    float programW = 158.0f;
+    float sigW = 82.0f;
+
+    if (usableW >= 900.0f)
+    {
+        dateW = 132.0f;
+        programW = 176.0f;
+        sigW = 88.0f;
+    }
+    else if (usableW >= 720.0f)
+    {
+        dateW = 128.0f;
+        programW = 162.0f;
+        sigW = 84.0f;
+    }
+    else if (usableW < 520.0f)
+    {
+        dateW = 112.0f;
+        programW = 92.0f;
+        sigW = 62.0f;
+    }
+
+    float pathW = usableW - dateW - programW - sigW - sepW * 3.0f;
+
+    if (pathW < 72.0f)
+    {
+        float need = 72.0f - pathW;
+        float reduceProgram = std::min(need, std::max(0.0f, programW - 62.0f));
+        programW -= reduceProgram;
+        need -= reduceProgram;
+
+        float reduceDate = std::min(need, std::max(0.0f, dateW - 96.0f));
+        dateW -= reduceDate;
+        need -= reduceDate;
+
+        float reduceSig = std::min(need, std::max(0.0f, sigW - 52.0f));
+        sigW -= reduceSig;
+
+        pathW = usableW - dateW - programW - sigW - sepW * 3.0f;
+    }
+
+    if (pathW < 50.0f)
+        pathW = 50.0f;
+
+    float cur = left;
+    g.DrawString(cols[0].c_str(), -1, &lineFont, RectF(cur, y, dateW, lineH + 2.0f), &fmt, &textBrush);
+    cur += dateW;
+    g.DrawString(L"|", -1, &lineFont, RectF(cur, y, sepW, lineH + 2.0f), &fmt, &sepBrush);
+    cur += sepW;
+
+    g.DrawString(cols[1].c_str(), -1, &lineFont, RectF(cur, y, programW, lineH + 2.0f), &fmt, &textBrush);
+    cur += programW;
+    g.DrawString(L"|", -1, &lineFont, RectF(cur, y, sepW, lineH + 2.0f), &fmt, &sepBrush);
+    cur += sepW;
+
+    g.DrawString(cols[2].c_str(), -1, &lineFont, RectF(cur, y, pathW, lineH + 2.0f), &fmt, &textBrush);
+    cur += pathW;
+    g.DrawString(L"|", -1, &lineFont, RectF(cur, y, sepW, lineH + 2.0f), &fmt, &sepBrush);
+    cur += sepW;
+
+    g.DrawString(cols[3].c_str(), -1, &lineFont, RectF(cur, y, sigW, lineH + 2.0f), &fmt, &sigBrush);
+}
+
+
+static bool IsPipeSeparatedAutomationRow(const std::wstring& line)
+{
+    std::vector<std::wstring> cols = SplitAutomationPipeColumns(line);
+    if (cols.size() < 2)
+        return false;
+
+    if (line == L"не найдено" || line.find(L"не удалось") != std::wstring::npos)
+        return false;
+
+    return true;
+}
+
+static void DrawAutomationPipeSeparatedRow(Graphics& g, const std::wstring& line, int target, const Font& lineFont, float x, float y, float panelW, float lineH)
+{
+    std::vector<std::wstring> cols = SplitAutomationPipeColumns(line);
+    if (cols.size() < 2)
+        return;
+
+    if ((target == AUTOMATION_OUTPUT_JAR_ACTIVITY || target == AUTOMATION_OUTPUT_EXE_DELETED || target == AUTOMATION_OUTPUT_PF_DELETED) && cols.size() > 3)
+    {
+        std::wstring action;
+        for (size_t i = 1; i + 1 < cols.size(); ++i)
+        {
+            if (!action.empty())
+                action += L", ";
+            action += cols[i];
+        }
+
+        std::vector<std::wstring> fixedCols;
+        fixedCols.push_back(cols[0]);
+        fixedCols.push_back(action);
+        fixedCols.push_back(cols.back());
+        cols.swap(fixedCols);
+    }
+
+    SolidBrush textBrush(Color(255, 235, 235, 240));
+    SolidBrush sepBrush(Color(180, 150, 150, 158));
+    StringFormat fmt;
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    const float left = x + 10.0f;
+    const float usableW = std::max(60.0f, panelW - 32.0f);
+    const float sepW = 6.0f;
+    float cur = left;
+
+    std::vector<float> widths;
+
+    if (target == AUTOMATION_OUTPUT_EVENTVWR && cols.size() >= 3)
+    {
+        widths = { 54.0f, 128.0f };
+    }
+    else if ((target == AUTOMATION_OUTPUT_JAR_ACTIVITY || target == AUTOMATION_OUTPUT_EXE_DELETED || target == AUTOMATION_OUTPUT_PF_DELETED) && cols.size() >= 3)
+    {
+        float actionW = std::min(330.0f, std::max(170.0f, usableW * 0.32f));
+        widths = { 112.0f, actionW };
+    }
+    else if (target == AUTOMATION_OUTPUT_PAGE5 && cols.size() >= 3)
+    {
+        widths = { std::min(260.0f, std::max(150.0f, usableW * 0.34f)), 130.0f };
+    }
+    else if (target == AUTOMATION_OUTPUT_INJGEN && cols.size() >= 4)
+    {
+        widths = { 44.0f, 96.0f, 130.0f };
+    }
+    else if ((target == AUTOMATION_OUTPUT_PAGE4 || target == AUTOMATION_OUTPUT_DLL_UNSIGNED) && cols.size() >= 2)
+    {
+        widths = { std::min(230.0f, std::max(130.0f, usableW * 0.24f)) };
+    }
+    else
+    {
+        float equal = std::max(60.0f, (usableW - sepW * static_cast<float>(cols.size() - 1)) / static_cast<float>(cols.size()));
+        for (size_t i = 0; i + 1 < cols.size(); ++i)
+            widths.push_back(equal);
+    }
+
+    float used = sepW * static_cast<float>(cols.size() - 1);
+    for (float w : widths)
+        used += w;
+
+    float lastW = std::max(60.0f, usableW - used);
+
+    for (size_t i = 0; i < cols.size(); ++i)
+    {
+        float colW = (i < widths.size()) ? widths[i] : lastW;
+        if (i >= widths.size() && i + 1 < cols.size())
+            colW = std::max(60.0f, lastW / static_cast<float>(cols.size() - i));
+
+        g.DrawString(cols[i].c_str(), -1, &lineFont, RectF(cur, y, colW, lineH + 2.0f), &fmt, &textBrush);
+        cur += colW;
+
+        if (i + 1 < cols.size())
+        {
+            g.DrawString(L"|", -1, &lineFont, RectF(cur, y, sepW, lineH + 2.0f), &fmt, &sepBrush);
+            cur += sepW;
+        }
+    }
+}
+
+static void DrawAutomationOutputPanel(Graphics& g, RECT panelRect, const wchar_t* title, int target)
+{
+    std::vector<std::wstring> lines;
+    int scrollOffset = 0;
+    GetAutomationSnapshot(target, lines, scrollOffset);
+
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    RectF bgRect(
+        static_cast<REAL>(panelRect.left),
+        static_cast<REAL>(panelRect.top),
+        static_cast<REAL>(panelRect.right - panelRect.left),
+        static_cast<REAL>(panelRect.bottom - panelRect.top)
+    );
+
+    GraphicsPath bgPath;
+    bgPath.AddArc(bgRect.X, bgRect.Y, 14.0f, 14.0f, 180.0f, 90.0f);
+    bgPath.AddArc(bgRect.GetRight() - 14.0f, bgRect.Y, 14.0f, 14.0f, 270.0f, 90.0f);
+    bgPath.AddArc(bgRect.GetRight() - 14.0f, bgRect.GetBottom() - 14.0f, 14.0f, 14.0f, 0.0f, 90.0f);
+    bgPath.AddArc(bgRect.X, bgRect.GetBottom() - 14.0f, 14.0f, 14.0f, 90.0f, 90.0f);
+    bgPath.CloseFigure();
+
+    bool transparentPanel = (target == AUTOMATION_OUTPUT_JAR_ACTIVITY || target == AUTOMATION_OUTPUT_EXE_DELETED || target == AUTOMATION_OUTPUT_PF_DELETED || target == AUTOMATION_OUTPUT_MC_LOGS);
+    SolidBrush bgBrush(transparentPanel ? Color(18, 28, 30, 36) : Color(125, 28, 30, 36));
+    Pen borderPen(Color(132, 122, 128, 142), 1.0f);
+
+    if (!transparentPanel)
+        g.FillPath(&bgBrush, &bgPath);
+    g.DrawPath(&borderPen, &bgPath);
+
+    FontFamily family(L"Consolas");
+    Font titleFont(&family, 11.0f, FontStyleBold, UnitPixel);
+    Font lineFont(&family, 10.0f, FontStyleBold, UnitPixel);
+    SolidBrush titleBrush(Color(245, 236, 238, 245));
+    SolidBrush textBrush(Color(255, 235, 235, 240));
+    SolidBrush hintBrush(Color(210, 160, 160, 168));
+
+    StringFormat fmt;
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    const float x = static_cast<float>(panelRect.left);
+    const float y = static_cast<float>(panelRect.top);
+    const float panelW = static_cast<float>(panelRect.right - panelRect.left);
+    const float panelH = static_cast<float>(panelRect.bottom - panelRect.top);
+
+    g.DrawString(title, -1, &titleFont, RectF(x + 10.0f, y + 7.0f, panelW - 20.0f, 16.0f), &fmt, &titleBrush);
+
+    const float lineH = 12.5f;
+    size_t panelLineCapacityHint = static_cast<size_t>(std::max(1.0f, (panelRect.bottom - panelRect.top - 30.0f) / lineH));
+
+    if (lines.size() > panelLineCapacityHint)
+    {
+        StringFormat rightFmt;
+        rightFmt.SetAlignment(StringAlignmentFar);
+        rightFmt.SetTrimming(StringTrimmingEllipsisCharacter);
+        rightFmt.SetFormatFlags(StringFormatFlagsNoWrap);
+        g.DrawString(L"scroll", -1, &lineFont, RectF(x + 10.0f, y + 7.0f, panelW - 20.0f, 16.0f), &rightFmt, &hintBrush);
+    }
+
+    if (!lines.empty() && lines.size() > panelLineCapacityHint)
+    {
+        int maxOffsetBar = std::max<int>(1, static_cast<int>(lines.size()) - static_cast<int>(panelLineCapacityHint));
+        float trackX = x + panelW - 10.0f;
+        float trackY = y + 25.0f;
+        float trackH = panelH - 34.0f;
+        SolidBrush trackBrush(Color(90, 45, 58, 86));
+        SolidBrush thumbBrush(Color(240, 82, 155, 255));
+        g.FillRectangle(&trackBrush, RectF(trackX, trackY, 6.0f, trackH));
+        float thumbH = std::max(22.0f, trackH * (static_cast<float>(panelLineCapacityHint) / static_cast<float>(lines.size())));
+        float thumbY = trackY + (trackH - thumbH) * (static_cast<float>(scrollOffset) / static_cast<float>(maxOffsetBar));
+        g.FillRectangle(&thumbBrush, RectF(trackX - 2.0f, thumbY, 10.0f, thumbH));
+    }
+
+    if (lines.empty())
+    {
+        g.DrawString(L"Нажмите кнопку слева.", -1, &lineFont, RectF(x + 10.0f, y + 28.0f, panelW - 20.0f, 15.0f), &fmt, &hintBrush);
+        return;
+    }
+
+    size_t visibleLines = std::min(panelLineCapacityHint, lines.size());
+    size_t startIndex = static_cast<size_t>(std::max(0, scrollOffset));
+    if (startIndex >= lines.size())
+        startIndex = lines.size() > visibleLines ? lines.size() - visibleLines : 0;
+    size_t endIndex = std::min(lines.size(), startIndex + visibleLines);
+
+    if (target == AUTOMATION_OUTPUT_HISTORYPW)
+        return;
+
+    float lineY = y + 25.0f;
+    SolidBrush rowBrush(Color(26, 92, 116, 170));
+    Pen rowLinePen(Color(84, 105, 118, 142), 1.0f);
+
+    for (size_t i = startIndex; i < endIndex; ++i)
+    {
+        RectF textRect(x + 10.0f, lineY, panelW - 30.0f, lineH + 1.0f);
+        bool pipeRow = IsPipeSeparatedAutomationRow(lines[i]);
+        bool bamRow = target == AUTOMATION_OUTPUT_BAM && IsBamDataRowForColumns(lines[i]);
+        bool linedRow = bamRow || (target != AUTOMATION_OUTPUT_EVENTVWR && pipeRow);
+
+        if (linedRow)
+        {
+            if ((i - startIndex) % 2 == 0)
+                g.FillRectangle(&rowBrush, RectF(x + 7.0f, lineY - 1.0f, panelW - 25.0f, lineH + 1.0f));
+            g.DrawLine(&rowLinePen, x + 8.0f, lineY + lineH, x + panelW - 17.0f, lineY + lineH);
+        }
+
+        if (bamRow)
+            DrawBamDataRow(g, lines[i], lineFont, x, lineY, panelW, lineH);
+        else if (target != AUTOMATION_OUTPUT_EVENTVWR && pipeRow)
+            DrawAutomationPipeSeparatedRow(g, lines[i], target, lineFont, x, lineY, panelW, lineH);
+        else
+            g.DrawString(lines[i].c_str(), -1, &lineFont, textRect, &fmt, &textBrush);
+
+        lineY += lineH;
+
+        if (lineY > y + panelH - 8.0f)
+            break;
+    }
+}
+
+
+struct AutomationServiceUiRow
+{
+    const wchar_t* label;
+    const wchar_t* serviceName;
+    bool running;
+};
+
+static bool QueryAutomationServiceRunning(const wchar_t* serviceName, bool& running)
+{
+    running = false;
+
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
+    if (!scm)
+        return false;
+
+    SC_HANDLE service = OpenServiceW(scm, serviceName, SERVICE_QUERY_STATUS);
+
+    if (!service)
+    {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    BOOL ok = QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&status),
+        sizeof(status),
+        &bytesNeeded
+    );
+
+    if (ok)
+        running = status.dwCurrentState == SERVICE_RUNNING;
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return ok == TRUE;
+}
+
+static std::vector<AutomationServiceUiRow> GetAutomationServiceRows()
+{
+    static ULONGLONG lastTick = 0;
+    static std::vector<AutomationServiceUiRow> cached;
+
+    ULONGLONG now = GetTickCount64();
+
+    if (!cached.empty() && now - lastTick < 1200)
+        return cached;
+
+    struct ServiceDef
+    {
+        const wchar_t* label;
+        const wchar_t* name;
+    };
+
+    static const ServiceDef defs[] =
+    {
+        { L"bam", L"bam" },
+        { L"pcascv", L"PcaSvc" },
+        { L"sysmain", L"SysMain" },
+        { L"dps", L"DPS" },
+        { L"eventlog", L"EventLog" }
+    };
+
+    std::vector<AutomationServiceUiRow> rows;
+    rows.reserve(sizeof(defs) / sizeof(defs[0]));
+
+    for (const ServiceDef& def : defs)
+    {
+        bool running = false;
+        QueryAutomationServiceRunning(def.name, running);
+        rows.push_back({ def.label, def.name, running });
+    }
+
+    cached = rows;
+    lastTick = now;
+    return cached;
+}
+
+static void DrawAutomationServicesPanel(Graphics& g, RECT panelRect)
+{
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    RectF bgRect(
+        static_cast<REAL>(panelRect.left),
+        static_cast<REAL>(panelRect.top),
+        static_cast<REAL>(panelRect.right - panelRect.left),
+        static_cast<REAL>(panelRect.bottom - panelRect.top)
+    );
+
+    GraphicsPath bgPath;
+    bgPath.AddArc(bgRect.X, bgRect.Y, 14.0f, 14.0f, 180.0f, 90.0f);
+    bgPath.AddArc(bgRect.GetRight() - 14.0f, bgRect.Y, 14.0f, 14.0f, 270.0f, 90.0f);
+    bgPath.AddArc(bgRect.GetRight() - 14.0f, bgRect.GetBottom() - 14.0f, 14.0f, 14.0f, 0.0f, 90.0f);
+    bgPath.AddArc(bgRect.X, bgRect.GetBottom() - 14.0f, 14.0f, 14.0f, 90.0f, 90.0f);
+    bgPath.CloseFigure();
+
+    SolidBrush bgBrush(Color(125, 28, 30, 36));
+    Pen borderPen(Color(132, 122, 128, 142), 1.0f);
+    g.FillPath(&bgBrush, &bgPath);
+    g.DrawPath(&borderPen, &bgPath);
+
+    FontFamily family(L"Consolas");
+    Font titleFont(&family, 11.0f, FontStyleBold, UnitPixel);
+    Font lineFont(&family, 10.0f, FontStyleBold, UnitPixel);
+
+    SolidBrush titleBrush(Color(245, 236, 238, 245));
+    SolidBrush nameBrush(Color(255, 235, 235, 240));
+    SolidBrush onBrush(Color(255, 70, 220, 105));
+    SolidBrush offBrush(Color(255, 255, 75, 75));
+
+    StringFormat fmt;
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    StringFormat rightFmt;
+    rightFmt.SetAlignment(StringAlignmentFar);
+    rightFmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    rightFmt.SetFormatFlags(StringFormatFlagsNoWrap);
+
+    const float x = static_cast<float>(panelRect.left);
+    const float y = static_cast<float>(panelRect.top);
+    const float w = static_cast<float>(panelRect.right - panelRect.left);
+
+    g.DrawString(L"Службы", -1, &titleFont, RectF(x + 12.0f, y + 8.0f, w - 24.0f, 18.0f), &fmt, &titleBrush);
+
+    std::vector<AutomationServiceUiRow> rows = GetAutomationServiceRows();
+    float rowY = y + 30.0f;
+    const float rowH = 16.0f;
+
+    for (const AutomationServiceUiRow& row : rows)
+    {
+        g.DrawString(row.label, -1, &lineFont, RectF(x + 14.0f, rowY, w - 92.0f, rowH), &fmt, &nameBrush);
+        const wchar_t* status = row.running ? L"вкл" : L"выкл";
+        Brush* statusBrush = row.running ? static_cast<Brush*>(&onBrush) : static_cast<Brush*>(&offBrush);
+        g.DrawString(status, -1, &lineFont, RectF(x + 12.0f, rowY, w - 24.0f, rowH), &rightFmt, statusBrush);
+        rowY += rowH;
+    }
+}
+
+static void DrawAutomationScreen(Graphics& g, RECT rc)
+{
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    RECT bamPanel = GetAutomationBamPanelRect(rc);
+    RECT eventPanel = GetAutomationEventPanelRect(rc);
+    RECT historyPanel = GetAutomationHistoryPanelRect(rc);
+    RECT servicesPanel = GetAutomationServicesPanelRect(rc);
+
+    DrawAutomationOutputPanel(g, bamPanel, L"BAM", AUTOMATION_OUTPUT_BAM);
+    DrawAutomationOutputPanel(g, eventPanel, L"EventVwr", AUTOMATION_OUTPUT_EVENTVWR);
+    DrawAutomationOutputPanel(g, historyPanel, L"HistoryPW", AUTOMATION_OUTPUT_HISTORYPW);
+    DrawAutomationServicesPanel(g, servicesPanel);
+}
+
+static void DrawJarActivityScreen(Graphics& g, RECT rc)
+{
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    DrawAutomationOutputPanel(g, GetJarActivityPanelRect(rc), L".jar activ", AUTOMATION_OUTPUT_JAR_ACTIVITY);
+    DrawAutomationOutputPanel(g, GetExeDeletedPanelRect(rc), L".exe activity", AUTOMATION_OUTPUT_EXE_DELETED);
+    DrawAutomationOutputPanel(g, GetPfDeletedPanelRect(rc), L".pf deleted", AUTOMATION_OUTPUT_PF_DELETED);
+}
+
+static void DrawPage4Screen(Graphics& g, RECT rc)
+{
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    DrawAutomationOutputPanel(g, GetPage4PanelRect(rc), L"mod hash", AUTOMATION_OUTPUT_PAGE4);
+    DrawAutomationOutputPanel(g, GetPage4DllPanelRect(rc), L"unsigned dll", AUTOMATION_OUTPUT_DLL_UNSIGNED);
+}
+
+static void DrawPage5Screen(Graphics& g, RECT rc)
+{
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    DrawAutomationOutputPanel(g, GetPage5PanelRect(rc), L"usb", AUTOMATION_OUTPUT_PAGE5);
+    DrawAutomationOutputPanel(g, GetPage5InjGenPanelRect(rc), L"injgen", AUTOMATION_OUTPUT_INJGEN);
+}
+
+
 static void DrawScene(HWND hwnd, HDC targetHdc)
 {
     RECT rc{};
@@ -497,11 +1016,34 @@ static void DrawScene(HWND hwnd, HDC targetHdc)
 
     DrawAmbientBackground(g, rc);
     DrawParticles(g, rc);
-    DrawLogo(g);
+
+    if (g_currentPage == 0)
+        DrawLogo(g);
+
     DrawSectionSeparator(g, rc);
-    DrawDownloadLog(g, rc);
-    DrawHelperTextPanel(g, rc);
-    DrawProgressBar(g, rc);
+
+    if (g_currentPage == 1)
+    {
+        DrawAutomationScreen(g, rc);
+    }
+    else if (g_currentPage == 2)
+    {
+        DrawJarActivityScreen(g, rc);
+    }
+    else if (g_currentPage == 3)
+    {
+        DrawPage4Screen(g, rc);
+    }
+    else if (g_currentPage == 4)
+    {
+        DrawPage5Screen(g, rc);
+    }
+    else
+    {
+        DrawDownloadLog(g, rc);
+        DrawHelperTextPanel(g, rc);
+        DrawProgressBar(g, rc);
+    }
 
     BitBlt(targetHdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
@@ -556,14 +1098,222 @@ static void LayoutControls(HWND hwnd)
 
     int width = rc.right;
 
+    const int topButtonH = 34;
+    const int topGap = 9;
+    const int topY = 16;
+    const int navButtonW = 112;
+    const int checkButtonW = 92;
+    int navX = width - 28 - checkButtonW;
+
+    MoveChildWindow(g_hAutomationNav, navX, topY, checkButtonW, topButtonH, TRUE);
+    ShowWindow(g_hAutomationNav, SW_SHOWNA);
+    SetWindowTextW(g_hAutomationNav, L"check");
+    ShowWindow(g_hHomeNav, SW_HIDE);
+
+    if (g_currentPage >= 1 && g_currentPage <= 4)
+    {
+        ShowWindow(g_hDeleteHolyCheck, SW_HIDE);
+        ShowWindow(g_hEnableServices, SW_HIDE);
+        ShowWindow(g_hPowerShell, SW_HIDE);
+        ShowWindow(g_hCancelDownload, SW_HIDE);
+        ShowWindow(g_hDownloadAll, SW_HIDE);
+        ShowWindow(g_hCopyEverything1, SW_HIDE);
+        ShowWindow(g_hCopyEverything2, SW_HIDE);
+        ShowWindow(g_hCopyPowerShell, SW_HIDE);
+        ShowWindow(g_hCopySites, SW_HIDE);
+
+        for (HWND tab : g_tabButtons)
+            ShowWindow(tab, SW_HIDE);
+
+        for (HWND tile : g_tileButtons)
+            ShowWindow(tile, SW_HIDE);
+
+        auto hidePageButtons = []()
+        {
+            ShowWindow(g_hHomeNav, SW_HIDE);
+            ShowWindow(g_hAutomationBam, SW_HIDE);
+            ShowWindow(g_hAutomationBamUnsignedOnly, SW_HIDE);
+            ShowWindow(g_hAutomationEventVwr, SW_HIDE);
+            ShowWindow(g_hAutomationHistoryPw, SW_HIDE);
+            ShowWindow(g_hAutomationJarPage, SW_HIDE);
+            ShowWindow(g_hJarActiv, SW_HIDE);
+            ShowWindow(g_hExeDeleted, SW_HIDE);
+            ShowWindow(g_hPfDeleted, SW_HIDE);
+            ShowWindow(g_hMcLogs, SW_HIDE);
+            ShowWindow(g_hPage4Nav, SW_HIDE);
+            ShowWindow(g_hModHash, SW_HIDE);
+            ShowWindow(g_hDllUnsigned, SW_HIDE);
+            ShowWindow(g_hPage5Nav, SW_HIDE);
+            ShowWindow(g_hUsbChecker, SW_HIDE);
+            ShowWindow(g_hInjGenCheck, SW_HIDE);
+            ShowWindow(g_hHistoryEdit, SW_HIDE);
+    ShowWindow(g_hJarEdit, SW_HIDE);
+    ShowWindow(g_hExeEdit, SW_HIDE);
+    ShowWindow(g_hPfEdit, SW_HIDE);
+    ShowWindow(g_hMcEdit, SW_HIDE);
+            ShowWindow(g_hJarEdit, SW_HIDE);
+            ShowWindow(g_hExeEdit, SW_HIDE);
+            ShowWindow(g_hPfEdit, SW_HIDE);
+            ShowWindow(g_hMcEdit, SW_HIDE);
+        };
+
+        hidePageButtons();
+
+        if (g_currentPage == 1)
+        {
+            RECT bamButton = GetAutomationBamButtonRect(rc);
+            RECT bamUnsignedOnly = GetAutomationBamUnsignedOnlyRect(rc);
+            RECT eventButton = GetAutomationEventButtonRect(rc);
+            RECT historyButton = GetAutomationHistoryButtonRect(rc);
+            RECT jarPageButton = GetAutomationJarPageButtonRect(rc);
+
+            RECT page4Button = jarPageButton;
+            page4Button.right = page4Button.left - topGap;
+            page4Button.left = page4Button.right - navButtonW;
+
+            RECT page5Button = page4Button;
+            page5Button.right = page5Button.left - topGap;
+            page5Button.left = page5Button.right - navButtonW;
+
+            MoveChildWindow(g_hAutomationBam, bamButton.left, bamButton.top, bamButton.right - bamButton.left, bamButton.bottom - bamButton.top, TRUE);
+            MoveChildWindow(g_hAutomationBamUnsignedOnly, bamUnsignedOnly.left, bamUnsignedOnly.top, bamUnsignedOnly.right - bamUnsignedOnly.left, bamUnsignedOnly.bottom - bamUnsignedOnly.top, TRUE);
+            MoveChildWindow(g_hAutomationEventVwr, eventButton.left, eventButton.top, eventButton.right - eventButton.left, eventButton.bottom - eventButton.top, TRUE);
+            MoveChildWindow(g_hAutomationHistoryPw, historyButton.left, historyButton.top, historyButton.right - historyButton.left, historyButton.bottom - historyButton.top, TRUE);
+            MoveChildWindow(g_hAutomationJarPage, jarPageButton.left, jarPageButton.top, jarPageButton.right - jarPageButton.left, jarPageButton.bottom - jarPageButton.top, TRUE);
+            MoveChildWindow(g_hPage4Nav, page4Button.left, page4Button.top, page4Button.right - page4Button.left, page4Button.bottom - page4Button.top, TRUE);
+            MoveChildWindow(g_hPage5Nav, page5Button.left, page5Button.top, page5Button.right - page5Button.left, page5Button.bottom - page5Button.top, TRUE);
+
+            RECT historyPanel = GetAutomationHistoryPanelRect(rc);
+            MoveChildWindow(g_hHistoryEdit, historyPanel.left + 10, historyPanel.top + 30, historyPanel.right - historyPanel.left - 34, historyPanel.bottom - historyPanel.top - 40, TRUE);
+            SetWindowTextW(g_hAutomationNav, L"1 лист");
+            SetWindowTextW(g_hAutomationJarPage, L"2 лист");
+            SetWindowTextW(g_hPage4Nav, L"3 лист");
+            SetWindowTextW(g_hPage5Nav, L"4 лист");
+
+            ShowWindow(g_hAutomationBam, SW_SHOWNA);
+            ShowWindow(g_hAutomationBamUnsignedOnly, SW_SHOWNA);
+            ShowWindow(g_hAutomationEventVwr, SW_SHOWNA);
+            ShowWindow(g_hAutomationHistoryPw, SW_SHOWNA);
+            ShowWindow(g_hAutomationJarPage, SW_SHOWNA);
+            if (page4Button.left > AUTOMATION_PANEL_X) ShowWindow(g_hPage4Nav, SW_SHOWNA);
+            if (page5Button.left > AUTOMATION_PANEL_X) ShowWindow(g_hPage5Nav, SW_SHOWNA);
+            ShowWindow(g_hHistoryEdit, SW_SHOWNA);
+        }
+        else if (g_currentPage == 2)
+        {
+            RECT jarButton = GetJarActivButtonRect(rc);
+            RECT exeButton = GetExeDeletedButtonRect(rc);
+            RECT pfButton = GetPfDeletedButtonRect(rc);
+            MoveChildWindow(g_hJarActiv, jarButton.left, jarButton.top, jarButton.right - jarButton.left, jarButton.bottom - jarButton.top, TRUE);
+            MoveChildWindow(g_hExeDeleted, exeButton.left, exeButton.top, exeButton.right - exeButton.left, exeButton.bottom - exeButton.top, TRUE);
+            MoveChildWindow(g_hPfDeleted, pfButton.left, pfButton.top, pfButton.right - pfButton.left, pfButton.bottom - pfButton.top, TRUE);
+
+            RECT jarPanel = GetJarActivityPanelRect(rc);
+            RECT exePanel = GetExeDeletedPanelRect(rc);
+            RECT pfPanel = GetPfDeletedPanelRect(rc);
+            MoveChildWindow(g_hJarEdit, jarPanel.left + 10, jarPanel.top + 30, jarPanel.right - jarPanel.left - 34, jarPanel.bottom - jarPanel.top - 40, TRUE);
+            MoveChildWindow(g_hExeEdit, exePanel.left + 10, exePanel.top + 30, exePanel.right - exePanel.left - 34, exePanel.bottom - exePanel.top - 40, TRUE);
+            MoveChildWindow(g_hPfEdit, pfPanel.left + 10, pfPanel.top + 30, pfPanel.right - pfPanel.left - 34, pfPanel.bottom - pfPanel.top - 40, TRUE);
+
+            ShowWindow(g_hJarActiv, SW_SHOWNA);
+            ShowWindow(g_hExeDeleted, SW_SHOWNA);
+            ShowWindow(g_hPfDeleted, SW_SHOWNA);
+            ShowWindow(g_hMcLogs, SW_HIDE);
+            ShowWindow(g_hJarEdit, SW_HIDE);
+            ShowWindow(g_hExeEdit, SW_HIDE);
+            ShowWindow(g_hPfEdit, SW_HIDE);
+            ShowWindow(g_hMcEdit, SW_HIDE);
+        }
+        else if (g_currentPage == 3)
+        {
+            RECT modButton = GetModHashButtonRect(rc);
+            RECT dllButton = GetDllUnsignedButtonRect(rc);
+            MoveChildWindow(g_hModHash, modButton.left, modButton.top, modButton.right - modButton.left, modButton.bottom - modButton.top, TRUE);
+            MoveChildWindow(g_hDllUnsigned, dllButton.left, dllButton.top, dllButton.right - dllButton.left, dllButton.bottom - dllButton.top, TRUE);
+            ShowWindow(g_hModHash, SW_SHOWNA);
+            ShowWindow(g_hDllUnsigned, SW_SHOWNA);
+
+        }
+        else if (g_currentPage == 4)
+        {
+            RECT usbButton = GetUsbCheckerButtonRect(rc);
+            RECT injButton = GetInjGenButtonRect(rc);
+            MoveChildWindow(g_hUsbChecker, usbButton.left, usbButton.top, usbButton.right - usbButton.left, usbButton.bottom - usbButton.top, TRUE);
+            MoveChildWindow(g_hInjGenCheck, injButton.left, injButton.top, injButton.right - injButton.left, injButton.bottom - injButton.top, TRUE);
+            ShowWindow(g_hUsbChecker, SW_SHOWNA);
+            ShowWindow(g_hInjGenCheck, SW_SHOWNA);
+
+        }
+
+        auto showTopNavAll = [&]()
+        {
+            int x = navX;
+            auto place = [&](HWND h, const wchar_t* text)
+            {
+                if (!h) return;
+                MoveChildWindow(h, x, topY, navButtonW, topButtonH, TRUE);
+                SetWindowTextW(h, text);
+                ShowWindow(h, SW_SHOWNA);
+                x -= navButtonW + topGap;
+            };
+            place(g_hHomeNav, L"Главная");
+            place(g_hPage5Nav, L"4 лист");
+            place(g_hPage4Nav, L"3 лист");
+            place(g_hAutomationJarPage, L"2 лист");
+            place(g_hAutomationNav, L"1 лист");
+        };
+        showTopNavAll();
+
+        InvalidateRect(g_hHomeNav, nullptr, TRUE);
+        InvalidateRect(g_hHomeNav, nullptr, TRUE);
+        InvalidateRect(g_hAutomationNav, nullptr, TRUE);
+        InvalidateRect(g_hAutomationBam, nullptr, TRUE);
+        InvalidateRect(g_hAutomationBamUnsignedOnly, nullptr, TRUE);
+        InvalidateRect(g_hAutomationEventVwr, nullptr, TRUE);
+        InvalidateRect(g_hAutomationHistoryPw, nullptr, TRUE);
+        InvalidateRect(g_hAutomationJarPage, nullptr, TRUE);
+        InvalidateRect(g_hJarActiv, nullptr, TRUE);
+        InvalidateRect(g_hExeDeleted, nullptr, TRUE);
+        InvalidateRect(g_hPfDeleted, nullptr, TRUE);
+        InvalidateRect(g_hMcLogs, nullptr, TRUE);
+        InvalidateRect(g_hPage4Nav, nullptr, TRUE);
+        InvalidateRect(g_hModHash, nullptr, TRUE);
+        InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
+        InvalidateRect(g_hPage5Nav, nullptr, TRUE);
+        InvalidateRect(g_hUsbChecker, nullptr, TRUE);
+        InvalidateRect(g_hInjGenCheck, nullptr, TRUE);
+
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_UPDATENOW);
+        return;
+    }
+
+    ShowWindow(g_hHomeNav, SW_HIDE);
+    ShowWindow(g_hAutomationBam, SW_HIDE);
+    ShowWindow(g_hAutomationBamUnsignedOnly, SW_HIDE);
+    ShowWindow(g_hAutomationEventVwr, SW_HIDE);
+    ShowWindow(g_hAutomationHistoryPw, SW_HIDE);
+    ShowWindow(g_hAutomationJarPage, SW_HIDE);
+    ShowWindow(g_hJarActiv, SW_HIDE);
+    ShowWindow(g_hExeDeleted, SW_HIDE);
+    ShowWindow(g_hPfDeleted, SW_HIDE);
+    ShowWindow(g_hMcLogs, SW_HIDE);
+    ShowWindow(g_hPage4Nav, SW_HIDE);
+    ShowWindow(g_hModHash, SW_HIDE);
+    ShowWindow(g_hDllUnsigned, SW_HIDE);
+    ShowWindow(g_hPage5Nav, SW_HIDE);
+    ShowWindow(g_hUsbChecker, SW_HIDE);
+    ShowWindow(g_hInjGenCheck, SW_HIDE);
+    ShowWindow(g_hHistoryEdit, SW_HIDE);
+    ShowWindow(g_hJarEdit, SW_HIDE);
+    ShowWindow(g_hExeEdit, SW_HIDE);
+    ShowWindow(g_hPfEdit, SW_HIDE);
+    ShowWindow(g_hMcEdit, SW_HIDE);
+
     MoveChildWindow(g_hDeleteHolyCheck, 28, 22, 118, 34, TRUE);
     ShowWindow(g_hDeleteHolyCheck, SW_SHOWNA);
 
     const int topButtonW = 126;
-    const int topButtonH = 34;
-    const int topGap = 9;
-    const int topY = 16;
-    int powerX = width - 28 - topButtonW;
+    int powerX = navX - topGap - topButtonW;
     int servicesX = powerX - topGap - topButtonW;
 
     MoveChildWindow(g_hEnableServices, servicesX, topY, topButtonW, topButtonH, TRUE);
@@ -675,6 +1425,20 @@ static void LayoutControls(HWND hwnd)
     InvalidateRect(g_hDeleteHolyCheck, nullptr, TRUE);
     InvalidateRect(g_hEnableServices, nullptr, TRUE);
     InvalidateRect(g_hPowerShell, nullptr, TRUE);
+    InvalidateRect(g_hAutomationNav, nullptr, TRUE);
+    InvalidateRect(g_hAutomationBamUnsignedOnly, nullptr, TRUE);
+    InvalidateRect(g_hAutomationHistoryPw, nullptr, TRUE);
+    InvalidateRect(g_hAutomationJarPage, nullptr, TRUE);
+    InvalidateRect(g_hJarActiv, nullptr, TRUE);
+    InvalidateRect(g_hExeDeleted, nullptr, TRUE);
+    InvalidateRect(g_hPfDeleted, nullptr, TRUE);
+    InvalidateRect(g_hMcLogs, nullptr, TRUE);
+    InvalidateRect(g_hPage4Nav, nullptr, TRUE);
+    InvalidateRect(g_hModHash, nullptr, TRUE);
+    InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
+    InvalidateRect(g_hPage5Nav, nullptr, TRUE);
+    InvalidateRect(g_hUsbChecker, nullptr, TRUE);
+    InvalidateRect(g_hInjGenCheck, nullptr, TRUE);
     InvalidateRect(g_hCopyEverything1, nullptr, TRUE);
     InvalidateRect(g_hCopyEverything2, nullptr, TRUE);
     InvalidateRect(g_hCopyPowerShell, nullptr, TRUE);
@@ -707,12 +1471,69 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
 
     int id = static_cast<int>(d->CtlID);
 
+    if (id == IDC_AUTOMATION_BAM_UNSIGNED_ONLY)
+    {
+        bool checked = g_bamUnsignedOnly.load();
+        bool pressed = (d->itemState & ODS_SELECTED) != 0;
+        bool disabled = ((d->itemState & ODS_DISABLED) != 0) || !IsWindowEnabled(d->hwndItem);
+
+        PaintParentSceneForButton(d->hwndItem, hdc);
+
+        RECT box = r;
+        box.left += 2;
+        box.top += 4;
+        box.right = box.left + 16;
+        box.bottom = box.top + 16;
+
+        COLORREF borderColor = disabled ? RGB(70, 70, 76) : RGB(120, 128, 146);
+        COLORREF fill = pressed ? RGB(58, 60, 70) : RGB(34, 36, 42);
+        HBRUSH br = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
+        HGDIOBJ oldBrush = SelectObject(hdc, br);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        RoundRect(hdc, box.left, box.top, box.right, box.bottom, 5, 5);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(br);
+
+        if (checked)
+        {
+            HPEN checkPen = CreatePen(PS_SOLID, 2, disabled ? RGB(120, 120, 126) : RGB(170, 205, 255));
+            HGDIOBJ oldCheckPen = SelectObject(hdc, checkPen);
+            MoveToEx(hdc, box.left + 4, box.top + 8, nullptr);
+            LineTo(hdc, box.left + 7, box.top + 12);
+            LineTo(hdc, box.left + 13, box.top + 4);
+            SelectObject(hdc, oldCheckPen);
+            DeleteObject(checkPen);
+        }
+
+        RECT textRect = r;
+        textRect.left = box.right + 7;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, disabled ? RGB(145, 145, 152) : TEXT);
+        HGDIOBJ oldFont = SelectObject(hdc, g_hSmallFont ? g_hSmallFont : g_hFont);
+        DrawTextW(hdc, L"not signed only", -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, oldFont);
+        return;
+    }
+
     bool pressed = (d->itemState & ODS_SELECTED) != 0;
     bool disabled = ((d->itemState & ODS_DISABLED) != 0) || !IsWindowEnabled(d->hwndItem);
     bool selected = false;
 
     if (id >= IDC_TAB_BASE && id < IDC_TAB_BASE + TAB_COUNT)
-        selected = (id - IDC_TAB_BASE == g_currentTab);
+        selected = (g_currentPage == 0 && id - IDC_TAB_BASE == g_currentTab);
+
+    if (id == IDC_AUTOMATION_NAV && g_currentPage == 1)
+        selected = true;
+
+    if (id == IDC_AUTOMATION_JAR_PAGE && g_currentPage == 2)
+        selected = true;
+    if (id == IDC_PAGE4_NAV && g_currentPage == 3)
+        selected = true;
+    if (id == IDC_PAGE5_NAV && g_currentPage == 4)
+        selected = true;
 
     bool copyButton = id == IDC_COPY_EVERYTHING_1 ||
         id == IDC_COPY_EVERYTHING_2 ||
@@ -745,7 +1566,11 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         borderColor = BORDER;
     }
 
-    if (!disabled && (id == IDC_POWERSHELL || id == IDC_ENABLE_SERVICES || id == IDC_DELETE_HOLYCHECK))
+    if (!disabled && (id == IDC_POWERSHELL || id == IDC_ENABLE_SERVICES || id == IDC_DELETE_HOLYCHECK ||
+        id == IDC_AUTOMATION_NAV || id == IDC_AUTOMATION_BAM || id == IDC_AUTOMATION_EVENTVWR ||
+        id == IDC_AUTOMATION_HISTORYPW || id == IDC_AUTOMATION_JAR_PAGE || id == IDC_JAR_ACTIV ||
+        id == IDC_EXE_DELETED || id == IDC_PF_DELETED || id == IDC_PAGE4_NAV ||
+        id == IDC_MOD_HASH || id == IDC_DLL_UNSIGNED || id == IDC_PAGE5_NAV || id == IDC_USB_CHECKER || id == IDC_INJGEN_CHECK))
     {
         fill = pressed ? RGB(70, 72, 82) : RGB(52, 54, 62);
         borderColor = RGB(92, 98, 112);
@@ -1223,7 +2048,7 @@ static void OpenPowerShellMinecraft()
 static void OpenCmdEnableServices()
 {
     std::wstring command =
-        L"/k sc config PcaSVC start= auto & sc start PcaSVC & "
+        L"/c sc config PcaSVC start= auto & sc start PcaSVC & "
         L"sc config DPS start= auto & sc start DPS & "
         L"sc config SysMain start= auto & sc start SysMain & "
         L"sc config EventLog start= auto & sc start EventLog & "

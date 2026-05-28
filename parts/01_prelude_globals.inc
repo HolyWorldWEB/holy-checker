@@ -18,6 +18,7 @@
 #define NOMINMAX
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -29,6 +30,9 @@
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <tlhelp32.h>
+#include <winevt.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 #include <string>
 #include <vector>
@@ -48,6 +52,10 @@
 #include <initializer_list>
 #include <new>
 #include <climits>
+#include <sstream>
+#include <iomanip>
+#include <utility>
+#include <cstddef>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -62,6 +70,8 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wevtapi.lib")
+#pragma comment(lib, "wintrust.lib")
 
 using namespace Gdiplus;
 
@@ -75,6 +85,28 @@ using namespace Gdiplus;
 #define IDC_COPY_EVERYTHING_2 2109
 #define IDC_COPY_POWERSHELL 2110
 #define IDC_COPY_SITES      2111
+#define IDC_AUTOMATION_NAV  2112
+#define IDC_AUTOMATION_BAM  2113
+#define IDC_AUTOMATION_EVENTVWR 2114
+#define IDC_AUTOMATION_BAM_UNSIGNED_ONLY 2115
+#define IDC_AUTOMATION_HISTORYPW 2116
+#define IDC_AUTOMATION_JAR_PAGE 2117
+#define IDC_JAR_ACTIV 2118
+#define IDC_HISTORYPW_EDIT 2119
+#define IDC_EXE_DELETED 2120
+#define IDC_PF_DELETED 2121
+#define IDC_MC_LOGS 2122
+#define IDC_PAGE4_NAV 2123
+#define IDC_MOD_HASH 2124
+#define IDC_DLL_UNSIGNED 2125
+#define IDC_PAGE5_NAV 2126
+#define IDC_USB_CHECKER 2127
+#define IDC_INJGEN_CHECK 2128
+#define IDC_HOME_NAV 2129
+#define IDC_JAR_EDIT 2130
+#define IDC_EXE_EDIT 2131
+#define IDC_PF_EDIT 2132
+#define IDC_MC_EDIT 2133
 #define IDC_TILE_BASE       3000
 
 #define TAB_COUNT           4
@@ -84,6 +116,7 @@ using namespace Gdiplus;
 #define WM_APP_LOG          (WM_APP + 4)
 #define WM_APP_ITEM_DONE    (WM_APP + 5)
 #define WM_APP_REFRESH      (WM_APP + 6)
+#define WM_APP_AUTOMATION_DONE (WM_APP + 7)
 
 #define TIMER_PARTICLES     9001
 
@@ -212,10 +245,34 @@ HWND g_hCopyEverything1 = nullptr;
 HWND g_hCopyEverything2 = nullptr;
 HWND g_hCopyPowerShell = nullptr;
 HWND g_hCopySites = nullptr;
+HWND g_hAutomationNav = nullptr;
+HWND g_hHomeNav = nullptr;
+HWND g_hAutomationBam = nullptr;
+HWND g_hAutomationEventVwr = nullptr;
+HWND g_hAutomationBamUnsignedOnly = nullptr;
+HWND g_hAutomationHistoryPw = nullptr;
+HWND g_hAutomationJarPage = nullptr;
+HWND g_hJarActiv = nullptr;
+HWND g_hExeDeleted = nullptr;
+HWND g_hPfDeleted = nullptr;
+HWND g_hMcLogs = nullptr;
+HWND g_hPage4Nav = nullptr;
+HWND g_hModHash = nullptr;
+HWND g_hDllUnsigned = nullptr;
+HWND g_hPage5Nav = nullptr;
+HWND g_hUsbChecker = nullptr;
+HWND g_hInjGenCheck = nullptr;
+HWND g_hHistoryEdit = nullptr;
+HWND g_hJarEdit = nullptr;
+HWND g_hExeEdit = nullptr;
+HWND g_hPfEdit = nullptr;
+HWND g_hMcEdit = nullptr;
 
 HFONT g_hFont = nullptr;
 HFONT g_hSmallFont = nullptr;
 HFONT g_hTinyFont = nullptr;
+HFONT g_hAutomationTextFont = nullptr;
+HBRUSH g_hAutomationEditBrush = nullptr;
 
 std::vector<HWND> g_tabButtons;
 std::vector<HWND> g_tileButtons;
@@ -228,6 +285,21 @@ std::atomic_bool g_destroying(false);
 std::atomic_int g_activeSingleDownloads(0);
 std::atomic_int g_singleTotal(0);
 std::atomic_int g_singleDone(0);
+std::atomic_bool g_automationBamWorking(false);
+std::atomic_bool g_automationEventWorking(false);
+std::atomic_bool g_automationHistoryWorking(false);
+std::atomic_bool g_automationJarWorking(false);
+std::atomic_bool g_automationExeWorking(false);
+std::atomic_bool g_automationPfWorking(false);
+std::atomic_bool g_automationMcLogsWorking(false);
+std::atomic_bool g_automationPage4Working(false);
+std::atomic_bool g_automationDllWorking(false);
+std::atomic_bool g_automationPage5Working(false);
+std::atomic_bool g_automationInjGenWorking(false);
+std::atomic_int g_activityScanMode(0);
+std::atomic_int g_page4ScanMode(0);
+std::atomic_int g_page5ScanMode(0);
+std::atomic_bool g_bamUnsignedOnly(false);
 
 static thread_local bool g_lastTransferStalled = false;
 static thread_local bool g_lastDownloadedPayloadInvalid = false;
@@ -266,6 +338,7 @@ static bool DidLastDownloadedPayloadInvalid()
 
 std::mutex g_zipMutex;
 std::mutex g_logMutex;
+std::mutex g_automationMutex;
 std::mutex g_activeDownloadsMutex;
 std::mutex g_itemBusyMutex;
 std::mutex g_httpHandlesMutex;
@@ -280,10 +353,36 @@ struct HttpHandleSlot
 std::vector<std::shared_ptr<HttpHandleSlot>> g_httpHandles;
 std::vector<BYTE> g_itemBusy;
 std::vector<std::wstring> g_logLines;
+std::vector<std::wstring> g_bamLines;
+std::vector<std::wstring> g_eventVwrLines;
+std::vector<std::wstring> g_historyPwLines;
+std::vector<std::wstring> g_jarActivityLines;
+std::vector<std::wstring> g_exeDeletedLines;
+std::vector<std::wstring> g_pfDeletedLines;
+std::vector<std::wstring> g_mcLogsLines;
+std::vector<std::wstring> g_page4Lines;
+std::vector<std::wstring> g_dllUnsignedLines;
+std::vector<std::wstring> g_page5Lines;
+std::vector<std::wstring> g_injGenLines;
 std::vector<ActiveDownloadInfo> g_activeDownloads;
 int g_logScrollOffset = 0;
+int g_bamScrollOffset = 0;
+int g_eventVwrScrollOffset = 0;
+int g_historyPwScrollOffset = 0;
+int g_jarActivityScrollOffset = 0;
+int g_exeDeletedScrollOffset = 0;
+int g_pfDeletedScrollOffset = 0;
+int g_mcLogsScrollOffset = 0;
+int g_page4ScrollOffset = 0;
+int g_dllUnsignedScrollOffset = 0;
+int g_page5ScrollOffset = 0;
+int g_injGenScrollOffset = 0;
+bool g_automationScrollDragging = false;
+int g_automationScrollDragTarget = 0;
 
 int g_currentTab = 0;
+int g_currentPage = 0;
+WNDPROC g_oldAutomationEditProc = nullptr;
 int g_progressPercent = 0;
 ULONG_PTR g_gdiplusToken = 0;
 bool g_particlesPaused = false;
@@ -319,6 +418,38 @@ static const int HELPER_PANEL_W = 418;
 static const int HELPER_PANEL_H = 146;
 static const int COPY_BUTTON_W = 82;
 static const int COPY_BUTTON_H = 22;
+static const int AUTOMATION_LEFT_X = 28;
+static const int AUTOMATION_PANEL_X = 160;
+static const int AUTOMATION_BUTTON_W = 124;
+static const int AUTOMATION_BUTTON_H = 34;
+static const int AUTOMATION_PANEL_MIN_W = 520;
+static const int AUTOMATION_PANEL_H = 156;
+static const int AUTOMATION_SERVICE_PANEL_W = 220;
+static const int AUTOMATION_SERVICE_PANEL_H = 150;
+static const int AUTOMATION_SERVICE_PANEL_MARGIN = 24;
+static const size_t AUTOMATION_MAX_LINES = 5000;
+static const size_t AUTOMATION_VISIBLE_LINES = 10;
+
+enum AutomationOutputKind
+{
+    AUTOMATION_OUTPUT_BAM = 1,
+    AUTOMATION_OUTPUT_EVENTVWR = 2,
+    AUTOMATION_OUTPUT_HISTORYPW = 3,
+    AUTOMATION_OUTPUT_JAR_ACTIVITY = 4,
+    AUTOMATION_OUTPUT_PAGE4 = 5,
+    AUTOMATION_OUTPUT_PAGE5 = 6,
+    AUTOMATION_OUTPUT_EXE_DELETED = 7,
+    AUTOMATION_OUTPUT_PF_DELETED = 8,
+    AUTOMATION_OUTPUT_MC_LOGS = 9,
+    AUTOMATION_OUTPUT_DLL_UNSIGNED = 10,
+    AUTOMATION_OUTPUT_INJGEN = 11
+};
+
+struct AutomationResult
+{
+    int target = 0;
+    std::vector<std::wstring> lines;
+};
 
 static RECT GetDownloadLogRect(const RECT& rc)
 {
@@ -357,6 +488,246 @@ static RECT GetHelperTextRect(const RECT& rc)
     }
 
     return out;
+}
+
+static RECT MakeAutomationButtonRect(int top)
+{
+    RECT out{};
+    out.left = AUTOMATION_LEFT_X;
+    out.top = top;
+    out.right = out.left + AUTOMATION_BUTTON_W;
+    out.bottom = out.top + AUTOMATION_BUTTON_H;
+    return out;
+}
+
+static RECT GetAutomationBamButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(84);
+}
+
+static RECT GetAutomationEventButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(254);
+}
+
+static RECT GetAutomationHistoryButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(424);
+}
+
+static RECT GetAutomationJarPageButtonRect(const RECT& rc)
+{
+    const int topButtonH = 34;
+    const int topGap = 9;
+    const int topY = 16;
+    const int navButtonW = 154;
+    int navX = rc.right - 28 - navButtonW;
+
+    RECT out{};
+    out.left = navX - topGap - navButtonW;
+    out.top = topY;
+    out.right = out.left + navButtonW;
+    out.bottom = out.top + topButtonH;
+
+    if (out.left < AUTOMATION_PANEL_X)
+        return MakeAutomationButtonRect(590);
+
+    return out;
+}
+
+static RECT GetJarActivButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(90);
+}
+
+static RECT GetExeDeletedButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(132);
+}
+
+static RECT GetPfDeletedButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(174);
+}
+
+static RECT GetMcLogsButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(216);
+}
+
+static RECT GetModHashButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(90);
+}
+
+static RECT GetDllUnsignedButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(132);
+}
+
+static RECT GetUsbCheckerButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(90);
+}
+
+static RECT GetInjGenButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(132);
+}
+
+static RECT GetAutomationBamUnsignedOnlyRect(const RECT&)
+{
+    RECT out{};
+    out.left = AUTOMATION_LEFT_X;
+    out.top = 124;
+    out.right = out.left + AUTOMATION_BUTTON_W;
+    out.bottom = out.top + 22;
+    return out;
+}
+
+static RECT MakeAutomationPanelRect(const RECT& rc, int top, int height)
+{
+    RECT out{};
+    out.left = AUTOMATION_PANEL_X;
+    out.top = top;
+    out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+
+    if (out.right - out.left < AUTOMATION_PANEL_MIN_W)
+        out.right = out.left + AUTOMATION_PANEL_MIN_W;
+
+    out.bottom = out.top + height;
+
+    if (out.bottom > rc.bottom - 70)
+    {
+        out.bottom = rc.bottom - 70;
+        out.top = std::max<int>(70, static_cast<int>(out.bottom) - height);
+    }
+
+    return out;
+}
+
+static RECT GetAutomationBamPanelRect(const RECT& rc)
+{
+    return MakeAutomationPanelRect(rc, 74, 156);
+}
+
+static RECT GetAutomationEventPanelRect(const RECT& rc)
+{
+    return MakeAutomationPanelRect(rc, 244, 150);
+}
+
+static RECT GetAutomationServicesPanelRect(const RECT& rc)
+{
+    RECT out{};
+    out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+    out.left = out.right - AUTOMATION_SERVICE_PANEL_W;
+    out.bottom = rc.bottom - 68;
+    out.top = out.bottom - AUTOMATION_SERVICE_PANEL_H;
+
+    if (out.top < 470)
+        out.top = 470;
+
+    if (out.left < AUTOMATION_PANEL_X + 360)
+        out.left = AUTOMATION_PANEL_X + 360;
+
+    return out;
+}
+
+static RECT GetAutomationHistoryPanelRect(const RECT& rc)
+{
+    RECT services = GetAutomationServicesPanelRect(rc);
+
+    RECT out{};
+    out.left = AUTOMATION_PANEL_X;
+    out.top = 414;
+    out.right = services.left - 14;
+    out.bottom = rc.bottom - 68;
+
+    if (out.right - out.left < AUTOMATION_PANEL_MIN_W)
+        out.right = std::min(rc.right - AUTOMATION_SERVICE_PANEL_MARGIN, out.left + AUTOMATION_PANEL_MIN_W);
+
+    if (out.bottom - out.top < 190)
+    {
+        out.top = std::max<int>(400, out.bottom - 190);
+        if (out.top < 400)
+            out.top = 400;
+    }
+
+    if (out.bottom <= out.top + 86)
+        out.bottom = out.top + 86;
+
+    return out;
+}
+
+static RECT MakePage3PanelRect(const RECT& rc, int index)
+{
+    int left = AUTOMATION_PANEL_X;
+    int right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+    int top = 58;
+    int gap = 12;
+    int totalH = (rc.bottom - 68) - top;
+    int h = std::max(150, (totalH - gap * 2) / 3);
+    RECT out{};
+    out.left = left;
+    out.right = right;
+    out.top = top + index * (h + gap);
+    out.bottom = out.top + h;
+    if (out.right - out.left < AUTOMATION_PANEL_MIN_W)
+        out.right = out.left + AUTOMATION_PANEL_MIN_W;
+    return out;
+}
+
+static RECT GetJarActivityPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 0); }
+static RECT GetExeDeletedPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 1); }
+static RECT GetPfDeletedPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 2); }
+static RECT GetMcLogsPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 3); }
+
+static RECT GetFullAutomationPanelRect(const RECT& rc)
+{
+    RECT out{};
+    out.left = AUTOMATION_PANEL_X;
+    out.top = 78;
+    out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+    out.bottom = rc.bottom - 68;
+    if (out.right - out.left < AUTOMATION_PANEL_MIN_W)
+        out.right = out.left + AUTOMATION_PANEL_MIN_W;
+    if (out.bottom - out.top < 220)
+        out.bottom = out.top + 220;
+    return out;
+}
+
+static RECT MakeSplitAutomationPanelRect(const RECT& rc, int index)
+{
+    RECT full = GetFullAutomationPanelRect(rc);
+    const int gap = 12;
+    int total = full.bottom - full.top;
+    int h = std::max(180, (total - gap) / 2);
+    RECT out = full;
+    out.top = full.top + index * (h + gap);
+    out.bottom = (index == 0) ? (out.top + h) : full.bottom;
+    if (out.bottom <= out.top + 120)
+        out.bottom = out.top + 120;
+    return out;
+}
+
+static RECT GetPage4PanelRect(const RECT& rc)
+{
+    return MakeSplitAutomationPanelRect(rc, 0);
+}
+
+static RECT GetPage4DllPanelRect(const RECT& rc)
+{
+    return MakeSplitAutomationPanelRect(rc, 1);
+}
+
+static RECT GetPage5PanelRect(const RECT& rc)
+{
+    return MakeSplitAutomationPanelRect(rc, 0);
+}
+
+static RECT GetPage5InjGenPanelRect(const RECT& rc)
+{
+    return MakeSplitAutomationPanelRect(rc, 1);
 }
 
 static bool PointInRect(const RECT& rc, POINT pt)

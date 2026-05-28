@@ -479,11 +479,6 @@ static void DownloadCurrentTab()
 }
 
 
-// Быстрая проверка уже скачанного файла для UI-потока.
-// Важно: для ZIP здесь НЕ делаем рекурсивный поиск .exe внутри папки распаковки.
-// Такой поиск может занимать заметное время и из-за него после клика кажется,
-// что скачивание началось не сразу. Полная проверка/распаковка/открытие остаются
-// в OpenOrDownloadSingleWorker, то есть выполняются в фоновом потоке.
 static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, const std::wstring& baseFolder)
 {
     std::wstring target = GetItemTargetPath(item, baseFolder);
@@ -603,8 +598,6 @@ static void OpenOrDownloadSingleById(int id)
     SetItemBusyIndex(index, true);
     SetTileEnabledByIndex(index, false);
 
-    // Показываем старт сразу после клика, до запуска фонового потока.
-    // Это убирает визуальную паузу перед началом скачивания.
     AddActiveDownload(item.name);
     UpdateActiveDownloadStatus(item.name, L"старт", 1, 1, 0, 0);
     PostProgress(0);
@@ -1101,8 +1094,8 @@ static void DeleteHolyCheckWorker()
 
     AbortActiveHttpHandles();
 
-    for (int i = 0; i < 35 && (g_working.load() || g_activeSingleDownloads.load() > 0); ++i)
-        Sleep(100);
+    for (int i = 0; i < 10 && (g_working.load() || g_activeSingleDownloads.load() > 0); ++i)
+        Sleep(50);
 
     std::wstring folder = GetHolyCheckFolderPathOnly();
 
