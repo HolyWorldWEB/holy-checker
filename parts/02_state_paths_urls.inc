@@ -203,27 +203,57 @@ static std::wstring ExtractFileNameOnly(const std::wstring& path)
 static bool IsLikelySystemExecutable(const std::wstring& path)
 {
     std::wstring lower = ToLowerCopy(path);
+    std::replace(lower.begin(), lower.end(), L'/', L'\\');
     std::wstring file = ExtractFileNameOnly(lower);
 
     if (lower.empty())
         return true;
 
-    if (lower.find(L"\\windows\\") != std::wstring::npos ||
-        lower.find(L"\\systemroot\\") != std::wstring::npos ||
-        lower.find(L"\\$windows.~bt\\") != std::wstring::npos ||
-        lower.find(L"\\$windows.~ws\\") != std::wstring::npos ||
-        lower.find(L"\\program files\\windowsapps\\") != std::wstring::npos ||
-        lower.find(L"\\windowsapps\\microsoft.") != std::wstring::npos ||
-        lower.find(L"\\windowsapps\\windows.") != std::wstring::npos ||
-        lower.find(L"\\programdata\\microsoft\\windows\\") != std::wstring::npos ||
-        lower.find(L"\\microsoft\\windows\\") != std::wstring::npos ||
-        lower.find(L"microsoft.windows.") != std::wstring::npos ||
-        lower.find(L"windows.client.") != std::wstring::npos ||
-        lower.find(L"startmenuexperiencehost") != std::wstring::npos ||
-        lower.find(L"client.cbs") != std::wstring::npos ||
-        lower.find(L"_cw5n1h2txyewy") != std::wstring::npos ||
-        lower.find(L"_8wekyb3d8bbwe") != std::wstring::npos ||
-        lower.find(L"__8wekyb3d8bbwe") != std::wstring::npos)
+    wchar_t winDirBuf[MAX_PATH * 4]{};
+    std::wstring winDir;
+    UINT winLen = GetWindowsDirectoryW(winDirBuf, ARRAYSIZE(winDirBuf));
+    if (winLen > 0 && winLen < ARRAYSIZE(winDirBuf))
+    {
+        winDir = ToLowerCopy(winDirBuf);
+        std::replace(winDir.begin(), winDir.end(), L'/', L'\\');
+        while (!winDir.empty() && winDir.back() == L'\\')
+            winDir.pop_back();
+    }
+
+    std::wstring winLeafNeedle;
+    if (!winDir.empty())
+        winLeafNeedle = L"\\" + ExtractFileNameOnly(winDir) + L"\\";
+
+    auto has = [&](const wchar_t* needle) -> bool
+    {
+        return lower.find(needle) != std::wstring::npos;
+    };
+
+    // Самый надёжный быстрый фильтр для этой утилиты: не хешировать каждый exe,
+    // а не пропускать Windows/SystemRoot/WinSxS/WindowsApps/Microsoft системные пути.
+    // Хеши без локальной базы эталонных системных хешей не дают 100% результата и сильно тормозят скан.
+    if ((!winDir.empty() && (lower.rfind(winDir + L"\\", 0) == 0 || (!winLeafNeedle.empty() && lower.find(winLeafNeedle) != std::wstring::npos))) ||
+        has(L"\\windows\\") ||
+        has(L"\\systemroot\\") ||
+        has(L"\\winsxs\\") ||
+        has(L"\\system32\\") ||
+        has(L"\\syswow64\\") ||
+        has(L"\\microsoft.net\\framework") ||
+        has(L"\\$windows.~bt\\") ||
+        has(L"\\$windows.~ws\\") ||
+        has(L"\\program files\\windowsapps\\") ||
+        has(L"\\program files (x86)\\windowsapps\\") ||
+        has(L"\\windowsapps\\microsoft.") ||
+        has(L"\\windowsapps\\windows.") ||
+        has(L"\\programdata\\microsoft\\windows\\") ||
+        has(L"\\microsoft\\windows\\") ||
+        has(L"microsoft.windows.") ||
+        has(L"windows.client.") ||
+        has(L"startmenuexperiencehost") ||
+        has(L"client.cbs") ||
+        has(L"_cw5n1h2txyewy") ||
+        has(L"_8wekyb3d8bbwe") ||
+        has(L"__8wekyb3d8bbwe"))
     {
         return true;
     }
@@ -245,13 +275,48 @@ static bool IsLikelySystemExecutable(const std::wstring& path)
         L"dwm.exe", L"ctfmon.exe", L"securityhealthsystray.exe", L"startmenuexperiencehost.exe",
         L"shellexperiencehost.exe", L"applicationframehost.exe", L"lockapp.exe", L"textinputhost.exe",
         L"backgroundtaskhost.exe", L"systemsettings.exe", L"trustedinstaller.exe", L"tiworker.exe",
-        L"mousocoreworker.exe", L"wuauclt.exe", L"wermgr.exe", L"msiexec.exe",
-        L"client.cbs", L"searchapp.exe", L"widgets.exe", L"widgetservice.exe"
+        L"mousocoreworker.exe", L"wuauclt.exe", L"musnotification.exe", L"musnotificationux.exe",
+        L"usocoreworker.exe", L"compattelrunner.exe", L"devicecensus.exe", L"consent.exe",
+        L"smartscreen.exe", L"securityhealthservice.exe", L"securityhealthhost.exe",
+        L"sppsvc.exe", L"vssvc.exe", L"spoolsv.exe", L"wscript.exe", L"cscript.exe",
+        L"msiexec.exe", L"msedgewebview2.exe", L"client.cbs", L"searchapp.exe",
+        L"widgets.exe", L"widgetservice.exe", L"onedrivesetup.exe", L"setuphost.exe",
+        L"backgrounddownload.exe", L"aggregatorhost.exe", L"systemsettingsbroker.exe",
+        L"yourphone.exe", L"phoneexperiencehost.exe", L"gamebar.exe", L"gamebarftserver.exe",
+        L"gamebarpresencewriter.exe", L"xboxgamebarwidgets.exe"
     };
 
     for (const wchar_t* name : systemNames)
     {
-        if (file == ToLowerCopy(name) || file.find(ToLowerCopy(name)) != std::wstring::npos)
+        std::wstring n = ToLowerCopy(name);
+        if (file == n || file.find(n) != std::wstring::npos)
+            return true;
+    }
+
+    // Дополнительные системные/служебные зоны. Это быстрее и надёжнее для live-скана,
+    // чем хешировать каждый exe без локальной базы эталонных системных хешей.
+    if (has(L"\\program files\\microsoft\\") ||
+        has(L"\\program files (x86)\\microsoft\\") ||
+        has(L"\\program files\\windows defender\\") ||
+        has(L"\\program files\\windows security\\") ||
+        has(L"\\program files\\windows nt\\") ||
+        has(L"\\program files\\internet explorer\\") ||
+        has(L"\\program files (x86)\\internet explorer\\") ||
+        has(L"\\program files\\common files\\microsoft shared\\") ||
+        has(L"\\program files (x86)\\common files\\microsoft shared\\") ||
+        has(L"\\appdata\\local\\microsoft\\windows\\") ||
+        has(L"\\appdata\\roaming\\microsoft\\windows\\") ||
+        has(L"\\appdata\\local\\packages\\microsoft.") ||
+        has(L"\\appdata\\local\\packages\\windows."))
+    {
+        return true;
+    }
+
+    // Prefetch-файлы часто дают только имя exe. Если это типичное системное имя — не выводим вообще.
+    if (lower.find(L"\\") == std::wstring::npos && lower.find(L"/") == std::wstring::npos)
+    {
+        if (file.rfind(L"microsoft.", 0) == 0 || file.rfind(L"windows.", 0) == 0 ||
+            file.find(L"setup") != std::wstring::npos || file.find(L"update") != std::wstring::npos)
             return true;
     }
 
@@ -922,6 +987,8 @@ static size_t GetAutomationVisibleLineCapacity(int target)
         panel = GetAutomationHistoryPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
         panel = GetJarActivityPanelRect(rc);
+    else if (target == AUTOMATION_OUTPUT_JAR_MODIFIED)
+        panel = GetJarModifiedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_EXE_DELETED)
         panel = GetExeDeletedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_PF_DELETED)
@@ -929,18 +996,16 @@ static size_t GetAutomationVisibleLineCapacity(int target)
     else if (target == AUTOMATION_OUTPUT_MC_LOGS)
         panel = GetMcLogsPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_PAGE4)
-        panel = GetPage4PanelRect(rc);
+        panel = (g_currentPage == 1) ? GetAutomationBamPanelRect(rc) : GetPage4PanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
-        panel = GetPage4DllPanelRect(rc);
-    else if (target == AUTOMATION_OUTPUT_PAGE5)
-        panel = GetPage5PanelRect(rc);
+        panel = GetDllUnsignedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
         panel = GetPage5InjGenPanelRect(rc);
     else
         panel = GetAutomationBamPanelRect(rc);
 
     int h = panel.bottom - panel.top;
-    int capacity = std::max(1, (h - 34) / 13);
+    int capacity = std::max(1, (h - 34) / 15);
     return static_cast<size_t>(capacity);
 }
 
@@ -962,6 +1027,8 @@ static int& AutomationScrollRef(int target)
         return g_historyPwScrollOffset;
     if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
         return g_jarActivityScrollOffset;
+    if (target == AUTOMATION_OUTPUT_JAR_MODIFIED)
+        return g_jarModifiedScrollOffset;
     if (target == AUTOMATION_OUTPUT_EXE_DELETED)
         return g_exeDeletedScrollOffset;
     if (target == AUTOMATION_OUTPUT_PF_DELETED)
@@ -972,8 +1039,6 @@ static int& AutomationScrollRef(int target)
         return g_page4ScrollOffset;
     if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         return g_dllUnsignedScrollOffset;
-    if (target == AUTOMATION_OUTPUT_PAGE5)
-        return g_page5ScrollOffset;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_injGenScrollOffset;
     return g_bamScrollOffset;
@@ -987,6 +1052,8 @@ static std::vector<std::wstring>& AutomationLinesRef(int target)
         return g_historyPwLines;
     if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
         return g_jarActivityLines;
+    if (target == AUTOMATION_OUTPUT_JAR_MODIFIED)
+        return g_jarModifiedLines;
     if (target == AUTOMATION_OUTPUT_EXE_DELETED)
         return g_exeDeletedLines;
     if (target == AUTOMATION_OUTPUT_PF_DELETED)
@@ -997,8 +1064,6 @@ static std::vector<std::wstring>& AutomationLinesRef(int target)
         return g_page4Lines;
     if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         return g_dllUnsignedLines;
-    if (target == AUTOMATION_OUTPUT_PAGE5)
-        return g_page5Lines;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_injGenLines;
     return g_bamLines;
@@ -1055,28 +1120,14 @@ static std::wstring JoinAutomationLinesForEdit(const std::vector<std::wstring>& 
 
 static void SyncAutomationEditScrollToState(int target);
 
-static void UpdateHistoryEditWindow()
-{
-    HWND edit = g_hHistoryEdit;
-    if (!edit || g_destroying.load())
-        return;
-
-    std::vector<std::wstring> lines;
-    {
-        std::lock_guard<std::mutex> lock(g_automationMutex);
-        lines = g_historyPwLines;
-    }
-
-    std::wstring text = JoinAutomationLinesForEdit(lines);
-    SetWindowTextW(edit, text.c_str());
-    SyncAutomationEditScrollToState(AUTOMATION_OUTPUT_HISTORYPW);
-}
-
+static void UpdateHistoryEditWindow();
 
 static HWND AutomationEditForTarget(int target)
 {
+    if (target == AUTOMATION_OUTPUT_EVENTVWR) return g_hEventEdit;
     if (target == AUTOMATION_OUTPUT_HISTORYPW) return g_hHistoryEdit;
     if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY) return g_hJarEdit;
+    if (target == AUTOMATION_OUTPUT_JAR_MODIFIED) return nullptr;
     if (target == AUTOMATION_OUTPUT_EXE_DELETED) return g_hExeEdit;
     if (target == AUTOMATION_OUTPUT_PF_DELETED) return g_hPfEdit;
     if (target == AUTOMATION_OUTPUT_MC_LOGS) return g_hMcEdit;
@@ -1114,7 +1165,15 @@ static void UpdateAutomationEditWindow(int target)
     }
     std::wstring text = JoinAutomationLinesForEdit(lines);
     SetWindowTextW(edit, text.c_str());
+    if (target == AUTOMATION_OUTPUT_EVENTVWR || target == AUTOMATION_OUTPUT_HISTORYPW)
+        ShowScrollBar(edit, SB_BOTH, FALSE);
     SyncAutomationEditScrollToState(target);
+}
+
+static void UpdateHistoryEditWindow()
+{
+    UpdateAutomationEditWindow(AUTOMATION_OUTPUT_HISTORYPW);
+    UpdateAutomationEditWindow(AUTOMATION_OUTPUT_EVENTVWR);
 }
 
 static HWND AutomationEditForTarget(int target);
@@ -1152,12 +1211,12 @@ static RECT GetAutomationPanelRectForTarget(int target, const RECT& rc)
     if (target == AUTOMATION_OUTPUT_EVENTVWR) return GetAutomationEventPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_HISTORYPW) return GetAutomationHistoryPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY) return GetJarActivityPanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_JAR_MODIFIED) return GetJarModifiedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_EXE_DELETED) return GetExeDeletedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_PF_DELETED) return GetPfDeletedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_MC_LOGS) return GetMcLogsPanelRect(rc);
-    if (target == AUTOMATION_OUTPUT_PAGE4) return GetPage4PanelRect(rc);
-    if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED) return GetPage4DllPanelRect(rc);
-    if (target == AUTOMATION_OUTPUT_PAGE5) return GetPage5PanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_PAGE4) return (g_currentPage == 1) ? GetAutomationBamPanelRect(rc) : GetPage4PanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED) return GetDllUnsignedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_INJGEN) return GetPage5InjGenPanelRect(rc);
     return GetAutomationBamPanelRect(rc);
 }
@@ -1237,17 +1296,17 @@ static int AutomationScrollTargetAtPoint(POINT pt)
     RECT rc{};
     GetClientRect(g_hMain, &rc);
 
-    int targetsPage1[] = { AUTOMATION_OUTPUT_BAM, AUTOMATION_OUTPUT_EVENTVWR, AUTOMATION_OUTPUT_HISTORYPW };
-    int targetsPage2[] = { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_EXE_DELETED, AUTOMATION_OUTPUT_PF_DELETED };
-    int targetsPage3[] = { AUTOMATION_OUTPUT_PAGE4, AUTOMATION_OUTPUT_DLL_UNSIGNED };
-    int targetsPage4[] = { AUTOMATION_OUTPUT_PAGE5, AUTOMATION_OUTPUT_INJGEN };
+    int targetsPage1[] = { AUTOMATION_OUTPUT_PAGE4, AUTOMATION_OUTPUT_EVENTVWR, AUTOMATION_OUTPUT_HISTORYPW };
+    int targetsPage2[] = { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_EXE_DELETED, AUTOMATION_OUTPUT_DLL_UNSIGNED };
+    int targetsPage3[] = { AUTOMATION_OUTPUT_PAGE4 };
+    int targetsPage4[] = { AUTOMATION_OUTPUT_INJGEN };
 
     const int* targets = nullptr;
     int count = 0;
     if (g_currentPage == 1) { targets = targetsPage1; count = 3; }
     else if (g_currentPage == 2) { targets = targetsPage2; count = 3; }
-    else if (g_currentPage == 3) { targets = targetsPage3; count = 2; }
-    else if (g_currentPage == 4) { targets = targetsPage4; count = 2; }
+    else if (g_currentPage == 3) { targets = targetsPage3; count = 1; }
+    else if (g_currentPage == 4) { targets = targetsPage4; count = 1; }
 
     for (int i = 0; i < count; ++i)
     {
@@ -1275,6 +1334,8 @@ static void InvalidateAutomationPanel(int target)
         panel = GetAutomationHistoryPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
         panel = GetJarActivityPanelRect(rc);
+    else if (target == AUTOMATION_OUTPUT_JAR_MODIFIED)
+        panel = GetJarModifiedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_EXE_DELETED)
         panel = GetExeDeletedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_PF_DELETED)
@@ -1282,11 +1343,9 @@ static void InvalidateAutomationPanel(int target)
     else if (target == AUTOMATION_OUTPUT_MC_LOGS)
         panel = GetMcLogsPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_PAGE4)
-        panel = GetPage4PanelRect(rc);
+        panel = (g_currentPage == 1) ? GetAutomationBamPanelRect(rc) : GetPage4PanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
-        panel = GetPage4DllPanelRect(rc);
-    else if (target == AUTOMATION_OUTPUT_PAGE5)
-        panel = GetPage5PanelRect(rc);
+        panel = GetDllUnsignedPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
         panel = GetPage5InjGenPanelRect(rc);
     else
@@ -1322,6 +1381,8 @@ static std::atomic_bool& AutomationWorkingRef(int target)
         return g_automationHistoryWorking;
     if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
         return g_automationJarWorking;
+    if (target == AUTOMATION_OUTPUT_JAR_MODIFIED)
+        return g_automationJarModifiedWorking;
     if (target == AUTOMATION_OUTPUT_EXE_DELETED)
         return g_automationExeWorking;
     if (target == AUTOMATION_OUTPUT_PF_DELETED)
@@ -1332,8 +1393,6 @@ static std::atomic_bool& AutomationWorkingRef(int target)
         return g_automationPage4Working;
     if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         return g_automationDllWorking;
-    if (target == AUTOMATION_OUTPUT_PAGE5)
-        return g_automationPage5Working;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_automationInjGenWorking;
     return g_automationBamWorking;
@@ -1435,6 +1494,10 @@ static void AppendBamRegistryKey(const wchar_t* subPath, bool unsignedOnly, std:
 {
     HKEY root = nullptr;
     LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subPath, 0, KEY_READ | KEY_WOW64_64KEY, &root);
+    if (openResult != ERROR_SUCCESS)
+        openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subPath, 0, KEY_READ | KEY_WOW64_32KEY, &root);
+    if (openResult != ERROR_SUCCESS)
+        openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subPath, 0, KEY_READ, &root);
 
     if (openResult != ERROR_SUCCESS)
     {
@@ -1490,9 +1553,6 @@ static void AppendBamRegistryKey(const wchar_t* subPath, bool unsignedOnly, std:
             std::wstring rawPath(valueName.data(), valueNameLen);
             std::wstring displayPath = DevicePathToDosPath(rawPath);
 
-            if (IsLikelySystemExecutable(displayPath) || IsLikelySystemExecutable(rawPath))
-                continue;
-
             FILETIME ft{};
             std::wstring when = L"дата неизвестна";
             ULONGLONG ftValue = 0;
@@ -1505,7 +1565,9 @@ static void AppendBamRegistryKey(const wchar_t* subPath, bool unsignedOnly, std:
 
             BamSignatureState signature = GetBamSignatureState(displayPath);
 
-            if (unsignedOnly && signature == BamSignatureState::Signed)
+            // unsignedOnly означает строго только unsigned/not signed.
+            // Deleted/отсутствующие файлы и signed в BAM не выводим.
+            if (unsignedOnly && signature != BamSignatureState::NotSigned)
                 continue;
 
             BamEntry entry;
@@ -1526,6 +1588,9 @@ static void AppendBamRegistryKey(const wchar_t* subPath, bool unsignedOnly, std:
 
 static std::vector<std::wstring> ScanBamRegistry(bool unsignedOnly)
 {
+    // BAM в интерфейсе всегда выводит только unsigned/not signed файлы.
+    unsignedOnly = true;
+
     std::vector<std::wstring> lines;
     std::vector<std::wstring> notes;
     std::vector<BamEntry> rows;
@@ -1533,7 +1598,11 @@ static std::vector<std::wstring> ScanBamRegistry(bool unsignedOnly)
     const wchar_t* subPaths[] =
     {
         L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings",
-        L"SYSTEM\\CurrentControlSet\\Services\\bam\\UserSettings"
+        L"SYSTEM\\CurrentControlSet\\Services\\bam\\UserSettings",
+        L"SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings",
+        L"SYSTEM\\ControlSet001\\Services\\bam\\UserSettings",
+        L"SYSTEM\\ControlSet002\\Services\\bam\\State\\UserSettings",
+        L"SYSTEM\\ControlSet002\\Services\\bam\\UserSettings"
     };
 
     for (const wchar_t* subPath : subPaths)
@@ -1563,7 +1632,7 @@ static std::vector<std::wstring> ScanBamRegistry(bool unsignedOnly)
     if (rows.empty())
     {
         if (unsignedOnly)
-            lines.push_back(L"unsigned/deleted записей не найдено или все записи похожи на системные.");
+            lines.push_back(L"unsigned записей не найдено или все записи похожи на системные.");
         else
             lines.push_back(L"пользовательских запусков не найдено или все найденные записи похожи на системные.");
 
@@ -2355,6 +2424,74 @@ static void SortAutomationOutputLinesByDateDesc(std::vector<std::wstring>& lines
         lines[headerLines + i] = rows[i].line;
 }
 
+
+static bool TryParseAutomationDateKeyInPipeColumn(const std::wstring& line, size_t column, long long& key)
+{
+    std::wstring clean = line;
+    if (!clean.empty() && clean[0] == L'\xE000')
+        clean.erase(clean.begin());
+    size_t start = 0;
+    for (size_t c = 0; ; ++c)
+    {
+        size_t pos = clean.find(L" | ", start);
+        std::wstring part = (pos == std::wstring::npos) ? clean.substr(start) : clean.substr(start, pos - start);
+        if (c == column)
+            return TryParseAutomationDateKeyAnywhere(part, key);
+        if (pos == std::wstring::npos)
+            break;
+        start = pos + 3;
+    }
+    return false;
+}
+
+static void SortAutomationOutputLinesByPipeColumnDateDesc(std::vector<std::wstring>& lines, size_t column, size_t headerLines = 1)
+{
+    if (lines.size() <= headerLines + 1)
+        return;
+
+    struct SortRow
+    {
+        std::wstring line;
+        long long key;
+        size_t order;
+        bool hasDate;
+    };
+
+    std::vector<SortRow> rows;
+    rows.reserve(lines.size() - headerLines);
+    for (size_t i = headerLines; i < lines.size(); ++i)
+    {
+        long long key = 0;
+        bool hasDate = TryParseAutomationDateKeyInPipeColumn(lines[i], column, key);
+        rows.push_back({ lines[i], key, i, hasDate });
+    }
+
+    std::stable_sort(rows.begin(), rows.end(), [](const SortRow& a, const SortRow& b)
+    {
+        if (a.hasDate != b.hasDate)
+            return a.hasDate;
+        if (a.hasDate && b.hasDate && a.key != b.key)
+            return a.key > b.key;
+        return a.order < b.order;
+    });
+
+    for (size_t i = 0; i < rows.size(); ++i)
+        lines[headerLines + i] = rows[i].line;
+}
+
+static bool SortAutomationTargetLinesByPipeColumnDateDesc(int target, size_t column)
+{
+    std::lock_guard<std::mutex> lock(g_automationMutex);
+    std::vector<std::wstring>& lines = AutomationLinesRef(target);
+    if (lines.size() <= 2)
+        return false;
+
+    std::vector<std::wstring> before = lines;
+    SortAutomationOutputLinesByPipeColumnDateDesc(lines, column, 1);
+    AutomationScrollRef(target) = 0;
+    return before != lines;
+}
+
 static std::wstring PickUsnFileNameFromCsvFields(const std::vector<std::wstring>& fields, const std::wstring& rawLine)
 {
     if (fields.size() > 1)
@@ -2399,6 +2536,8 @@ static std::wstring PickUsnFileNameFromCsvFields(const std::vector<std::wstring>
 }
 
 static bool ContainsExtensionToken(const std::wstring& text, const std::wstring& ext);
+static std::wstring CleanPipeCell(std::wstring value);
+
 
 static std::wstring PickUsnFileNameFromCsvFieldsGeneric(const std::vector<std::wstring>& fields, const std::wstring& rawLine, const std::wstring& ext)
 {
@@ -2431,16 +2570,16 @@ static std::wstring PickUsnFileNameFromCsvFieldsGeneric(const std::vector<std::w
         --start;
     }
 
-    size_t end = extPos + lowerExt.size();
-    while (end < rawLine.size())
+    size_t endPos = extPos + lowerExt.size();
+    while (endPos < rawLine.size())
     {
-        wchar_t ch = rawLine[end];
+        wchar_t ch = rawLine[endPos];
         if (ch == L',' || ch == L'"' || ch == L'|' || ch == L' ' || ch == L'\t')
             break;
-        ++end;
+        ++endPos;
     }
 
-    return ExtractFileNameOnly(rawLine.substr(start, end - start));
+    return ExtractFileNameOnly(rawLine.substr(start, endPos - start));
 }
 
 static bool ContainsExtensionToken(const std::wstring& text, const std::wstring& ext)
@@ -2469,6 +2608,178 @@ static bool ContainsExtensionToken(const std::wstring& text, const std::wstring&
 
     return name.compare(name.size() - lowerExt.size(), lowerExt.size(), lowerExt) == 0;
 }
+
+static std::wstring ExtractUsnPathLikeForExtension(const std::wstring& text, const std::wstring& ext)
+{
+    std::wstring clean = TrimAutomationField(text);
+    if (clean.empty())
+        return L"";
+
+    std::wstring lower = ToLowerCopy(clean);
+    std::wstring lowerExt = ToLowerCopy(ext);
+    size_t extPos = lower.find(lowerExt);
+    if (extPos == std::wstring::npos)
+        return L"";
+
+    size_t endPos = extPos + lowerExt.size();
+    while (endPos < clean.size())
+    {
+        wchar_t ch = clean[endPos];
+        if (ch == L'"' || ch == L'|' || ch == L',' || ch == L'\r' || ch == L'\n' || ch == L'\t')
+            break;
+        ++endPos;
+    }
+
+    size_t start = std::wstring::npos;
+    size_t drivePos = lower.rfind(L":\\", extPos);
+    if (drivePos != std::wstring::npos && drivePos > 0)
+        start = drivePos - 1;
+    else
+    {
+        size_t devPos = lower.rfind(L"\\device\\", extPos);
+        if (devPos != std::wstring::npos)
+            start = devPos;
+    }
+
+    if (start == std::wstring::npos)
+        return L"";
+
+    return CleanPipeCell(DevicePathToDosPath(clean.substr(start, endPos - start)));
+}
+
+static std::wstring PickUsnPathFromCsvFieldsGeneric(const std::vector<std::wstring>& fields, const std::wstring& rawLine, const std::wstring& ext)
+{
+    // USN usually contains only the file name. If a full path is present in CSV,
+    // show it; otherwise keep the filename in the path column instead of leaving it empty.
+    for (const std::wstring& field : fields)
+    {
+        std::wstring path = ExtractUsnPathLikeForExtension(field, ext);
+        if (!path.empty())
+            return path;
+    }
+
+    std::wstring path = ExtractUsnPathLikeForExtension(rawLine, ext);
+    if (!path.empty())
+        return path;
+
+    return CleanPipeCell(PickUsnFileNameFromCsvFieldsGeneric(fields, rawLine, ext));
+}
+
+
+static std::wstring NormalizeUsnFileReferenceField(std::wstring value)
+{
+    value = TrimAutomationField(value);
+    if (value.empty())
+        return L"";
+
+    while (!value.empty() && (value.front() == L'"' || value.front() == L'['))
+        value.erase(value.begin());
+    while (!value.empty() && (value.back() == L'"' || value.back() == L']' || value.back() == L','))
+        value.pop_back();
+
+    if (value.empty())
+        return L"";
+
+    std::wstring lower = ToLowerCopy(value);
+    bool hasHexPrefix = lower.rfind(L"0x", 0) == 0;
+    std::wstring digits = hasHexPrefix ? lower.substr(2) : lower;
+    if (digits.empty())
+        return L"";
+
+    bool allDecimal = true;
+    bool allHex = true;
+    bool hasHexLetter = false;
+    for (wchar_t ch : digits)
+    {
+        if (!iswdigit(ch))
+            allDecimal = false;
+        if (!iswxdigit(ch))
+            allHex = false;
+        if ((ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F'))
+            hasHexLetter = true;
+    }
+
+    if (hasHexPrefix)
+    {
+        if (!allHex || digits.size() > 16)
+            return L"";
+        return L"0x" + digits;
+    }
+
+    // fsutil csv can print file reference numbers as decimal.  Do not convert
+    // decimal-looking values to hex: queryfilenamebyid accepts the decimal form,
+    // while adding 0x changes the value and breaks parent path recovery.
+    if (allDecimal)
+        return digits;
+
+    if (allHex && hasHexLetter && digits.size() <= 16)
+        return L"0x" + digits;
+
+    return L"";
+}
+
+static void PickUsnReferenceFields(const std::vector<std::wstring>& fields, std::wstring& fileRef, std::wstring& parentRef)
+{
+    fileRef.clear();
+    parentRef.clear();
+
+    // fsutil usn readjournal C: csv normally starts with:
+    // USN | File name | File reference number | Parent file reference number | Reason | Time stamp | ...
+    if (fields.size() > 2)
+        fileRef = NormalizeUsnFileReferenceField(fields[2]);
+    if (fields.size() > 3)
+        parentRef = NormalizeUsnFileReferenceField(fields[3]);
+}
+
+static std::wstring ExtractDosPathFromFsutilFileIdOutput(const std::wstring& output)
+{
+    std::wstring text = output;
+    size_t start = text.find(L":\\");
+    if (start == std::wstring::npos || start == 0)
+        return L"";
+
+    --start; // include the drive letter
+    size_t end = text.find_first_of(L"\r\n", start);
+    std::wstring path = (end == std::wstring::npos) ? text.substr(start) : text.substr(start, end - start);
+
+    while (!path.empty() && (path.front() == L'"' || path.front() == L'[' || path.front() == L' ' || path.front() == L'\t'))
+        path.erase(path.begin());
+    while (!path.empty() && (path.back() == L'"' || path.back() == L']' || path.back() == L' ' || path.back() == L'\t' || path.back() == L'.'))
+        path.pop_back();
+
+    return CleanPipeCell(DevicePathToDosPath(path));
+}
+
+static std::wstring QueryNtfsPathByFileReferenceCached(const std::wstring& fileRef)
+{
+    static std::mutex cacheMutex;
+    static std::map<std::wstring, std::wstring> cache;
+
+    std::wstring ref = NormalizeUsnFileReferenceField(fileRef);
+    if (ref.empty())
+        return L"";
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto it = cache.find(ref);
+        if (it != cache.end())
+            return it->second;
+    }
+
+    std::wstring output;
+    std::wstring command = L"fsutil file queryfilenamebyid C: " + ref;
+    std::wstring result;
+    if (RunHiddenCommandCapture(command, output, 12000))
+        result = ExtractDosPathFromFsutilFileIdOutput(output);
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        cache[ref] = result;
+    }
+
+    return result;
+}
+
 
 static bool ContainsJarExtensionToken(const std::wstring& text)
 {
@@ -2555,6 +2866,7 @@ static std::wstring ReasonTextFromMask(ULONGLONG mask)
     AddReasonPart(parts, mask, 0x00002000ULL, L"Rename new name");
     AddReasonPart(parts, mask, 0x00008000ULL, L"Basic info change");
     AddReasonPart(parts, mask, 0x00200000ULL, L"Stream change");
+    AddReasonPart(parts, mask, 0x80000000ULL, L"Close");
     return JoinReasonParts(parts);
 }
 
@@ -2565,7 +2877,8 @@ static bool FieldLooksLikeReasonText(const std::wstring& field)
         lower.find(L"file ") != std::wstring::npos ||
         lower.find(L"rename") != std::wstring::npos ||
         lower.find(L"basic info") != std::wstring::npos ||
-        lower.find(L"stream") != std::wstring::npos;
+        lower.find(L"stream") != std::wstring::npos ||
+        lower.find(L"close") != std::wstring::npos;
 }
 
 static std::wstring PickUsnReasonTextFromCsvFields(const std::vector<std::wstring>& fields, const std::wstring& rawLine, ULONGLONG mask)
@@ -2592,6 +2905,9 @@ struct JarUsnEntry
 {
     std::wstring date;
     std::wstring name;
+    std::wstring path;
+    std::wstring fileRef;
+    std::wstring parentRef;
     std::wstring lowerRaw;
     ULONGLONG reason = 0;
     std::wstring reasonText;
@@ -2603,7 +2919,43 @@ struct JarUsnEntry
     bool dataExtend = false;
     bool basicInfo = false;
     bool streamChange = false;
+    bool close = false;
 };
+
+static std::wstring ResolveUsnFullPathForEntry(const JarUsnEntry& e, const std::wstring& ext)
+{
+    std::wstring path = CleanPipeCell(DevicePathToDosPath(e.path));
+    if (path.find(L":\\") != std::wstring::npos || ToLowerCopy(path).find(L"\\device\\") != std::wstring::npos)
+        return path;
+
+    std::wstring name = CleanPipeCell(e.name.empty() ? ExtractFileNameOnly(path) : e.name);
+    if (name.empty())
+        name = ExtractFileNameOnly(path);
+    if (name.empty())
+        return path;
+
+    if (!e.deleted && !e.fileRef.empty())
+    {
+        std::wstring exact = QueryNtfsPathByFileReferenceCached(e.fileRef);
+        if (!exact.empty() && ContainsExtensionToken(exact, ext))
+            return exact;
+    }
+
+    if (!e.parentRef.empty())
+    {
+        std::wstring parent = QueryNtfsPathByFileReferenceCached(e.parentRef);
+        if (!parent.empty())
+        {
+            while (!parent.empty() && (parent.back() == L'\\' || parent.back() == L'/'))
+                parent.pop_back();
+            if (!parent.empty())
+                return CleanPipeCell(parent + L"\\" + ExtractFileNameOnly(name));
+        }
+    }
+
+    return CleanPipeCell(path.empty() ? name : path);
+}
+
 
 static bool TextHasAny(const std::wstring& lower, const wchar_t* a, const wchar_t* b = L"", const wchar_t* c = L"")
 {
@@ -2623,6 +2975,8 @@ static JarUsnEntry MakeJarUsnEntry(const std::wstring& rawLine)
     JarUsnEntry e;
     e.date = PickJarDateFromCsvFields(fields);
     e.name = PickUsnFileNameFromCsvFields(fields, rawLine);
+    e.path = CleanPipeCell(e.name);
+    PickUsnReferenceFields(fields, e.fileRef, e.parentRef);
     e.lowerRaw = ToLowerCopy(rawLine);
     e.reason = PickJarReasonMaskFromCsvFields(fields, rawLine);
     e.reasonText = PickUsnReasonTextFromCsvFields(fields, rawLine, e.reason);
@@ -2635,6 +2989,7 @@ static JarUsnEntry MakeJarUsnEntry(const std::wstring& rawLine)
     e.dataExtend = ((e.reason & 0x00000002ULL) != 0) || TextHasAny(e.lowerRaw, L"data_extend", L"data extend");
     e.basicInfo = ((e.reason & 0x00008000ULL) != 0) || TextHasAny(e.lowerRaw, L"basic_info_change", L"basic info change");
     e.streamChange = ((e.reason & 0x00200000ULL) != 0) || TextHasAny(e.lowerRaw, L"stream_change", L"stream change");
+    e.close = ((e.reason & 0x80000000ULL) != 0) || TextHasAny(e.lowerRaw, L"close", L"reason_close", L"usn_reason_close");
 
     return e;
 }
@@ -2646,6 +3001,8 @@ static JarUsnEntry MakeUsnEntryForExtension(const std::wstring& rawLine, const s
     JarUsnEntry e;
     e.date = PickJarDateFromCsvFields(fields);
     e.name = PickUsnFileNameFromCsvFieldsGeneric(fields, rawLine, ext);
+    e.path = PickUsnPathFromCsvFieldsGeneric(fields, rawLine, ext);
+    PickUsnReferenceFields(fields, e.fileRef, e.parentRef);
     e.lowerRaw = ToLowerCopy(rawLine);
     e.reason = PickJarReasonMaskFromCsvFields(fields, rawLine);
     e.reasonText = PickUsnReasonTextFromCsvFields(fields, rawLine, e.reason);
@@ -2658,6 +3015,7 @@ static JarUsnEntry MakeUsnEntryForExtension(const std::wstring& rawLine, const s
     e.dataExtend = ((e.reason & 0x00000002ULL) != 0) || TextHasAny(e.lowerRaw, L"data_extend", L"data extend");
     e.basicInfo = ((e.reason & 0x00008000ULL) != 0) || TextHasAny(e.lowerRaw, L"basic_info_change", L"basic info change");
     e.streamChange = ((e.reason & 0x00200000ULL) != 0) || TextHasAny(e.lowerRaw, L"stream_change", L"stream change");
+    e.close = ((e.reason & 0x80000000ULL) != 0) || TextHasAny(e.lowerRaw, L"close", L"reason_close", L"usn_reason_close");
 
     return e;
 }
@@ -2696,25 +3054,414 @@ static std::wstring CleanPipeCell(std::wstring value)
     return TrimAutomationField(value);
 }
 
-static void AppendJarActivityRow(std::vector<std::wstring>& lines, const std::wstring& date, const wchar_t* action, const std::wstring& name)
+static const wchar_t* AUTOMATION_DELETED_MARKER = L"\xE000";
+
+static bool AutomationLineHasDeletedMarker(const std::wstring& line)
 {
-    if (name.empty())
+    return !line.empty() && line[0] == L'\xE000';
+}
+
+static std::wstring StripAutomationDeletedMarker(std::wstring line)
+{
+    if (AutomationLineHasDeletedMarker(line))
+        line.erase(line.begin());
+    return line;
+}
+
+static std::wstring BuildProgramNameAndPathCell(const std::wstring& pathOrName)
+{
+    std::wstring clean = CleanPipeCell(DevicePathToDosPath(pathOrName));
+    if (clean.empty())
+        return L"";
+
+    std::wstring name = ExtractFileNameOnly(clean);
+    if (name.empty() || _wcsicmp(name.c_str(), clean.c_str()) == 0)
+        return clean;
+
+    return CleanPipeCell(name) + L"    " + clean;
+}
+
+static void AppendJarActivityRow(std::vector<std::wstring>& lines, const std::wstring& date, const wchar_t* action, const std::wstring& name, const std::wstring& path = L"")
+{
+    if (name.empty() && path.empty())
         return;
 
     std::wstring cleanDate = CleanPipeCell(date);
-    std::wstring cleanAction = CleanPipeCell(action ? std::wstring(action) : std::wstring());
-    std::wstring cleanName = CleanPipeCell(name);
+    std::wstring cleanAction = ToLowerCopy(CleanPipeCell(action ? std::wstring(action) : std::wstring()));
+    std::wstring cleanPath = CleanPipeCell(DevicePathToDosPath(path.empty() ? name : path));
+    std::wstring program = CleanPipeCell(name.empty() ? ExtractFileNameOnly(cleanPath) : ExtractFileNameOnly(name));
+    if (program.empty())
+        program = ExtractFileNameOnly(cleanPath);
+    if (program.empty())
+        program = cleanPath;
+    if (program.empty() || cleanPath.empty())
+        return;
 
-    if (cleanAction.empty())
-        cleanAction = L"activity";
+    std::wstring row = cleanDate + L" | " + program + L" | " + cleanPath;
+    if (cleanAction.find(L"deleted") != std::wstring::npos ||
+        cleanAction.find(L"file delete") != std::wstring::npos ||
+        cleanAction.find(L"file_delete") != std::wstring::npos)
+    {
+        row.insert(0, AUTOMATION_DELETED_MARKER);
+    }
 
-    lines.push_back(cleanDate + L" | " + cleanAction + L" | " + cleanName);
+    lines.push_back(std::move(row));
 }
 
-static std::vector<std::wstring> ScanUsnActivityForExtension(const std::wstring& ext, bool deletedOnly)
+
+static std::wstring SimpleJarJournalReason(const JarUsnEntry& e)
+{
+    if (e.created) return L"created";
+    if (e.deleted) return L"deleted";
+    if (e.renameOld) return L"rename old name";
+    if (e.renameNew) return L"rename new name";
+    return L"";
+}
+
+
+static std::wstring BuildJarActivityReasonWithUsnDate(const std::wstring& reason, const std::wstring& usnDate)
+{
+    std::wstring cleanReason = CleanPipeCell(reason);
+    std::wstring cleanUsnDate = CleanPipeCell(usnDate);
+    if (cleanReason.empty())
+        return L"";
+    if (cleanUsnDate.empty() || cleanUsnDate == L"дата неизвестна")
+        return cleanReason;
+    return cleanReason + L" (" + cleanUsnDate + L")";
+}
+
+
+static bool IsUnknownAutomationDate(const std::wstring& text);
+
+static std::wstring FileLastWriteTimeText(const std::wstring& path, ULONGLONG* outSortTime = nullptr)
+{
+    if (outSortTime)
+        *outSortTime = 0;
+
+    std::wstring dosPath = DevicePathToDosPath(path);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (dosPath.empty() || GetFileAttributesExW(dosPath.c_str(), GetFileExInfoStandard, &data) == FALSE || !IsPlausibleFileTime(data.ftLastWriteTime))
+        return L"дата неизвестна";
+
+    if (outSortTime)
+        *outSortTime = FileTimeToUInt64(data.ftLastWriteTime);
+    return FileTimeToLocalText(data.ftLastWriteTime);
+}
+
+static void AddJarSearchRootIfExists(std::vector<std::wstring>& roots, const std::wstring& path)
+{
+    if (path.empty())
+        return;
+
+    std::wstring clean = DevicePathToDosPath(path);
+    while (!clean.empty() && (clean.back() == L'\\' || clean.back() == L'/'))
+        clean.pop_back();
+    if (clean.empty())
+        return;
+
+    DWORD attrs = GetFileAttributesW(clean.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        return;
+
+    std::wstring lower = ToLowerCopy(clean);
+    for (const std::wstring& existing : roots)
+    {
+        if (ToLowerCopy(existing) == lower)
+            return;
+    }
+    roots.push_back(clean);
+}
+
+static void SearchJarModificationRecursive(const std::wstring& root, const std::wstring& lowerName, int depth, int& visited, ULONGLONG& bestTime, std::wstring& bestText, std::wstring& bestPath)
+{
+    if (root.empty() || depth < 0 || visited > 14000)
+        return;
+
+    std::wstring mask = root + L"\\*";
+    WIN32_FIND_DATAW data{};
+    HANDLE h = FindFirstFileW(mask.c_str(), &data);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        const wchar_t* name = data.cFileName;
+        if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+            continue;
+
+        std::wstring full = root + L"\\" + name;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            std::wstring lowerDir = ToLowerCopy(name);
+            if (lowerDir == L"windows" || lowerDir == L"program files" || lowerDir == L"program files (x86)" ||
+                lowerDir == L"programdata" || lowerDir == L"$recycle.bin" || lowerDir == L"system volume information")
+                continue;
+            SearchJarModificationRecursive(full, lowerName, depth - 1, visited, bestTime, bestText, bestPath);
+            continue;
+        }
+
+        ++visited;
+        if (ToLowerCopy(name) != lowerName)
+            continue;
+
+        if (!IsPlausibleFileTime(data.ftLastWriteTime))
+            continue;
+
+        ULONGLONG t = FileTimeToUInt64(data.ftLastWriteTime);
+        if (t >= bestTime)
+        {
+            bestTime = t;
+            bestText = FileTimeToLocalText(data.ftLastWriteTime);
+            bestPath = CleanPipeCell(full);
+        }
+    } while (FindNextFileW(h, &data));
+
+    FindClose(h);
+}
+
+static bool FindJarModificationByName(const std::wstring& fileName, std::wstring& outDate, ULONGLONG* outSortTime = nullptr, std::wstring* outPath = nullptr)
+{
+    if (outSortTime)
+        *outSortTime = 0;
+    if (outPath)
+        outPath->clear();
+
+    std::wstring name = ExtractFileNameOnly(fileName);
+    if (name.empty() || !ContainsJarExtensionToken(name))
+        return false;
+
+    static std::mutex cacheMutex;
+    static std::map<std::wstring, std::pair<ULONGLONG, std::pair<std::wstring, std::wstring>>> cache;
+
+    std::wstring lowerName = ToLowerCopy(name);
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto it = cache.find(lowerName);
+        if (it != cache.end())
+        {
+            if (it->second.first == 0)
+                return false;
+            if (outSortTime)
+                *outSortTime = it->second.first;
+            outDate = it->second.second.first;
+            if (outPath)
+                *outPath = it->second.second.second;
+            return true;
+        }
+    }
+
+    std::vector<std::wstring> roots;
+    wchar_t userProfile[MAX_PATH]{};
+    wchar_t appData[MAX_PATH]{};
+    wchar_t localAppData[MAX_PATH]{};
+    wchar_t publicProfile[MAX_PATH]{};
+
+    GetEnvironmentVariableW(L"USERPROFILE", userProfile, ARRAYSIZE(userProfile));
+    GetEnvironmentVariableW(L"APPDATA", appData, ARRAYSIZE(appData));
+    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData));
+    GetEnvironmentVariableW(L"PUBLIC", publicProfile, ARRAYSIZE(publicProfile));
+
+    if (userProfile[0])
+    {
+        AddJarSearchRootIfExists(roots, std::wstring(userProfile) + L"\\Desktop");
+        AddJarSearchRootIfExists(roots, std::wstring(userProfile) + L"\\Downloads");
+        AddJarSearchRootIfExists(roots, std::wstring(userProfile) + L"\\Documents");
+        AddJarSearchRootIfExists(roots, std::wstring(userProfile) + L"\\AppData\\Roaming\\.minecraft");
+        AddJarSearchRootIfExists(roots, std::wstring(userProfile));
+    }
+    if (appData[0])
+    {
+        AddJarSearchRootIfExists(roots, std::wstring(appData) + L"\\.minecraft");
+        AddJarSearchRootIfExists(roots, appData);
+    }
+    if (localAppData[0])
+        AddJarSearchRootIfExists(roots, localAppData);
+    if (publicProfile[0])
+    {
+        AddJarSearchRootIfExists(roots, std::wstring(publicProfile) + L"\\Desktop");
+        AddJarSearchRootIfExists(roots, std::wstring(publicProfile) + L"\\Downloads");
+    }
+
+    ULONGLONG bestTime = 0;
+    std::wstring bestText;
+    std::wstring bestPath;
+    int visited = 0;
+    for (const std::wstring& root : roots)
+    {
+        SearchJarModificationRecursive(root, lowerName, 6, visited, bestTime, bestText, bestPath);
+        if (visited > 14000)
+            break;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        cache[lowerName] = { bestTime, { bestText, bestPath } };
+    }
+
+    if (bestTime == 0 || bestText.empty())
+        return false;
+
+    if (outSortTime)
+        *outSortTime = bestTime;
+    outDate = bestText;
+    if (outPath)
+        *outPath = bestPath;
+    return true;
+}
+
+static std::wstring JarFileModificationTimeText(const JarUsnEntry& e, const std::wstring& fullPath, ULONGLONG* outSortTime = nullptr)
+{
+    if (outSortTime)
+        *outSortTime = 0;
+
+    ULONGLONG directTime = 0;
+    std::wstring direct = FileLastWriteTimeText(fullPath, &directTime);
+    if (!IsUnknownAutomationDate(direct))
+    {
+        if (outSortTime)
+            *outSortTime = directTime;
+        return direct;
+    }
+
+    std::wstring foundDate;
+    ULONGLONG foundTime = 0;
+    std::wstring foundPath;
+    std::wstring name = ExtractFileNameOnly(fullPath);
+    if (name.empty())
+        name = ExtractFileNameOnly(e.name);
+    if (FindJarModificationByName(name, foundDate, &foundTime, &foundPath))
+    {
+        if (outSortTime)
+            *outSortTime = foundTime;
+        return foundDate;
+    }
+
+    return L"дата неизвестна";
+}
+
+static bool IsUnknownAutomationDate(const std::wstring& text)
+{
+    std::wstring lower = ToLowerCopy(TrimAutomationField(text));
+    return lower.empty() || lower == L"дата неизвестна" || lower == L"n/a" || lower == L"na";
+}
+
+static void AppendJarUnifiedActivityRow(std::vector<std::wstring>& lines, const JarUsnEntry& e)
+{
+    std::wstring reason = SimpleJarJournalReason(e);
+    if (reason.empty())
+        return;
+
+    std::wstring fullPath = ResolveUsnFullPathForEntry(e, L".jar");
+    ULONGLONG modSortTime = 0;
+    std::wstring modDate = JarFileModificationTimeText(e, fullPath, &modSortTime);
+    std::wstring program = CleanPipeCell(ExtractFileNameOnly(fullPath));
+    if (program.empty())
+        program = CleanPipeCell(ExtractFileNameOnly(e.name));
+    if (program.empty())
+        program = CleanPipeCell(e.name);
+    if (program.empty())
+        return;
+
+    std::wstring reasonCell = BuildJarActivityReasonWithUsnDate(reason, e.date);
+    if (reasonCell.empty())
+        return;
+
+    std::wstring row = CleanPipeCell(modDate) + L" | " + reasonCell + L" | " + program;
+    if (reason == L"deleted")
+        row.insert(0, AUTOMATION_DELETED_MARKER);
+    lines.push_back(std::move(row));
+}
+
+static std::wstring JarUnifiedDedupKey(const JarUsnEntry& e)
+{
+    std::wstring reason = SimpleJarJournalReason(e);
+    std::wstring fullPath = ResolveUsnFullPathForEntry(e, L".jar");
+    std::wstring name = ExtractFileNameOnly(fullPath);
+    if (name.empty())
+        name = ExtractFileNameOnly(e.name);
+    if (name.empty())
+        name = e.name;
+
+    // Deduplicate by visible file name + visible action. USN can emit many rows
+    // for the same command with different references/close events; the user wants
+    // one row per same file/action in .jar activity.
+    std::wstring key = ToLowerCopy(CleanPipeCell(name)) + L"|" + ToLowerCopy(CleanPipeCell(reason));
+    return key;
+}
+
+static std::vector<std::wstring> ReadJarUsnEntriesForActivity()
+{
+    std::vector<std::wstring> rawLines;
+    std::wstring output;
+    std::wstring command = L"fsutil usn readjournal C: csv | findstr /l /i /c:\".jar\"";
+    if (!RunHiddenCommandCapture(command, output, 120000))
+    {
+        rawLines.push_back(L"__ERROR__");
+        return rawLines;
+    }
+    return SplitAutomationTextLines(output);
+}
+
+static std::vector<JarUsnEntry> CollectJarReasonEntries()
+{
+    std::vector<JarUsnEntry> entries;
+    std::vector<std::wstring> raw = ReadJarUsnEntriesForActivity();
+    if (raw.size() == 1 && raw[0] == L"__ERROR__")
+        return entries;
+
+    entries.reserve(raw.size());
+    for (const std::wstring& rawLine : raw)
+    {
+        if (rawLine.empty())
+            continue;
+        std::wstring lower = ToLowerCopy(rawLine);
+        if (lower.find(L"usn") != std::wstring::npos && lower.find(L"reason") != std::wstring::npos && lower.find(L"name") != std::wstring::npos)
+            continue;
+
+        JarUsnEntry e = MakeUsnEntryForExtension(rawLine, L".jar");
+        if (!ShouldShowUsnEntryForExtension(e, L".jar"))
+            continue;
+        if (SimpleJarJournalReason(e).empty())
+            continue;
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+static std::vector<std::wstring> ScanJarActivityJournalReasonsOnly()
 {
     std::vector<std::wstring> lines;
-    lines.push_back(L"дата | действие | название");
+    lines.push_back(L"дата модификации | действие | программа");
+
+    std::vector<JarUsnEntry> entries = CollectJarReasonEntries();
+    if (entries.empty())
+    {
+        std::vector<std::wstring> probe = ReadJarUsnEntriesForActivity();
+        if (probe.size() == 1 && probe[0] == L"__ERROR__")
+            lines.push_back(L"не удалось запустить fsutil");
+        else
+            lines.push_back(L"не найдено");
+        return lines;
+    }
+
+    std::set<std::wstring> seen;
+    for (const JarUsnEntry& e : entries)
+    {
+        std::wstring key = JarUnifiedDedupKey(e);
+        if (!key.empty() && !seen.insert(key).second)
+            continue;
+        AppendJarUnifiedActivityRow(lines, e);
+    }
+
+    if (lines.size() == 1)
+        lines.push_back(L"не найдено");
+    return lines;
+}
+
+static std::vector<std::wstring> ScanUsnActivityForExtension(const std::wstring& ext, bool deletedOnly, bool keepDeletedInActivity = false)
+{
+    std::vector<std::wstring> lines;
+    lines.push_back(L"дата | программа | путь");
 
     std::wstring output;
     std::wstring command = L"fsutil usn readjournal C: csv | findstr /l /i /c:\"" + ext + L"\"";
@@ -2750,12 +3497,814 @@ static std::vector<std::wstring> ScanUsnActivityForExtension(const std::wstring&
 
         if (deletedOnly)
         {
+            // В окнах deleted показываем только те записи USN,
+            // где реально есть FILE_DELETE. Один только CLOSE не означает удаление.
             if (e.deleted)
-                AppendJarActivityRow(lines, e.date, L"deleted", e.name);
+                AppendJarActivityRow(lines, e.date, L"deleted", e.name, ResolveUsnFullPathForEntry(e, ext));
             continue;
         }
 
-        AppendJarActivityRow(lines, e.date, e.reasonText.empty() ? L"activity" : e.reasonText.c_str(), e.name);
+        if (e.deleted)
+        {
+            if (keepDeletedInActivity)
+                AppendJarActivityRow(lines, e.date, L"deleted", e.name, ResolveUsnFullPathForEntry(e, ext));
+            continue;
+        }
+
+        AppendJarActivityRow(lines, e.date, e.reasonText.empty() ? L"activity" : e.reasonText.c_str(), e.name, ResolveUsnFullPathForEntry(e, ext));
+    }
+
+    if (lines.size() == 1)
+        lines.push_back(L"не найдено");
+
+    return lines;
+}
+
+
+static std::vector<std::wstring> SplitTextByPipe(const std::wstring& line)
+{
+    std::vector<std::wstring> cols;
+    size_t start = 0;
+    while (start <= line.size())
+    {
+        size_t pos = line.find(L"|", start);
+        std::wstring part = (pos == std::wstring::npos) ? line.substr(start) : line.substr(start, pos - start);
+        cols.push_back(TrimAutomationField(part));
+        if (pos == std::wstring::npos)
+            break;
+        start = pos + 1;
+    }
+    return cols;
+}
+
+struct ExeLaunchRegistryRow
+{
+    std::wstring date;
+    std::wstring source;
+    std::wstring name;
+    std::wstring path;
+    ULONGLONG sortTime = 0;
+};
+
+static std::wstring RegistryValueTimeText(const FILETIME& ft, ULONGLONG& sortTime)
+{
+    sortTime = 0;
+    if (!IsPlausibleFileTime(ft))
+        return L"дата неизвестна";
+    sortTime = FileTimeToUInt64(ft);
+    return FileTimeToLocalText(ft);
+}
+
+static bool ExtractExePathFromRegistryText(const std::wstring& text, std::wstring& outPath)
+{
+    std::wstring cleaned = TrimAutomationField(text);
+    if (cleaned.empty())
+        return false;
+
+    size_t exePos = ToLowerCopy(cleaned).find(L".exe");
+    if (exePos == std::wstring::npos)
+        return false;
+
+    size_t end = exePos + 4;
+    size_t start = cleaned.rfind(L'\"', exePos);
+    if (start != std::wstring::npos)
+    {
+        start += 1;
+        outPath = cleaned.substr(start, end - start);
+        return !outPath.empty();
+    }
+
+    start = cleaned.rfind(L"C:\\", exePos);
+    if (start == std::wstring::npos)
+        start = cleaned.rfind(L"D:\\", exePos);
+    if (start == std::wstring::npos)
+        start = cleaned.rfind(L"E:\\", exePos);
+    if (start == std::wstring::npos)
+        start = cleaned.rfind(L"\\Device\\", exePos);
+    if (start == std::wstring::npos)
+        start = 0;
+
+    outPath = cleaned.substr(start, end - start);
+    while (!outPath.empty() && (outPath.front() == L' ' || outPath.front() == L'\t' || outPath.front() == L'\"'))
+        outPath.erase(outPath.begin());
+    while (!outPath.empty() && (outPath.back() == L' ' || outPath.back() == L'\t' || outPath.back() == L'\"'))
+        outPath.pop_back();
+    return !outPath.empty();
+}
+
+static std::wstring Rot13Wide(const std::wstring& text)
+{
+    std::wstring out = text;
+    for (wchar_t& ch : out)
+    {
+        if (ch >= L'a' && ch <= L'z')
+            ch = static_cast<wchar_t>(L'a' + ((ch - L'a' + 13) % 26));
+        else if (ch >= L'A' && ch <= L'Z')
+            ch = static_cast<wchar_t>(L'A' + ((ch - L'A' + 13) % 26));
+    }
+    return out;
+}
+
+static void AddExeLaunchRow(std::vector<ExeLaunchRegistryRow>& rows, const std::wstring& source, const std::wstring& rawPath, const std::wstring& fallbackDate, ULONGLONG sortTime)
+{
+    std::wstring path = DevicePathToDosPath(rawPath);
+    path = TrimAutomationField(path);
+
+    std::wstring lower = ToLowerCopy(path);
+    if (lower.find(L".exe") == std::wstring::npos)
+        return;
+
+    // Системные exe не добавляем в .exe activity ни из реестра, ни из Prefetch.
+    if (IsLikelySystemExecutable(path))
+        return;
+
+    ExeLaunchRegistryRow row;
+    row.date = fallbackDate.empty() ? L"дата неизвестна" : fallbackDate;
+    row.source = source;
+    row.path = path;
+    row.name = ExtractFileNameOnly(path);
+    if (row.name.empty())
+        row.name = path;
+    row.sortTime = sortTime;
+    rows.push_back(std::move(row));
+}
+
+static bool IsPrefetchLaunchRow(const ExeLaunchRegistryRow& row)
+{
+    return ToLowerCopy(row.source).find(L"prefetch") != std::wstring::npos;
+}
+
+
+struct PrefetchLaunchInfo
+{
+    std::wstring exeName;
+    std::wstring path;
+    std::wstring date;
+    ULONGLONG sortTime = 0;
+};
+
+static std::wstring NormalizeExeLaunchKey(const std::wstring& text)
+{
+    std::wstring value = ToLowerCopy(DevicePathToDosPath(TrimAutomationField(text)));
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    return value;
+}
+
+static bool SameExeLaunchPathOrName(const ExeLaunchRegistryRow& row, const PrefetchLaunchInfo& pf)
+{
+    std::wstring rowPath = NormalizeExeLaunchKey(row.path);
+    std::wstring pfPath = NormalizeExeLaunchKey(pf.path);
+    if (!rowPath.empty() && !pfPath.empty() && rowPath == pfPath)
+        return true;
+
+    std::wstring rowName = ToLowerCopy(row.name.empty() ? ExtractFileNameOnly(row.path) : row.name);
+    std::wstring pfName = ToLowerCopy(pf.exeName.empty() ? ExtractFileNameOnly(pf.path) : pf.exeName);
+    return !rowName.empty() && !pfName.empty() && rowName == pfName;
+}
+
+static bool ApplyPrefetchTimeToRegistryRow(ExeLaunchRegistryRow& row, const std::vector<PrefetchLaunchInfo>& prefetch)
+{
+    const PrefetchLaunchInfo* best = nullptr;
+    for (const PrefetchLaunchInfo& pf : prefetch)
+    {
+        if (!SameExeLaunchPathOrName(row, pf))
+            continue;
+        if (!best || pf.sortTime > best->sortTime)
+            best = &pf;
+    }
+
+    if (!best || best->sortTime == 0)
+        return false;
+
+    row.date = best->date;
+    row.sortTime = best->sortTime;
+    if (ToLowerCopy(row.source).find(L"prefetch") == std::wstring::npos)
+        row.source += L" / Prefetch time";
+    return true;
+}
+
+static std::wstring PrefetchExeNameFromFileName(const std::wstring& fileName)
+{
+    std::wstring name = ExtractFileNameOnly(fileName);
+    std::wstring lower = ToLowerCopy(name);
+
+    if (lower.size() < 3 || lower.substr(lower.size() - 3) != L".pf")
+        return L"";
+
+    name = name.substr(0, name.size() - 3);
+
+    size_t dash = name.find_last_of(L'-');
+    if (dash != std::wstring::npos && dash > 0)
+        name = name.substr(0, dash);
+
+    name = TrimAutomationField(name);
+    if (name.empty())
+        return L"";
+
+    if (ToLowerCopy(name).find(L".exe") == std::wstring::npos)
+        name += L".exe";
+
+    return name;
+}
+
+static bool IsReadablePrefetchChar(wchar_t ch)
+{
+    return ch >= 32 && ch < 127 || ch >= 0x0400 && ch <= 0x052F;
+}
+
+static bool ReadWholeFileBytes(const std::wstring& path, std::vector<BYTE>& bytes)
+{
+    bytes.clear();
+
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 32LL * 1024LL * 1024LL)
+    {
+        CloseHandle(h);
+        return false;
+    }
+
+    bytes.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+    CloseHandle(h);
+
+    if (!ok || read == 0)
+    {
+        bytes.clear();
+        return false;
+    }
+
+    bytes.resize(read);
+    return true;
+}
+
+static bool IsBetterPrefetchExePathCandidate(const std::wstring& candidate, const std::wstring& currentBest)
+{
+    if (currentBest.empty())
+        return true;
+
+    std::wstring c = ToLowerCopy(candidate);
+    std::wstring b = ToLowerCopy(currentBest);
+
+    bool cDos = c.size() > 2 && c[1] == L':' && (c[2] == L'\\' || c[2] == L'/');
+    bool bDos = b.size() > 2 && b[1] == L':' && (b[2] == L'\\' || b[2] == L'/');
+    if (cDos != bDos)
+        return cDos;
+
+    bool cDevice = c.rfind(L"\\device\\", 0) == 0;
+    bool bDevice = b.rfind(L"\\device\\", 0) == 0;
+    if (cDevice != bDevice)
+        return cDevice;
+
+    return candidate.size() > currentBest.size();
+}
+
+static bool TryExtractExePathFromPrefetchFile(const std::wstring& pfPath, const std::wstring& exeName, std::wstring& outPath)
+{
+    outPath.clear();
+
+    std::vector<BYTE> bytes;
+    if (!ReadWholeFileBytes(pfPath, bytes) || bytes.size() < sizeof(wchar_t))
+        return false;
+
+    std::wstring target = ToLowerCopy(ExtractFileNameOnly(exeName));
+    std::wstring current;
+    std::wstring best;
+
+    auto flush = [&]()
+    {
+        if (current.size() >= 5)
+        {
+            std::wstring lower = ToLowerCopy(current);
+            if (lower.find(L".exe") != std::wstring::npos &&
+                (target.empty() || ToLowerCopy(ExtractFileNameOnly(current)) == target || lower.find(target) != std::wstring::npos))
+            {
+                std::wstring candidate;
+                if (ExtractExePathFromRegistryText(current, candidate))
+                {
+                    candidate = DevicePathToDosPath(candidate);
+                    if (!IsLikelySystemExecutable(candidate) && IsBetterPrefetchExePathCandidate(candidate, best))
+                        best = candidate;
+                }
+            }
+        }
+        current.clear();
+    };
+
+    for (size_t i = 0; i + 1 < bytes.size(); i += 2)
+    {
+        wchar_t ch = static_cast<wchar_t>(bytes[i] | (static_cast<WORD>(bytes[i + 1]) << 8));
+        if (IsReadablePrefetchChar(ch))
+        {
+            current.push_back(ch);
+            if (current.size() > 1024)
+                flush();
+        }
+        else
+        {
+            flush();
+        }
+    }
+    flush();
+
+    if (best.empty())
+        return false;
+
+    outPath = best;
+    return true;
+}
+
+
+static std::vector<PrefetchLaunchInfo> BuildPrefetchLaunchInfos()
+{
+    std::vector<PrefetchLaunchInfo> infos;
+
+    wchar_t windowsDir[MAX_PATH * 4]{};
+    UINT len = GetWindowsDirectoryW(windowsDir, ARRAYSIZE(windowsDir));
+    if (len == 0 || len >= ARRAYSIZE(windowsDir))
+        return infos;
+
+    std::wstring folder(windowsDir);
+    while (!folder.empty() && (folder.back() == L'\\' || folder.back() == L'/'))
+        folder.pop_back();
+    folder += L"\\Prefetch";
+
+    std::wstring mask = folder + L"\\*.pf";
+    WIN32_FIND_DATAW data{};
+    HANDLE h = FindFirstFileW(mask.c_str(), &data);
+    if (h == INVALID_HANDLE_VALUE)
+        return infos;
+
+    do
+    {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        std::wstring exeName = PrefetchExeNameFromFileName(data.cFileName);
+        if (exeName.empty())
+            continue;
+
+        // Системные exe не добавляем даже как источник времени для .exe activity.
+        if (IsLikelySystemExecutable(exeName))
+            continue;
+
+        ULONGLONG sortTime = 0;
+        std::wstring when = L"дата неизвестна";
+        if (IsPlausibleFileTime(data.ftLastWriteTime))
+        {
+            sortTime = FileTimeToUInt64(data.ftLastWriteTime);
+            when = FileTimeToLocalText(data.ftLastWriteTime);
+        }
+
+        std::wstring pfPath = folder + L"\\" + data.cFileName;
+        std::wstring exePath;
+        TryExtractExePathFromPrefetchFile(pfPath, exeName, exePath);
+
+        if (!exePath.empty() && IsLikelySystemExecutable(exePath))
+            continue;
+
+        PrefetchLaunchInfo info;
+        info.exeName = exeName;
+        info.path = exePath;
+        info.date = when;
+        info.sortTime = sortTime;
+        infos.push_back(std::move(info));
+    }
+    while (FindNextFileW(h, &data));
+
+    FindClose(h);
+    return infos;
+}
+
+static void AppendPrefetchExeLaunchRows(std::vector<ExeLaunchRegistryRow>& rows)
+{
+    wchar_t windowsDir[MAX_PATH * 4]{};
+    UINT len = GetWindowsDirectoryW(windowsDir, ARRAYSIZE(windowsDir));
+    if (len == 0 || len >= ARRAYSIZE(windowsDir))
+        return;
+
+    std::wstring folder(windowsDir);
+    while (!folder.empty() && (folder.back() == L'\\' || folder.back() == L'/'))
+        folder.pop_back();
+    folder += L"\\Prefetch";
+
+    std::wstring mask = folder + L"\\*.pf";
+    WIN32_FIND_DATAW data{};
+    HANDLE h = FindFirstFileW(mask.c_str(), &data);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        std::wstring exeName = PrefetchExeNameFromFileName(data.cFileName);
+        if (exeName.empty())
+            continue;
+
+        std::wstring pfPath = folder + L"\\" + data.cFileName;
+        std::wstring exePath;
+
+        // Из Prefetch берём не только имя .pf, а пытаемся достать реальный путь запущенного exe из содержимого .pf.
+        // Если путь восстановить нельзя, строку не добавляем, чтобы в .exe activity не было записей без пути.
+        if (!TryExtractExePathFromPrefetchFile(pfPath, exeName, exePath))
+            continue;
+
+        ULONGLONG sortTime = 0;
+        std::wstring when = L"дата неизвестна";
+        if (IsPlausibleFileTime(data.ftLastWriteTime))
+        {
+            sortTime = FileTimeToUInt64(data.ftLastWriteTime);
+            when = FileTimeToLocalText(data.ftLastWriteTime);
+        }
+
+        AddExeLaunchRow(rows, L"Prefetch / modified", exePath, when, sortTime);
+    }
+    while (FindNextFileW(h, &data));
+
+    FindClose(h);
+}
+
+static void AppendMuiCacheValues(HKEY root, const std::wstring& subKey, const std::wstring& label, std::vector<ExeLaunchRegistryRow>& rows)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS &&
+        RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &key) != ERROR_SUCCESS)
+        return;
+
+    DWORD valueCount = 0, maxValueNameLen = 0, maxValueDataLen = 0;
+    RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &valueCount, &maxValueNameLen, &maxValueDataLen, nullptr, nullptr);
+    ULONGLONG sortTime = 0;
+    std::wstring when;
+
+    for (DWORD i = 0; i < valueCount; ++i)
+    {
+        std::vector<wchar_t> valueName(maxValueNameLen + 2, L'\0');
+        std::vector<BYTE> valueData(std::max<DWORD>(maxValueDataLen + 4, 8));
+        DWORD nameLen = static_cast<DWORD>(valueName.size());
+        DWORD dataLen = static_cast<DWORD>(valueData.size());
+        DWORD type = 0;
+        if (RegEnumValueW(key, i, valueName.data(), &nameLen, nullptr, &type, valueData.data(), &dataLen) != ERROR_SUCCESS)
+            continue;
+
+        std::wstring raw(valueName.data(), nameLen);
+        std::wstring path;
+        if (ExtractExePathFromRegistryText(raw, path))
+            AddExeLaunchRow(rows, label + L" / MuiCache", path, when, sortTime);
+    }
+
+    RegCloseKey(key);
+}
+
+static void AppendRegistryExeValueNames(HKEY root, const std::wstring& subKey, const std::wstring& label, bool userAssistRot13, std::vector<ExeLaunchRegistryRow>& rows)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS &&
+        RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &key) != ERROR_SUCCESS)
+        return;
+
+    DWORD subKeyCount = 0, maxSubKeyLen = 0, valueCount = 0, maxValueNameLen = 0, maxValueDataLen = 0;
+    RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKeyLen, nullptr, &valueCount, &maxValueNameLen, &maxValueDataLen, nullptr, nullptr);
+    ULONGLONG sortTime = 0;
+    std::wstring when;
+
+    for (DWORD i = 0; i < valueCount; ++i)
+    {
+        std::vector<wchar_t> valueName(maxValueNameLen + 2, L'\0');
+        std::vector<BYTE> valueData(std::max<DWORD>(maxValueDataLen + 4, 8));
+        DWORD nameLen = static_cast<DWORD>(valueName.size());
+        DWORD dataLen = static_cast<DWORD>(valueData.size());
+        DWORD type = 0;
+        if (RegEnumValueW(key, i, valueName.data(), &nameLen, nullptr, &type, valueData.data(), &dataLen) != ERROR_SUCCESS)
+            continue;
+
+        std::wstring text(valueName.data(), nameLen);
+        if (userAssistRot13)
+            text = Rot13Wide(text);
+
+        std::wstring path;
+        if (ExtractExePathFromRegistryText(text, path))
+            AddExeLaunchRow(rows, label, path, when, sortTime);
+    }
+
+    for (DWORD i = 0; i < subKeyCount; ++i)
+    {
+        std::vector<wchar_t> child(maxSubKeyLen + 2, L'\0');
+        DWORD childLen = static_cast<DWORD>(child.size());
+        if (RegEnumKeyExW(key, i, child.data(), &childLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS && childLen > 0)
+            AppendRegistryExeValueNames(root, subKey + L"\\" + std::wstring(child.data(), childLen), label, userAssistRot13, rows);
+    }
+
+    RegCloseKey(key);
+}
+
+static void AppendRegistryExeValueData(HKEY root, const std::wstring& subKey, const std::wstring& label, std::vector<ExeLaunchRegistryRow>& rows)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS &&
+        RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &key) != ERROR_SUCCESS)
+        return;
+
+    DWORD subKeyCount = 0, maxSubKeyLen = 0, valueCount = 0, maxValueNameLen = 0, maxValueDataLen = 0;
+    RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKeyLen, nullptr, &valueCount, &maxValueNameLen, &maxValueDataLen, nullptr, nullptr);
+    ULONGLONG sortTime = 0;
+    std::wstring when;
+
+    for (DWORD i = 0; i < valueCount; ++i)
+    {
+        std::vector<wchar_t> valueName(maxValueNameLen + 2, L'\0');
+        std::vector<BYTE> valueData(std::max<DWORD>(maxValueDataLen + 4, 8));
+        DWORD nameLen = static_cast<DWORD>(valueName.size());
+        DWORD dataLen = static_cast<DWORD>(valueData.size());
+        DWORD type = 0;
+        if (RegEnumValueW(key, i, valueName.data(), &nameLen, nullptr, &type, valueData.data(), &dataLen) != ERROR_SUCCESS)
+            continue;
+
+        std::wstring text;
+        if ((type == REG_SZ || type == REG_EXPAND_SZ) && dataLen >= sizeof(wchar_t))
+            text.assign(reinterpret_cast<wchar_t*>(valueData.data()), dataLen / sizeof(wchar_t));
+        else
+            text.assign(valueName.data(), nameLen);
+
+        std::wstring path;
+        if (ExtractExePathFromRegistryText(text, path))
+            AddExeLaunchRow(rows, label, path, when, sortTime);
+    }
+
+    for (DWORD i = 0; i < subKeyCount; ++i)
+    {
+        std::vector<wchar_t> child(maxSubKeyLen + 2, L'\0');
+        DWORD childLen = static_cast<DWORD>(child.size());
+        if (RegEnumKeyExW(key, i, child.data(), &childLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS && childLen > 0)
+            AppendRegistryExeValueData(root, subKey + L"\\" + std::wstring(child.data(), childLen), label, rows);
+    }
+
+    RegCloseKey(key);
+}
+
+static void AppendMuiCacheForAllUsers(std::vector<ExeLaunchRegistryRow>& rows)
+{
+    const std::wstring muiSub = L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache";
+    AppendMuiCacheValues(HKEY_CLASSES_ROOT, L"Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache", L"HKCR", rows);
+    AppendMuiCacheValues(HKEY_CURRENT_USER, muiSub, L"HKCU", rows);
+
+    HKEY users = nullptr;
+    if (RegOpenKeyExW(HKEY_USERS, nullptr, 0, KEY_READ, &users) != ERROR_SUCCESS)
+        return;
+
+    DWORD subKeyCount = 0, maxSubKeyLen = 0;
+    if (RegQueryInfoKeyW(users, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKeyLen, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+    {
+        for (DWORD i = 0; i < subKeyCount; ++i)
+        {
+            std::vector<wchar_t> sid(maxSubKeyLen + 2, L'\0');
+            DWORD sidLen = static_cast<DWORD>(sid.size());
+            if (RegEnumKeyExW(users, i, sid.data(), &sidLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS || sidLen == 0)
+                continue;
+
+            std::wstring sidText(sid.data(), sidLen);
+            AppendMuiCacheValues(HKEY_USERS, sidText + L"\\" + muiSub, L"HKU\\" + ShortSidTail(sidText), rows);
+            AppendMuiCacheValues(HKEY_USERS, sidText + L"_Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache", L"HKU\\" + ShortSidTail(sidText) + L"_Classes", rows);
+        }
+    }
+
+    RegCloseKey(users);
+}
+
+static void AppendExeLaunchArtifactsForUserRoot(HKEY root, const std::wstring& prefix, const std::wstring& labelPrefix, std::vector<ExeLaunchRegistryRow>& rows)
+{
+    std::wstring base = prefix.empty() ? L"" : prefix + L"\\";
+    AppendRegistryExeValueNames(root, base + L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist", labelPrefix + L"UserAssist", true, rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store", labelPrefix + L"Compatibility Assistant Store", rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Persisted", labelPrefix + L"Compatibility Assistant Persisted", rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers", labelPrefix + L"AppCompat Layers", rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU", labelPrefix + L"RunMRU", rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU", labelPrefix + L"OpenSavePidlMRU", rows);
+    AppendRegistryExeValueData(root, base + L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs", labelPrefix + L"RecentDocs", rows);
+}
+
+static void AppendExeLaunchArtifactsForAllUsers(std::vector<ExeLaunchRegistryRow>& rows)
+{
+    AppendExeLaunchArtifactsForUserRoot(HKEY_CURRENT_USER, L"", L"HKCU / ", rows);
+    AppendExeLaunchArtifactsForUserRoot(HKEY_LOCAL_MACHINE, L"", L"HKLM / ", rows);
+
+    HKEY users = nullptr;
+    if (RegOpenKeyExW(HKEY_USERS, nullptr, 0, KEY_READ, &users) != ERROR_SUCCESS)
+        return;
+
+    DWORD subKeyCount = 0, maxSubKeyLen = 0;
+    if (RegQueryInfoKeyW(users, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKeyLen, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+    {
+        for (DWORD i = 0; i < subKeyCount; ++i)
+        {
+            std::vector<wchar_t> sid(maxSubKeyLen + 2, L'\0');
+            DWORD sidLen = static_cast<DWORD>(sid.size());
+            if (RegEnumKeyExW(users, i, sid.data(), &sidLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS || sidLen == 0)
+                continue;
+
+            std::wstring sidText(sid.data(), sidLen);
+            if (sidText.find(L"_Classes") != std::wstring::npos)
+                continue;
+            AppendExeLaunchArtifactsForUserRoot(HKEY_USERS, sidText, L"HKU\\" + ShortSidTail(sidText) + L" / ", rows);
+        }
+    }
+
+    RegCloseKey(users);
+}
+
+static void AppendBamExeLaunchRows(std::vector<ExeLaunchRegistryRow>& rows)
+{
+    std::vector<BamEntry> bamRows;
+    std::vector<std::wstring> notes;
+    const wchar_t* subPaths[] =
+    {
+        L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings",
+        L"SYSTEM\\CurrentControlSet\\Services\\bam\\UserSettings",
+        L"SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings",
+        L"SYSTEM\\ControlSet001\\Services\\bam\\UserSettings",
+        L"SYSTEM\\ControlSet002\\Services\\bam\\State\\UserSettings",
+        L"SYSTEM\\ControlSet002\\Services\\bam\\UserSettings"
+    };
+
+    for (const wchar_t* subPath : subPaths)
+        AppendBamRegistryKey(subPath, true, bamRows, notes);
+
+    for (const BamEntry& entry : bamRows)
+    {
+        if (entry.signature != BamSignatureState::NotSigned)
+            continue;
+
+        std::wstring raw = entry.path.empty() ? entry.exeName : entry.path;
+        AddExeLaunchRow(rows, L"BAM / unsigned", raw, entry.when, entry.fileTimeValue);
+    }
+}
+
+static std::vector<std::wstring> ScanExeLaunchesFromRegistry()
+{
+    std::vector<std::wstring> lines;
+    lines.push_back(L"дата запуска | программа | путь");
+
+    std::vector<ExeLaunchRegistryRow> rows;
+
+    // .exe activity снова сканирует реестр, но НЕ берёт дату через RegQueryInfoKeyW(..., &keyWrite).
+    // Реестр здесь используется как источник путей/факта активности, а время запуска берётся из Prefetch modified time.
+    std::vector<PrefetchLaunchInfo> prefetch = BuildPrefetchLaunchInfos();
+
+    AppendPrefetchExeLaunchRows(rows);
+
+    std::vector<ExeLaunchRegistryRow> registryRows;
+    AppendExeLaunchArtifactsForAllUsers(registryRows);
+    AppendMuiCacheForAllUsers(registryRows);
+    for (ExeLaunchRegistryRow& regRow : registryRows)
+    {
+        // Без совпадения с Prefetch не показываем строку: иначе дата была бы не временем запуска конкретного exe.
+        if (ApplyPrefetchTimeToRegistryRow(regRow, prefetch))
+            rows.push_back(std::move(regRow));
+    }
+
+    // BAM имеет отдельный FILETIME у значения, поэтому его можно использовать как источник времени.
+    // В .exe activity из BAM выводим только unsigned/not signed.
+    AppendBamExeLaunchRows(rows);
+
+    // Сначала убираем дубли одной программы, потом сортируем строго по времени.
+    // Старый вариант сортировал Prefetch внутри компаратора и из-за этого порядок мог быть "разнобой".
+    std::vector<ExeLaunchRegistryRow> uniqueRows;
+    for (const ExeLaunchRegistryRow& row : rows)
+    {
+        std::wstring key = ToLowerCopy(row.name);
+        if (key.empty())
+            key = ToLowerCopy(row.path);
+        if (key.empty())
+            continue;
+
+        auto it = std::find_if(uniqueRows.begin(), uniqueRows.end(), [&](const ExeLaunchRegistryRow& existing)
+        {
+            std::wstring existingKey = ToLowerCopy(existing.name);
+            if (existingKey.empty())
+                existingKey = ToLowerCopy(existing.path);
+            return existingKey == key;
+        });
+
+        if (it == uniqueRows.end())
+        {
+            uniqueRows.push_back(row);
+            continue;
+        }
+
+        bool rowPrefetch = IsPrefetchLaunchRow(row);
+        bool oldPrefetch = IsPrefetchLaunchRow(*it);
+
+        if ((rowPrefetch && row.sortTime > 0 && !oldPrefetch) ||
+            (row.sortTime > it->sortTime) ||
+            (row.sortTime == it->sortTime && rowPrefetch && !oldPrefetch))
+        {
+            *it = row;
+        }
+    }
+
+    rows.swap(uniqueRows);
+
+    std::sort(rows.begin(), rows.end(), [](const ExeLaunchRegistryRow& a, const ExeLaunchRegistryRow& b)
+    {
+        if (a.sortTime != b.sortTime)
+            return a.sortTime > b.sortTime;
+
+        bool au = (a.sortTime == 0);
+        bool bu = (b.sortTime == 0);
+        if (au != bu)
+            return !au;
+
+        int p = _wcsicmp(a.date.c_str(), b.date.c_str());
+        if (p != 0)
+            return p > 0;
+
+        p = _wcsicmp(a.path.c_str(), b.path.c_str());
+        if (p != 0)
+            return p < 0;
+
+        return _wcsicmp(a.source.c_str(), b.source.c_str()) < 0;
+    });
+
+    for (const ExeLaunchRegistryRow& row : rows)
+    {
+        std::wstring cleanPath = CleanPipeCell(DevicePathToDosPath(row.path.empty() ? row.name : row.path));
+        std::wstring rawProgram = row.name.empty() ? ExtractFileNameOnly(cleanPath) : row.name;
+        std::wstring program = CleanPipeCell(ExtractFileNameOnly(rawProgram));
+        if (program.empty())
+            program = ExtractFileNameOnly(cleanPath);
+        if (program.empty() || cleanPath.empty())
+            continue;
+        lines.push_back(CleanPipeCell(row.date) + L" | " + program + L" | " + cleanPath);
+    }
+
+    if (lines.size() == 1)
+        lines.push_back(L"не найдено");
+
+    return lines;
+}
+
+static std::vector<std::wstring> ScanExeDeletedFromUsnDeleteClose()
+{
+    std::vector<std::wstring> lines;
+    lines.push_back(L"дата | программа | путь");
+
+    std::wstring output;
+    std::wstring command = L"fsutil usn readjournal C: csv | findstr /l /i /c:\".exe\"";
+    if (!RunHiddenCommandCapture(command, output, 120000))
+    {
+        lines.push_back(L"не удалось запустить fsutil");
+        return lines;
+    }
+
+    std::vector<std::wstring> raw = SplitAutomationTextLines(output);
+    for (const std::wstring& rawLine : raw)
+    {
+        if (rawLine.empty())
+            continue;
+
+        std::wstring lower = ToLowerCopy(rawLine);
+        if (lower.find(L"usn") != std::wstring::npos && lower.find(L"reason") != std::wstring::npos && lower.find(L"name") != std::wstring::npos)
+            continue;
+
+        JarUsnEntry e = MakeUsnEntryForExtension(rawLine, L".exe");
+        if (!ShouldShowUsnEntryForExtension(e, L".exe"))
+            continue;
+
+        // Только FILE_DELETE считается подтверждённым удалением.
+        // CLOSE без FILE_DELETE больше не выводится в deleted.
+        if (e.deleted)
+            AppendJarActivityRow(lines, e.date, L"deleted", e.name, ResolveUsnFullPathForEntry(e, L".exe"));
+    }
+
+    if (lines.size() == 1)
+        lines.push_back(L"не найдено");
+
+    return lines;
+}
+
+
+static std::vector<std::wstring> ScanExeActivityWithDeleted()
+{
+    std::vector<std::wstring> lines = ScanExeLaunchesFromRegistry();
+
+    // .exe deleted больше не отдельное окно: добавляем подтверждённые удаления в .exe activity.
+    std::vector<std::wstring> deleted = ScanExeDeletedFromUsnDeleteClose();
+
+    if (lines.size() == 2 && TrimAutomationField(lines[1]) == L"не найдено")
+        lines.pop_back();
+
+    for (size_t i = 1; i < deleted.size(); ++i)
+    {
+        std::wstring row = TrimAutomationField(deleted[i]);
+        if (row.empty() || row == L"не найдено")
+            continue;
+        lines.push_back(row);
     }
 
     if (lines.size() == 1)
@@ -2844,7 +4393,7 @@ static std::wstring PickMinecraftLogActivityName(const std::wstring& rawLine)
 static std::vector<std::wstring> ScanMinecraftLogsFolders()
 {
     std::vector<std::wstring> lines;
-    lines.push_back(L"дата | действие | название");
+    lines.push_back(L"дата | действие | файл");
 
     std::wstring script = LR"HCPS(
 $ErrorActionPreference='SilentlyContinue'
@@ -2939,49 +4488,103 @@ static std::vector<std::wstring> ScanModrinthHashes()
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
+try{Add-Type -AssemblyName System.IO.Compression.FileSystem}catch{}
 function AddRoot([string]$p){ if(-not [string]::IsNullOrWhiteSpace($p) -and (Test-Path -LiteralPath $p)){ $script:roots += (Resolve-Path -LiteralPath $p).Path } }
-function IsUserJar([System.IO.FileInfo]$f){
-  $p=$f.FullName
+function IsAllowedPath([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return $false}
   if($p -match '^C:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|System Volume Information|\$Recycle\.Bin)(\\|$)'){return $false}
-  if($p -match '\\(WindowsApps|Microsoft|Package Cache|AppData\\Local\\Packages|AppData\\Local\\Microsoft|AppData\\Local\\Programs|Python|Python\d+|pip|nodejs|gradle|maven|\.gradle|\.m2|jdk|jre|java|libraries|assets|runtime|versions)\\'){return $false}
-  if($p -match '\\(Downloads|Desktop)\\'){return $true}
-  if($p -match '\\.minecraft\\mods\\'){return $true}
-  if($p -match '\\.tlauncher\\legacy\\Minecraft\\game\\mods\\'){return $true}
-  if($p -match '\\.tlauncher\\legacy\\Minecraft\\game\\' -and $p -notmatch '\\(libraries|versions|assets|runtime)\\'){return $true}
-  return $false
+  if($p -match '\\(jdk|jre|java|javapath|libraries|assets|runtime|versions)\\'){return $false}
+  if($p -match '\\.minecraft\\(libraries|assets|runtime|versions)\\'){return $false}
+  if($p -match '\\.tlauncher\\legacy\\Minecraft\\game\\(libraries|assets|runtime|versions)\\'){return $false}
+  return $true
+}
+function AddJarItem([string]$name,[string]$path,[string]$hash){
+  if([string]::IsNullOrWhiteSpace($hash)){return}
+  $script:items += [PSCustomObject]@{Hash=$hash.ToLowerInvariant();Name=$name;Path=$path}
+}
+function Find7Zip(){
+  $c=@('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe')
+  foreach($x in $c){if(Test-Path -LiteralPath $x){return $x}}
+  try{$cmd=Get-Command 7z.exe -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
+  return $null
 }
 $roots=@()
 if(Test-Path -LiteralPath 'C:\Users'){
   Get-ChildItem -LiteralPath 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
     AddRoot (Join-Path $_.FullName 'Downloads')
     AddRoot (Join-Path $_.FullName 'Desktop')
+    AddRoot (Join-Path $_.FullName 'Documents')
     AddRoot (Join-Path $_.FullName 'AppData\Roaming\.minecraft\mods')
-    AddRoot (Join-Path $_.FullName 'AppData\Roaming\.tlauncher\legacy\Minecraft\game')
+    AddRoot (Join-Path $_.FullName 'AppData\Roaming\.tlauncher\legacy\Minecraft\game\mods')
+    AddRoot (Join-Path $_.FullName 'AppData\Roaming\PrismLauncher\instances')
+    AddRoot (Join-Path $_.FullName 'curseforge\minecraft\Instances')
   }
 }
-if($env:USERPROFILE){ AddRoot (Join-Path $env:USERPROFILE 'Downloads'); AddRoot (Join-Path $env:USERPROFILE 'Desktop') }
-if($env:APPDATA){ AddRoot (Join-Path $env:APPDATA '.minecraft\mods'); AddRoot (Join-Path $env:APPDATA '.tlauncher\legacy\Minecraft\game') }
 $roots=@($roots | Where-Object {$_} | Select-Object -Unique)
 if($roots.Count -eq 0){'mods folder not found'; exit}
-$files=@{}
+$items=@()
+$seen=@{}
 foreach($r in $roots){
   try{
-    Get-ChildItem -LiteralPath $r -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { IsUserJar $_ } | ForEach-Object { $files[$_.FullName.ToLowerInvariant()]=$_ }
+    Get-ChildItem -LiteralPath $r -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { IsAllowedPath $_.FullName } | ForEach-Object {
+      $k=$_.FullName.ToLowerInvariant(); if(-not $seen.ContainsKey($k)){ $seen[$k]=1; try{AddJarItem $_.Name $_.FullName (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA512).Hash}catch{} }
+    }
   }catch{}
 }
-$files=@($files.Values)
-if($files.Count -eq 0){'mods not found'; exit}
-$items=@()
-foreach($f in $files){
-  try{$h=(Get-FileHash -LiteralPath $f.FullName -Algorithm SHA512).Hash.ToLowerInvariant(); $items += [PSCustomObject]@{Hash=$h;Name=$f.Name;Path=$f.FullName}}catch{}
+$archives=@{}
+foreach($r in $roots){
+  try{
+    Get-ChildItem -LiteralPath $r -File -Recurse -Force -ErrorAction SilentlyContinue -Include '*.zip','*.rar','*.7z' | Where-Object { IsAllowedPath $_.FullName } | ForEach-Object { $archives[$_.FullName.ToLowerInvariant()]=$_ }
+  }catch{}
 }
+$tempRoot=Join-Path $env:TEMP ('HolyCheck_checkmods_' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+try{
+  foreach($a in @($archives.Values)){
+    $ext=[IO.Path]::GetExtension($a.FullName).ToLowerInvariant()
+    if($ext -eq '.zip'){
+      try{
+        $zip=[IO.Compression.ZipFile]::OpenRead($a.FullName)
+        foreach($e in $zip.Entries){
+          if($e.FullName -match '\.jar$' -and -not ($e.FullName -match '(^|/)(libraries|assets|runtime|versions)/')){
+            try{
+              $tmp=Join-Path $tempRoot ([Guid]::NewGuid().ToString('N') + '.jar')
+              [IO.Compression.ZipFileExtensions]::ExtractToFile($e,$tmp,$true)
+              AddJarItem ([IO.Path]::GetFileName($e.FullName)) ($a.FullName + '!' + $e.FullName) (Get-FileHash -LiteralPath $tmp -Algorithm SHA512).Hash
+              Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            }catch{}
+          }
+        }
+        $zip.Dispose()
+      }catch{}
+    }elseif($ext -eq '.rar' -or $ext -eq '.7z'){
+      $seven=Find7Zip
+      if($seven){
+        try{
+          $out=Join-Path $tempRoot ([Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & $seven x '-y' ('-o'+$out) $a.FullName '*.jar' | Out-Null
+          Get-ChildItem -LiteralPath $out -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if($_.FullName -notmatch '\\(libraries|assets|runtime|versions)\\'){
+              try{$rel=$_.FullName.Substring($out.Length).TrimStart('\'); AddJarItem $_.Name ($a.FullName + '!' + $rel) (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA512).Hash}catch{}
+            }
+          }
+          Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+        }catch{}
+      }
+    }
+  }
+}finally{
+  Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+if($items.Count -eq 0){'mods not found'; exit}
 $known=@{}
 for($i=0;$i -lt $items.Count;$i+=50){
   $to=[Math]::Min($i+49,$items.Count-1)
   $batch=@($items[$i..$to])
   $body=@{hashes=@($batch|ForEach-Object{$_.Hash});algorithm='sha512'}|ConvertTo-Json -Compress
   try{
-    $res=Invoke-RestMethod -Uri 'https://api.modrinth.com/v2/version_files' -Method Post -ContentType 'application/json' -Body $body -Headers @{'User-Agent'='Mozilla/5.0'} -TimeoutSec 20
+    $res=Invoke-RestMethod -Uri 'https://api.modrinth.com/v2/version_files' -Method Post -ContentType 'application/json' -Body $body -Headers @{'User-Agent'='HolyCheck/1.0'} -TimeoutSec 20
     if($res){$res.PSObject.Properties.Name|ForEach-Object{$known[$_]=1}}
   }catch{}
 }
@@ -2996,9 +4599,9 @@ if($bad -eq 0){'не найдено'}
 )HCPS";
 
     std::wstring output;
-    if (!RunHiddenPowerShellScriptCapture(script, output, 180000))
+    if (!RunHiddenPowerShellScriptCapture(script, output, 300000))
     {
-        lines.push_back(L"не удалось запустить mod hash");
+        lines.push_back(L"не удалось запустить checkmods");
         return lines;
     }
 
@@ -3091,100 +4694,6 @@ static std::vector<std::wstring> ScanPage4ByMode(int mode)
     if (mode == 1)
         return ScanUnsignedDlls();
     return ScanModrinthHashes();
-}
-
-static std::vector<std::wstring> ScanUsbHistory()
-{
-    std::vector<std::wstring> lines;
-    lines.push_back(L"название | plug time | unplug time");
-
-    std::wstring script = LR"HCPS(
-$ErrorActionPreference='SilentlyContinue'
-[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
-function FmtTime($t){ if($null -eq $t){return '-'} try{return ([DateTime]$t).ToString('dd.MM.yyyy HH:mm:ss')}catch{return '-'} }
-function FromFileTimeBytes($v){
-  try{
-    if($null -eq $v){return $null}
-    if($v -is [byte[]] -and $v.Length -ge 8){return [DateTime]::FromFileTimeUtc([BitConverter]::ToInt64($v,0)).ToLocalTime()}
-    if($v -is [long] -or $v -is [int64]){return [DateTime]::FromFileTimeUtc([int64]$v).ToLocalTime()}
-  }catch{}
-  return $null
-}
-function ReadDevTime($path,[string]$id){
-  try{ return FromFileTimeBytes ((Get-ItemProperty -LiteralPath (Join-Path $path ('Properties\{83da6326-97a6-4088-9453-a1923f573b29}\' + $id)) -Name Data -ErrorAction SilentlyContinue).Data) }catch{}
-  return $null
-}
-function ModelName([string]$className,[string]$friendly){
-  if(-not [string]::IsNullOrWhiteSpace($friendly)){return ($friendly -replace '\s+',' ').Trim()}
-  $prod=''; $ven=''
-  if($className -match 'Ven_([^&]+)'){$ven=$Matches[1] -replace '_',' '}
-  if($className -match 'Prod_([^&]+)'){$prod=$Matches[1] -replace '_',' '}
-  $name=($ven + ' ' + $prod).Trim()
-  if([string]::IsNullOrWhiteSpace($name)){$name=$className}
-  return ($name -replace '\s+',' ').Trim()
-}
-$devices=@()
-$base='HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR'
-if(Test-Path -LiteralPath $base){
-  Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | ForEach-Object {
-    $class=$_.PSChildName
-    Get-ChildItem -LiteralPath $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
-      $ipath=$_.PSPath
-      $p=Get-ItemProperty -LiteralPath $ipath -ErrorAction SilentlyContinue
-      $name=ModelName $class $p.FriendlyName
-      if($name -notmatch 'MTP|Android|SAMSUNG|Phone|Modem|COM_|Bluetooth|HID'){
-        $tokens=New-Object System.Collections.Generic.List[string]
-        foreach($x in @($class,$_.PSChildName,$p.ParentIdPrefix,$p.ContainerID,@($p.HardwareID))){
-          foreach($y in @($x)){ if(-not [string]::IsNullOrWhiteSpace($y) -and $y.ToString().Length -ge 5){$tokens.Add($y.ToString().ToLowerInvariant())} }
-        }
-        $devices += [PSCustomObject]@{Name=$name; Tokens=@($tokens); Plug=(ReadDevTime $ipath '0066'); Unplug=(ReadDevTime $ipath '0067')}
-      }
-    }
-  }
-}
-$logs=@('Microsoft-Windows-DriverFrameworks-UserMode/Operational','System','Microsoft-Windows-Partition/Diagnostic','Microsoft-Windows-Storage-ClassPnP/Operational','Microsoft-Windows-Kernel-PnP/Configuration')
-$events=@()
-foreach($log in $logs){ try{$events += Get-WinEvent -LogName $log -MaxEvents 4000 -ErrorAction SilentlyContinue}catch{} }
-foreach($e in @($events | Sort-Object TimeCreated -Descending)){
-  $m=(($e.Message + ' ' + $e.ProviderName) -replace '\r|\n',' ' -replace '\s+',' ').Trim()
-  if($m -notmatch 'USBSTOR|Disk&Ven_|Disk&Prod_|USB Mass Storage|Mass Storage|Removable'){continue}
-  if($m -match 'MTP|ANDROID|SAMSUNG|WPD|Phone|usbser|COM_|MODEM|BTH|Bluetooth|HID|PCI\\|ACPI\\|ROOT\\SYSTEM|WUDFRd'){continue}
-  $lm=$m.ToLowerInvariant()
-  foreach($d in $devices){
-    $hit=$false
-    foreach($t in $d.Tokens){ if($t.Length -ge 5 -and $lm.Contains($t)){ $hit=$true; break } }
-    if(-not $hit){continue}
-    $removed=($e.Id -in 20003,2102,508,510) -or ($lm -match 'removed|unplug|disconnect|device deleted|was deleted|surprise removal|удален')
-    if($removed){ if($null -eq $d.Unplug -or $e.TimeCreated -gt $d.Unplug){$d.Unplug=$e.TimeCreated} }
-    else { if($null -eq $d.Plug -or $e.TimeCreated -gt $d.Plug){$d.Plug=$e.TimeCreated} }
-  }
-}
-$out=@()
-foreach($d in @($devices | Sort-Object @{Expression={if($_.Plug){$_.Plug}else{[DateTime]::MinValue}};Descending=$true},Name)){
-  if($null -eq $d.Plug -and $null -eq $d.Unplug){continue}
-  $out += ('{0} | {1} | {2}' -f $d.Name,(FmtTime $d.Plug),(FmtTime $d.Unplug))
-}
-if($out.Count -eq 0){'не найдено'}else{$out}
-)HCPS";
-
-    std::wstring output;
-    if (!RunHiddenPowerShellScriptCapture(script, output, 120000))
-    {
-        lines.push_back(L"не удалось прочитать USB события");
-        return lines;
-    }
-
-    std::vector<std::wstring> raw = SplitAutomationTextLines(output);
-    for (const std::wstring& line : raw)
-    {
-        if (!line.empty() && ToLowerCopy(line).find(L"filename, directory name, or volume label") == std::wstring::npos)
-            AppendWrappedAutomationLine(lines, line, 180);
-    }
-
-    if (lines.size() == 1)
-        lines.push_back(L"не найдено");
-
-    return lines;
 }
 
 static std::vector<std::wstring> ScanInjGenStyle()
@@ -3401,11 +4910,53 @@ try {
     return lines;
 }
 
-static std::vector<std::wstring> ScanPage5ByMode(int mode)
+static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool unsignedOnly)
 {
-    if (mode == 1)
-        return ScanInjGenStyle();
-    return ScanUsbHistory();
+    std::vector<std::wstring> lines;
+
+    if (target == AUTOMATION_OUTPUT_BAM)
+        lines = ScanBamRegistry(unsignedOnly);
+    else if (target == AUTOMATION_OUTPUT_EVENTVWR)
+        lines = ScanEventViewerLogs();
+    else if (target == AUTOMATION_OUTPUT_HISTORYPW)
+        lines = ScanPowerShellHistory();
+    else if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
+        lines = ScanJarActivityJournalReasonsOnly();
+    else if (target == AUTOMATION_OUTPUT_EXE_DELETED)
+        // .exe deleted больше не отдельное окно: deleted-строки показываются внутри .exe activity.
+        lines = ScanExeActivityWithDeleted();
+    else if (target == AUTOMATION_OUTPUT_PF_DELETED)
+        lines = ScanUsnActivityForExtension(L".jar", true);
+    else if (target == AUTOMATION_OUTPUT_MC_LOGS)
+        lines = ScanExeDeletedFromUsnDeleteClose();
+    else if (target == AUTOMATION_OUTPUT_PAGE4)
+        lines = ScanModrinthHashes();
+    else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
+        lines = ScanUnsignedDlls();
+    else if (target == AUTOMATION_OUTPUT_INJGEN)
+        lines = ScanInjGenStyle();
+
+    if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
+        SortAutomationOutputLinesByPipeColumnDateDesc(lines, 0, 1);
+    else
+        SortAutomationOutputLinesByDateDesc(lines, target == AUTOMATION_OUTPUT_EVENTVWR ? 0 : 1);
+    return lines;
+}
+
+static void PostAutomationBatchDone(std::vector<AutomationBatchItem>&& items)
+{
+    HWND hwnd = g_hMain;
+
+    if (!hwnd || g_destroying.load())
+        return;
+
+    AutomationBatchResult* result = new (std::nothrow) AutomationBatchResult();
+    if (!result)
+        return;
+
+    result->items = std::move(items);
+    if (!PostMessageW(hwnd, WM_APP_AUTOMATION_BATCH_DONE, 0, reinterpret_cast<LPARAM>(result)))
+        delete result;
 }
 
 static void StartAutomationScan(int target)
@@ -3415,77 +4966,79 @@ static void StartAutomationScan(int target)
 
     if (!working.compare_exchange_strong(expected, true))
     {
-        SetAutomationStatusLine(target, L"это сканирование уже выполняется...");
+        SetAutomationStatusLine(target, L"сканирование...");
         InvalidateAutomationPanel(target);
         return;
     }
 
     bool unsignedOnly = g_bamUnsignedOnly.load();
-    int activityMode = g_activityScanMode.load();
-    int page4Mode = g_page4ScanMode.load();
-    int page5Mode = g_page5ScanMode.load();
-    (void)page4Mode;
-    (void)page5Mode;
-    std::wstring status = L"сканирование...";
-
-    if (target == AUTOMATION_OUTPUT_BAM)
-        status = unsignedOnly ? L"сканирование not signed only..." : L"сканирование...";
-    else if (target == AUTOMATION_OUTPUT_HISTORYPW)
-        status = L"чтение ConsoleHost_history.txt...";
-    else if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
-    {
-        if (activityMode == 1)
-            status = L"чтение USN журнала .exe activity...";
-        else if (activityMode == 2)
-            status = L"чтение USN журнала .pf deleted...";
-        else if (activityMode == 3)
-            status = L"поиск .minecraft\\logs...";
-        else
-            status = L"чтение USN журнала .jar...";
-    }
-    else if (target == AUTOMATION_OUTPUT_PAGE4)
-        status = L"проверка хешей модов через Modrinth...";
-    else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
-        status = L"поиск неподписанных dll...";
-    else if (target == AUTOMATION_OUTPUT_PAGE5)
-        status = L"поиск usb...";
-    else if (target == AUTOMATION_OUTPUT_INJGEN)
-        status = L"проверка JVM/JNI/JVMTI...";
-
-    SetAutomationStatusLine(target, status);
+    SetAutomationStatusLine(target, L"сканирование...");
     if (AutomationEditForTarget(target))
         UpdateAutomationEditWindow(target);
     InvalidateAutomationPanel(target);
 
-    std::thread([target, unsignedOnly, activityMode]()
+    std::thread([target, unsignedOnly]()
     {
-        std::vector<std::wstring> lines;
-
-        if (target == AUTOMATION_OUTPUT_BAM)
-            lines = ScanBamRegistry(unsignedOnly);
-        else if (target == AUTOMATION_OUTPUT_EVENTVWR)
-            lines = ScanEventViewerLogs();
-        else if (target == AUTOMATION_OUTPUT_HISTORYPW)
-            lines = ScanPowerShellHistory();
-        else if (target == AUTOMATION_OUTPUT_JAR_ACTIVITY)
-            lines = ScanUsnActivityForExtension(L".jar", false);
-        else if (target == AUTOMATION_OUTPUT_EXE_DELETED)
-            lines = ScanUsnActivityForExtension(L".exe", false);
-        else if (target == AUTOMATION_OUTPUT_PF_DELETED)
-            lines = ScanUsnActivityForExtension(L".pf", true);
-        else if (target == AUTOMATION_OUTPUT_MC_LOGS)
-            lines = ScanMinecraftLogsFolders();
-        else if (target == AUTOMATION_OUTPUT_PAGE4)
-            lines = ScanModrinthHashes();
-        else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
-            lines = ScanUnsignedDlls();
-        else if (target == AUTOMATION_OUTPUT_PAGE5)
-            lines = ScanUsbHistory();
-        else if (target == AUTOMATION_OUTPUT_INJGEN)
-            lines = ScanInjGenStyle();
-
-        SortAutomationOutputLinesByDateDesc(lines, target == AUTOMATION_OUTPUT_EVENTVWR ? 0 : 1);
+        std::vector<std::wstring> lines = ExecuteAutomationScanTarget(target, unsignedOnly);
         PostAutomationDone(target, std::move(lines));
+    }).detach();
+}
+
+static void StartAutomationBatchScan(const std::vector<int>& targets)
+{
+    std::vector<int> started;
+    started.reserve(targets.size());
+
+    for (int target : targets)
+    {
+        bool expected = false;
+        std::atomic_bool& working = AutomationWorkingRef(target);
+        if (working.compare_exchange_strong(expected, true))
+        {
+            started.push_back(target);
+            SetAutomationStatusLine(target, L"сканирование...");
+            if (AutomationEditForTarget(target))
+                UpdateAutomationEditWindow(target);
+            InvalidateAutomationPanel(target);
+        }
+        else
+        {
+            SetAutomationStatusLine(target, L"сканирование...");
+            InvalidateAutomationPanel(target);
+        }
+    }
+
+    if (started.empty())
+        return;
+
+    bool unsignedOnly = g_bamUnsignedOnly.load();
+
+    std::thread([started, unsignedOnly]()
+    {
+        std::vector<AutomationBatchItem> items;
+        std::mutex itemsMutex;
+        std::vector<std::thread> workers;
+        workers.reserve(started.size());
+
+        for (int target : started)
+        {
+            workers.emplace_back([target, unsignedOnly, &items, &itemsMutex]()
+            {
+                AutomationBatchItem item;
+                item.target = target;
+                item.lines = ExecuteAutomationScanTarget(target, unsignedOnly);
+                std::lock_guard<std::mutex> lock(itemsMutex);
+                items.push_back(std::move(item));
+            });
+        }
+
+        for (std::thread& worker : workers)
+        {
+            if (worker.joinable())
+                worker.join();
+        }
+
+        PostAutomationBatchDone(std::move(items));
     }).detach();
 }
 
@@ -3930,14 +5483,8 @@ static bool EndsWithI(const std::wstring& s, const std::wstring& suffix)
 
 static bool IsFastFailName(const std::wstring& name)
 {
-    std::wstring lower = ToLower(name);
-
-    return lower.find(L"registryexplorer") != std::wstring::npos ||
-        (lower.find(L"registry") != std::wstring::npos && lower.find(L"explorer") != std::wstring::npos) ||
-        lower.find(L"jumplistexplorer") != std::wstring::npos ||
-        (lower.find(L"jumplist") != std::wstring::npos && lower.find(L"explorer") != std::wstring::npos) ||
-        lower.find(L"simpleunlocker") != std::wstring::npos ||
-        (lower.find(L"simple") != std::wstring::npos && lower.find(L"unlocker") != std::wstring::npos);
+    UNREFERENCED_PARAMETER(name);
+    return false;
 }
 
 static bool IsFastFailItem(const DownloadItem& item)
@@ -4064,17 +5611,12 @@ static bool IsSourceForgeDownloadWaitUrl(const std::wstring& url)
 
 static bool IsEricZimmermanLargeItem(const DownloadItem& item)
 {
-    return IsRegistryExplorerItem(item) || IsJumpListExplorerItem(item);
+    UNREFERENCED_PARAMETER(item);
+    return false;
 }
 
 static DWORD GetDirectDownloadTimeoutMs(const DownloadItem& item)
 {
-    if (IsRegistryExplorerItem(item) || IsJumpListExplorerItem(item))
-        return 900000;
-
-    if (IsSimpleUnlockerItem(item))
-        return 180000;
-
     if (IsSystemInformerItem(item))
         return 600000;
 

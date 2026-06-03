@@ -261,8 +261,6 @@ static unsigned long long GetEstimatedDownloadOrderBytes(const DownloadItem& ite
     if (name.find(L"recentfilesview") != std::wstring::npos) return 90ull * 1024ull;
     if (name.find(L"lastactivityview") != std::wstring::npos) return 120ull * 1024ull;
     if (name.find(L"executedprogramslist") != std::wstring::npos) return 120ull * 1024ull;
-    if (name.find(L"usbdrivelog") != std::wstring::npos) return 150ull * 1024ull;
-    if (name.find(L"usbdeview") != std::wstring::npos) return 180ull * 1024ull;
     if (name.find(L"browserdownloadsview") != std::wstring::npos) return 200ull * 1024ull;
     if (name.find(L"browsinghistoryview") != std::wstring::npos) return 220ull * 1024ull;
     if (name.find(L"regscanner") != std::wstring::npos) return 250ull * 1024ull;
@@ -342,8 +340,11 @@ static void DownloadWorker(std::vector<DownloadItem> items)
         int remaining = static_cast<int>(batch.size());
         int workers = static_cast<int>(std::thread::hardware_concurrency());
 
-        if (workers < 2) workers = 2;
-        if (workers > 4) workers = 4;
+        if (workers < 4) workers = 4;
+        // Раньше было максимум 4 потока. Это не ограничение скорости одного файла,
+        // но ограничивало параллельную загрузку. 8 обычно безопаснее для сети/серверов,
+        // чем десятки одновременных подключений.
+        if (workers > 8) workers = 8;
 
         if (workers > remaining) workers = remaining;
         if (workers < 1) workers = remaining > 0 ? 1 : 0;
@@ -913,6 +914,62 @@ static bool IsPathInsideFolder(const std::wstring& path, const std::wstring& fol
     return p[f.size()] == L'\\' || p[f.size()] == L'/';
 }
 
+
+static bool IsProcessNameEqual(const wchar_t* processName, const wchar_t* wantedName)
+{
+    if (!processName || !wantedName)
+        return false;
+    return _wcsicmp(processName, wantedName) == 0;
+}
+
+static void CloseProcessesByName(const std::vector<std::wstring>& names)
+{
+    if (names.empty())
+        return;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD currentPid = GetCurrentProcessId();
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(snapshot, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID == currentPid)
+                continue;
+
+            bool matched = false;
+            for (const std::wstring& name : names)
+            {
+                if (IsProcessNameEqual(pe.szExeFile, name.c_str()))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+                continue;
+
+            HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+            if (!process)
+                continue;
+
+            PostLog(L"Закрывается: " + std::wstring(pe.szExeFile));
+            TerminateProcess(process, 0);
+            WaitForSingleObject(process, 3000);
+            CloseHandle(process);
+        }
+        while (Process32NextW(snapshot, &pe));
+    }
+
+    CloseHandle(snapshot);
+}
+
 static void CloseProcessesFromFolder(const std::wstring& folder)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1088,6 +1145,140 @@ static void DeletePowerShellCheckOutputFiles()
         PostLog(L"Удалены check.txt/checktwinks.txt: " + std::to_wstring(deletedCount));
 }
 
+
+static std::wstring QuoteCmdArgument(const std::wstring& value)
+{
+    std::wstring out = L"\"";
+    for (wchar_t ch : value)
+    {
+        if (ch == L'\"')
+            out += L"\\\"";
+        else
+            out += ch;
+    }
+    out += L"\"";
+    return out;
+}
+
+static bool IsHolyCheckLikeFolderName(const std::wstring& folder)
+{
+    std::wstring full = GetFullPathSafe(folder);
+    size_t slash = full.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? full : full.substr(slash + 1);
+    std::wstring lower = ToLower(leaf);
+    return lower == L"holycheck" || lower == L"holycxheker" || lower.find(L"holycheck") != std::wstring::npos;
+}
+
+static bool WriteUtf8TextFileLocal(const std::wstring& path, const std::wstring& text)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    std::string bytes;
+    if (!text.empty())
+    {
+        int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (need > 1)
+        {
+            bytes.resize(static_cast<size_t>(need - 1));
+            WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, bytes.data(), need, nullptr, nullptr);
+        }
+    }
+
+    DWORD written = 0;
+    BOOL ok = TRUE;
+    if (!bytes.empty())
+        ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    CloseHandle(file);
+    return ok != FALSE;
+}
+
+static std::wstring BatchSetValue(std::wstring value)
+{
+    for (wchar_t& ch : value)
+    {
+        if (ch == L'"')
+            ch = L'\'';
+    }
+    return value;
+}
+
+static std::wstring EscapePowerShellSingleQuotedLocal(const std::wstring& value)
+{
+    std::wstring out;
+    out.reserve(value.size() + 8);
+    for (wchar_t ch : value)
+    {
+        if (ch == L'\'')
+            out += L"''";
+        else
+            out += ch;
+    }
+    return out;
+}
+
+static void ScheduleSelfDeleteAndCloseProgram()
+{
+    wchar_t exePath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath)))
+        return;
+
+    std::wstring exe = exePath;
+    std::wstring folder;
+    size_t slash = exe.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        folder = exe.substr(0, slash);
+
+    wchar_t tempDir[MAX_PATH]{};
+    std::wstring workDir = L"C:\\";
+    DWORD tempLen = GetTempPathW(ARRAYSIZE(tempDir), tempDir);
+    if (tempLen > 0 && tempLen < ARRAYSIZE(tempDir))
+        workDir = tempDir;
+    while (!workDir.empty() && (workDir.back() == L'\\' || workDir.back() == L'/'))
+        workDir.pop_back();
+
+    // Старая логика удаления папки выполняется в DeleteHolyCheckWorker через
+    // DeleteDirectoryTree(folder), пока программа ещё открыта. Этот helper нужен
+    // только для последнего заблокированного файла — текущего HolyCheck.exe — и
+    // финального удаления уже пустой папки после закрытия процесса.
+    std::wstring cmd = L"/C ping 127.0.0.1 -n 3 >nul";
+    cmd += L" & attrib -r -s -h " + QuoteCmdArgument(exe) + L" >nul 2>nul";
+    cmd += L" & del /f /q " + QuoteCmdArgument(exe) + L" >nul 2>nul";
+    if (!folder.empty())
+    {
+        // Повторяем коротко, чтобы успеть после полного завершения процесса.
+        cmd += L" & for /l %i in (1,1,20) do @if exist " + QuoteCmdArgument(folder) +
+               L" (rmdir " + QuoteCmdArgument(folder) + L" >nul 2>nul & if exist " +
+               QuoteCmdArgument(folder) + L" ping 127.0.0.1 -n 2 >nul)";
+    }
+
+    wchar_t sysDir[MAX_PATH]{};
+    std::wstring cmdExe = L"cmd.exe";
+    if (GetSystemDirectoryW(sysDir, ARRAYSIZE(sysDir)))
+        cmdExe = CombinePath(sysDir, L"cmd.exe");
+
+    std::wstring commandLine = QuoteCmdArgument(cmdExe) + L" " + cmd;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buffer(commandLine.begin(), commandLine.end());
+    buffer.push_back(L'\0');
+
+    std::vector<wchar_t> cwd(workDir.begin(), workDir.end());
+    cwd.push_back(L'\0');
+
+    if (CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, cwd.data(), &si, &pi))
+    {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+
 static void DeleteHolyCheckWorker()
 {
     RequestCancelDownloads();
@@ -1102,6 +1293,7 @@ static void DeleteHolyCheckWorker()
     DeletePowerShellCheckOutputFiles();
 
     PostLog(L"Закрываю программы");
+    CloseProcessesByName({ L"powershell.exe", L"pwsh.exe" });
     CloseProcessesFromFolder(folder);
 
     UninstallSystemInformerIfPresent();
@@ -1109,18 +1301,27 @@ static void DeleteHolyCheckWorker()
 
     CloseProcessesFromFolder(folder);
 
+    // Возвращена старая логика: сначала удаляется папка HolyCheck тем же
+    // DeleteDirectoryTree(folder). Текущий exe может остаться заблокированным,
+    // поэтому после закрытия программы helper удалит только exe и пустую папку.
     if (DeleteDirectoryTree(folder))
         PostLog(L"Папка удалена полностью");
     else
-        PostLog(L"Ошибка удаления папки");
+        PostLog(L"Папка удалена частично, завершаю HolyCheck и удаляю exe");
 
     ClearActiveDownloads();
     g_deleteInProgress = false;
     PostProgress(0);
 
+    ScheduleSelfDeleteAndCloseProgram();
+
     if (g_hMain && !g_destroying.load())
-        PostMessageW(g_hMain, WM_APP_DONE, 0, 0);
+        PostMessageW(g_hMain, WM_CLOSE, 0, 0);
+
+    Sleep(300);
+    ExitProcess(0);
 }
+
 
 static void DeleteHolyCheckFolder()
 {
