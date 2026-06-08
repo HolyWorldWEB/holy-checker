@@ -496,8 +496,10 @@ static DownloadResult DownloadRecursiveOnce(
         IsEricZimmermanUrl(url) ||
         IsFastFailDownload(displayName, url);
 
-    const DWORD lowSpeedWindowMs = aggressiveSwitch ? 8000 : 10000;
-    const unsigned long long minBytesPerSecond = aggressiveSwitch ? 100ull * 1024ull : 32ull * 1024ull;
+    // Не обрываем WinHTTP по "низкой скорости". Реального лимита скорости в коде нет;
+    // этот блок раньше только считал загрузку зависшей при медленном соединении.
+    const DWORD lowSpeedWindowMs = 0;
+    const unsigned long long minBytesPerSecond = 0ull;
 
     auto makeStalled = [&](DWORD err) -> DownloadResult
     {
@@ -577,7 +579,7 @@ static DownloadResult DownloadRecursiveOnce(
 
         ULONGLONG windowMs = now - lowSpeedWindowStarted;
 
-        if (windowMs >= lowSpeedWindowMs)
+        if (lowSpeedWindowMs > 0 && minBytesPerSecond > 0 && windowMs >= lowSpeedWindowMs)
         {
             unsigned long long delta = bytesWrittenThisResponse - lowSpeedWindowBytes;
             unsigned long long bytesPerSecond = (delta * 1000ull) / std::max<ULONGLONG>(1, windowMs);
@@ -638,7 +640,8 @@ static bool DownloadRecursive(
     const std::wstring& displayName,
     int depth)
 {
-    const int maxAttempts = depth == 0 ? 4 : 3;
+    const bool fastSwitchName = IsAggressiveWinHttpSwitchName(displayName);
+    const int maxAttempts = fastSwitchName ? 1 : (depth == 0 ? 4 : 3);
     DownloadResult lastResult;
 
     for (int attempt = 1; attempt <= maxAttempts; ++attempt)
