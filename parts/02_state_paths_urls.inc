@@ -4690,9 +4690,15 @@ function IsBadXaeroMinimap([string]$name){
   if([string]::IsNullOrWhiteSpace($name)){return $false}
   if([IO.Path]::GetExtension($name).ToLowerInvariant() -ne '.jar'){return $false}
   $base=([IO.Path]::GetFileNameWithoutExtension($name)).ToLowerInvariant()
-  $m=[regex]::Match($base, '(xaeros?[\s_\.-]*minimap|xaerominimap).*?(\d+)\D+(\d+)\D+(\d+)')
-  if(-not $m.Success){return $false}
-  return (VersionAtLeast2530 ([int]$m.Groups[2].Value) ([int]$m.Groups[3].Value) ([int]$m.Groups[4].Value))
+  if($base -notmatch '(xaeros?[\s_\.-]*minimap|xaerominimap)'){return $false}
+
+  # Xaero's Minimap filenames often contain both the Minecraft version and the mod version:
+  #   xaerominimap-fabric-26.1.2-25.3.14.jar
+  # Here 26.1.2 is the game version, so check the last semantic version in the filename.
+  $matches=[regex]::Matches($base, '(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)')
+  if($matches.Count -le 0){return $false}
+  $m=$matches[$matches.Count-1]
+  return (VersionAtLeast2530 ([int]$m.Groups[1].Value) ([int]$m.Groups[2].Value) ([int]$m.Groups[3].Value))
 }
 $cheatKeys=New-Object System.Collections.Generic.List[string]
 foreach($n in $cheatJarNames){ $k=NormName ($n + '.jar'); if(-not [string]::IsNullOrWhiteSpace($k) -and -not $cheatKeys.Contains($k)){ $cheatKeys.Add($k) } }
