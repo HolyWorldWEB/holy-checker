@@ -493,7 +493,6 @@ static void StartDownload(const std::vector<DownloadItem>& items)
     SetDownloadControlsEnabled(false);
     g_progressPercent = 0;
     ClearDownloadLog();
-    PostLog(L"лог: " + GetHolyCheckDebugLogPath());
     ClearActiveDownloads();
     InvalidateBottomPanel();
 
@@ -639,8 +638,7 @@ static void OpenOrDownloadSingleById(int id)
         g_singleDone = 0;
         g_progressPercent = 0;
         ClearDownloadLog();
-        PostLog(L"лог: " + GetHolyCheckDebugLogPath());
-        ClearActiveDownloads();
+            ClearActiveDownloads();
     }
 
     g_singleTotal.fetch_add(1);

@@ -36,41 +36,12 @@ static std::wstring SanitizeDebugLogText(std::wstring text)
 
 static std::wstring BuildHolyCheckDebugLogPathNoLock()
 {
-    std::wstring dir;
-
-    wchar_t localAppData[MAX_PATH * 4]{};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData)) && localAppData[0])
-    {
-        dir = std::wstring(localAppData) + L"\\HolyCheck";
-        CreateDirectoryW(dir.c_str(), nullptr);
-    }
-
-    DWORD attr = dir.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(dir.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
-    {
-        wchar_t tempDir[MAX_PATH * 4]{};
-        DWORD len = GetTempPathW(ARRAYSIZE(tempDir), tempDir);
-        if (len > 0 && len < ARRAYSIZE(tempDir))
-            dir.assign(tempDir, len);
-        else
-            dir = L"C:\\Windows\\Temp\\";
-
-        if (!dir.empty() && dir.back() == L'\\')
-            dir.pop_back();
-
-        dir += L"\\HolyCheck";
-        CreateDirectoryW(dir.c_str(), nullptr);
-    }
-
-    return dir + L"\\holycheck_debug.log";
+    return L"";
 }
 
 static std::wstring GetHolyCheckDebugLogPath()
 {
-    std::lock_guard<std::mutex> lock(g_debugLogMutex);
-    if (g_debugLogPath.empty())
-        g_debugLogPath = BuildHolyCheckDebugLogPathNoLock();
-    return g_debugLogPath;
+    return L"";
 }
 
 static std::wstring FormatWin32ErrorForLog(DWORD err)
@@ -104,55 +75,15 @@ static std::wstring FormatWin32ErrorForLog(DWORD err)
     return text;
 }
 
-static std::wstring MakeDebugTimestamp()
-{
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-
-    wchar_t buf[64]{};
-    swprintf_s(buf, ARRAYSIZE(buf), L"%04u-%02u-%02u %02u:%02u:%02u.%03u",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    return buf;
-}
-
 static void DebugLogLine(const std::wstring& scope, const std::wstring& message)
 {
-    std::wstring path = GetHolyCheckDebugLogPath();
-    std::wstring line = MakeDebugTimestamp() + L" pid=" + std::to_wstring(GetCurrentProcessId()) +
-        L" tid=" + std::to_wstring(GetCurrentThreadId()) + L" [" + SanitizeDebugLogText(scope) +
-        L"] " + SanitizeDebugLogText(message) + L"\r\n";
-
-    std::lock_guard<std::mutex> lock(g_debugLogMutex);
-
-    HANDLE file = CreateFileW(
-        path.c_str(),
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-
-    if (file == INVALID_HANDLE_VALUE)
-        return;
-
-    LARGE_INTEGER size{};
-    if (GetFileSizeEx(file, &size) && size.QuadPart == 0)
-    {
-        const BYTE bom[2] = { 0xFF, 0xFE };
-        DWORD written = 0;
-        WriteFile(file, bom, 2, &written, nullptr);
-    }
-
-    DWORD bytes = static_cast<DWORD>(line.size() * sizeof(wchar_t));
-    DWORD written = 0;
-    WriteFile(file, line.data(), bytes, &written, nullptr);
-    CloseHandle(file);
+    (void)scope;
+    (void)message;
 }
 
 static void DebugLogSeparator(const std::wstring& title)
 {
-    DebugLogLine(L"session", L"========== " + title + L" ==========");
+    (void)title;
 }
 
 static std::wstring EscapePowerShellSingleQuotedForDebug(std::wstring s)
@@ -2164,7 +2095,6 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
         if (!output.empty())
             output += L"\n";
         output += L"fsutil: команда остановлена по таймауту.";
-        output += L"\nподробный лог: " + GetHolyCheckDebugLogPath();
     }
 
     return true;
@@ -2279,7 +2209,6 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
         if (!output.empty())
             output += L"\n";
         output += L"команда остановлена по таймауту.";
-        output += L"\nподробный лог: " + GetHolyCheckDebugLogPath();
     }
 
     return true;
@@ -4845,19 +4774,14 @@ static std::vector<std::wstring> ScanModrinthHashes(int scanMode)
     std::wstring script;
     script.reserve(110592);
     script += (scanMode == 1) ? L"$script:HolyCheckFullScan=$true\n" : L"$script:HolyCheckFullScan=$false\n";
-    script += L"$script:HolyCheckDebugLog='" + EscapePowerShellSingleQuotedForDebug(GetHolyCheckDebugLogPath()) + L"'\n";
+    script += L"$script:HolyCheckDebugLog=''\n";
     script += L"$script:HolyCheckSelfExe='" + EscapePowerShellSingleQuotedForDebug(selfExePath) + L"'\n";
     script += LR"HCPS(
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
 try{Add-Type -AssemblyName System.IO.Compression.FileSystem}catch{}
-function HCLog([string]$m){
-  try{
-    $ts=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
-    Add-Content -LiteralPath $script:HolyCheckDebugLog -Encoding Unicode -Value ($ts + ' [ps:checkmods] ' + $m)
-  }catch{}
-}
+function HCLog([string]$m){ }
 HCLog ('start fullscan=' + $script:HolyCheckFullScan)
 
 $script:roots=@()
@@ -5509,7 +5433,6 @@ if($bad -eq 0){'не найдено'}
     {
         DebugLogLine(L"checkmods", L"powershell capture launch failed mode=" + std::to_wstring(scanMode));
         lines.push_back((scanMode == 1) ? L"не удалось запустить checkmods fullscan" : L"не удалось запустить checkmods");
-        lines.push_back(L"подробный лог: " + GetHolyCheckDebugLogPath());
         return lines;
     }
     DebugLogLine(L"checkmods", L"powershell capture done timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
