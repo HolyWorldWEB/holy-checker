@@ -246,6 +246,8 @@ static DownloadResult DownloadRecursiveOnce(
     int depth)
 {
     ClearTransferStalledFlag();
+    DebugLogLine(L"download", L"WinHTTP once start item=" + displayName + L" depth=" + std::to_wstring(depth) +
+        L" target=" + targetPath + L" url=" + url);
 
     if (IsCancelRequested())
         return MakeDownloadError(DownloadError::Cancelled, 0, false);
@@ -267,6 +269,14 @@ static DownloadResult DownloadRecursiveOnce(
 
     auto finish = [&](DownloadResult result) -> DownloadResult
     {
+        DebugLogLine(L"download", L"WinHTTP once finish item=" + displayName +
+            L" ok=" + std::to_wstring(result.ok ? 1 : 0) +
+            L" error=" + DownloadErrorToString(result.error) +
+            L" http=" + std::to_wstring(result.httpStatus) +
+            L" win32=" + FormatWin32ErrorForLog(result.win32Error) +
+            L" bytes=" + std::to_wstring(result.bytesWritten) +
+            L" contentLength=" + std::to_wstring(result.contentLength) +
+            L" finalUrl=" + result.finalUrl);
         CloseTrackedHttpHandle(requestSlot);
         CloseTrackedHttpHandle(connectSlot);
         CloseTrackedHttpHandle(sessionSlot);
@@ -649,12 +659,15 @@ static bool DownloadRecursive(
         if (attempt > 1 && !SleepRetryDelay(GetRetryDelayMs(attempt - 1)))
             return false;
 
+        DebugLogLine(L"download", L"WinHTTP attempt start item=" + displayName + L" attempt=" + std::to_wstring(attempt) + L"/" + std::to_wstring(maxAttempts));
         lastResult = DownloadRecursiveOnce(url, targetPath, displayName, depth);
 
         if (lastResult.ok)
         {
             if (lastResult.resumed)
                 PostLog(L"Докачано: " + displayName);
+            DebugLogLine(L"download", L"WinHTTP recursive success item=" + displayName + L" attempt=" + std::to_wstring(attempt) +
+                L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
             return true;
         }
 
@@ -667,6 +680,7 @@ static bool DownloadRecursive(
             break;
     }
 
+    DebugLogLine(L"download", L"WinHTTP recursive failed item=" + displayName + L" error=" + DownloadErrorToString(lastResult.error));
     return false;
 }
 

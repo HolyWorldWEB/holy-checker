@@ -24,6 +24,148 @@ static std::wstring ShortLogLine(std::wstring line)
     return line;
 }
 
+static std::wstring SanitizeDebugLogText(std::wstring text)
+{
+    for (wchar_t& ch : text)
+    {
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t')
+            ch = L' ';
+    }
+    return text;
+}
+
+static std::wstring BuildHolyCheckDebugLogPathNoLock()
+{
+    std::wstring dir;
+
+    wchar_t localAppData[MAX_PATH * 4]{};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData)) && localAppData[0])
+    {
+        dir = std::wstring(localAppData) + L"\\HolyCheck";
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
+
+    DWORD attr = dir.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(dir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        wchar_t tempDir[MAX_PATH * 4]{};
+        DWORD len = GetTempPathW(ARRAYSIZE(tempDir), tempDir);
+        if (len > 0 && len < ARRAYSIZE(tempDir))
+            dir.assign(tempDir, len);
+        else
+            dir = L"C:\\Windows\\Temp\\";
+
+        if (!dir.empty() && dir.back() == L'\\')
+            dir.pop_back();
+
+        dir += L"\\HolyCheck";
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
+
+    return dir + L"\\holycheck_debug.log";
+}
+
+static std::wstring GetHolyCheckDebugLogPath()
+{
+    std::lock_guard<std::mutex> lock(g_debugLogMutex);
+    if (g_debugLogPath.empty())
+        g_debugLogPath = BuildHolyCheckDebugLogPathNoLock();
+    return g_debugLogPath;
+}
+
+static std::wstring FormatWin32ErrorForLog(DWORD err)
+{
+    if (err == 0)
+        return L"0";
+
+    wchar_t* buffer = nullptr;
+    DWORD len = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        err,
+        0,
+        reinterpret_cast<LPWSTR>(&buffer),
+        0,
+        nullptr);
+
+    std::wstring text = std::to_wstring(err);
+    if (len > 0 && buffer)
+    {
+        text += L" (";
+        text += buffer;
+        while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ' || text.back() == L'\t'))
+            text.pop_back();
+        text += L")";
+    }
+
+    if (buffer)
+        LocalFree(buffer);
+
+    return text;
+}
+
+static std::wstring MakeDebugTimestamp()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    wchar_t buf[64]{};
+    swprintf_s(buf, ARRAYSIZE(buf), L"%04u-%02u-%02u %02u:%02u:%02u.%03u",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buf;
+}
+
+static void DebugLogLine(const std::wstring& scope, const std::wstring& message)
+{
+    std::wstring path = GetHolyCheckDebugLogPath();
+    std::wstring line = MakeDebugTimestamp() + L" pid=" + std::to_wstring(GetCurrentProcessId()) +
+        L" tid=" + std::to_wstring(GetCurrentThreadId()) + L" [" + SanitizeDebugLogText(scope) +
+        L"] " + SanitizeDebugLogText(message) + L"\r\n";
+
+    std::lock_guard<std::mutex> lock(g_debugLogMutex);
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(file, &size) && size.QuadPart == 0)
+    {
+        const BYTE bom[2] = { 0xFF, 0xFE };
+        DWORD written = 0;
+        WriteFile(file, bom, 2, &written, nullptr);
+    }
+
+    DWORD bytes = static_cast<DWORD>(line.size() * sizeof(wchar_t));
+    DWORD written = 0;
+    WriteFile(file, line.data(), bytes, &written, nullptr);
+    CloseHandle(file);
+}
+
+static void DebugLogSeparator(const std::wstring& title)
+{
+    DebugLogLine(L"session", L"========== " + title + L" ==========");
+}
+
+static std::wstring EscapePowerShellSingleQuotedForDebug(std::wstring s)
+{
+    size_t pos = 0;
+    while ((pos = s.find(L"'", pos)) != std::wstring::npos)
+    {
+        s.replace(pos, 1, L"''");
+        pos += 2;
+    }
+    return s;
+}
+
 static void PushLogLine(const std::wstring& line)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
@@ -1921,6 +2063,10 @@ static void AppendWrappedAutomationLines(std::vector<std::wstring>& out, const s
 static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& output, DWORD timeoutMs)
 {
     output.clear();
+    g_lastHiddenProcessTimedOut = false;
+    g_lastHiddenProcessExitCode = STILL_ACTIVE;
+    g_lastHiddenProcessCreateError = 0;
+    DebugLogLine(L"process", L"cmd start timeout=" + std::to_wstring(timeoutMs) + L" command=" + command);
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -1929,7 +2075,10 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
     HANDLE readPipe = nullptr;
     HANDLE writePipe = nullptr;
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
+    {
+        DebugLogLine(L"process", L"cmd CreatePipe failed error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
@@ -1949,6 +2098,8 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
 
     if (!ok)
     {
+        g_lastHiddenProcessCreateError = GetLastError();
+        DebugLogLine(L"process", L"cmd CreateProcess failed error=" + FormatWin32ErrorForLog(g_lastHiddenProcessCreateError));
         CloseHandle(readPipe);
         return false;
     }
@@ -1995,6 +2146,13 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
         }
     }
 
+    DWORD exitCode = STILL_ACTIVE;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    g_lastHiddenProcessTimedOut = timedOut;
+    g_lastHiddenProcessExitCode = exitCode;
+    DebugLogLine(L"process", L"cmd finish timedOut=" + std::to_wstring(timedOut ? 1 : 0) +
+        L" exit=" + std::to_wstring(exitCode) + L" bytes=" + std::to_wstring(bytes.size()));
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
@@ -2006,6 +2164,7 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
         if (!output.empty())
             output += L"\n";
         output += L"fsutil: команда остановлена по таймауту.";
+        output += L"\nподробный лог: " + GetHolyCheckDebugLogPath();
     }
 
     return true;
@@ -2016,6 +2175,10 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
 static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstring& arguments, std::wstring& output, DWORD timeoutMs)
 {
     output.clear();
+    g_lastHiddenProcessTimedOut = false;
+    g_lastHiddenProcessExitCode = STILL_ACTIVE;
+    g_lastHiddenProcessCreateError = 0;
+    DebugLogLine(L"process", L"process start exe=" + exePath + L" timeout=" + std::to_wstring(timeoutMs) + L" args=" + arguments);
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -2024,7 +2187,10 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
     HANDLE readPipe = nullptr;
     HANDLE writePipe = nullptr;
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
+    {
+        DebugLogLine(L"process", L"process CreatePipe failed exe=" + exePath + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
@@ -2047,6 +2213,8 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
 
     if (!ok)
     {
+        g_lastHiddenProcessCreateError = GetLastError();
+        DebugLogLine(L"process", L"process CreateProcess failed exe=" + exePath + L" error=" + FormatWin32ErrorForLog(g_lastHiddenProcessCreateError));
         CloseHandle(readPipe);
         return false;
     }
@@ -2093,6 +2261,13 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
         }
     }
 
+    DWORD exitCode = STILL_ACTIVE;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    g_lastHiddenProcessTimedOut = timedOut;
+    g_lastHiddenProcessExitCode = exitCode;
+    DebugLogLine(L"process", L"process finish exe=" + exePath + L" timedOut=" + std::to_wstring(timedOut ? 1 : 0) +
+        L" exit=" + std::to_wstring(exitCode) + L" bytes=" + std::to_wstring(bytes.size()));
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
@@ -2104,6 +2279,7 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
         if (!output.empty())
             output += L"\n";
         output += L"команда остановлена по таймауту.";
+        output += L"\nподробный лог: " + GetHolyCheckDebugLogPath();
     }
 
     return true;
@@ -2142,8 +2318,12 @@ static std::wstring MakeAutomationTempPs1Path(const wchar_t* prefix)
 static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::wstring& output, DWORD timeoutMs)
 {
     std::wstring ps1 = MakeAutomationTempPs1Path(L"holycheck_scan");
+    DebugLogLine(L"powershell", L"write ps1=" + ps1 + L" chars=" + std::to_wstring(script.size()) + L" timeout=" + std::to_wstring(timeoutMs));
     if (!WriteUtf16LeTextFileLocal(ps1, script))
+    {
+        DebugLogLine(L"powershell", L"write ps1 failed path=" + ps1 + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     std::wstring psExe = L"powershell.exe";
     wchar_t winDir[MAX_PATH]{};
@@ -2159,8 +2339,19 @@ static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::ws
     }
 
     std::wstring args = L"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"" + ps1 + L"\"";
+    DebugLogLine(L"powershell", L"launch exe=" + psExe + L" ps1=" + ps1);
     bool ok = RunHiddenProcessCapture(psExe, args, output, timeoutMs);
-    DeleteFileW(ps1.c_str());
+    DebugLogLine(L"powershell", L"finish ok=" + std::to_wstring(ok ? 1 : 0) +
+        L" timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
+        L" exit=" + std::to_wstring(g_lastHiddenProcessExitCode) + L" outputChars=" + std::to_wstring(output.size()));
+    if (g_lastHiddenProcessTimedOut)
+    {
+        DebugLogLine(L"powershell", L"timeout: temp script kept for debugging: " + ps1);
+    }
+    else
+    {
+        DeleteFileW(ps1.c_str());
+    }
     return ok;
 }
 
@@ -4637,24 +4828,173 @@ static std::vector<std::wstring> ScanActivityByMode(int mode)
     return ScanUsnActivityForExtension(L".jar", false);
 }
 
-static std::vector<std::wstring> ScanModrinthHashes()
+static std::vector<std::wstring> ScanModrinthHashes(int scanMode)
 {
     std::vector<std::wstring> lines;
     lines.push_back(L"название | путь");
 
-    std::wstring script = LR"HCPS(
+    DebugLogSeparator((scanMode == 1) ? L"checkmods fullscan start" : L"checkmods start");
+    DebugLogLine(L"checkmods", L"mode=" + std::to_wstring(scanMode) + L" log=" + GetHolyCheckDebugLogPath());
+
+    wchar_t selfExePathBuf[32768]{};
+    std::wstring selfExePath;
+    DWORD selfExeLen = GetModuleFileNameW(nullptr, selfExePathBuf, ARRAYSIZE(selfExePathBuf));
+    if (selfExeLen > 0 && selfExeLen < ARRAYSIZE(selfExePathBuf))
+        selfExePath.assign(selfExePathBuf, selfExeLen);
+
+    std::wstring script;
+    script.reserve(110592);
+    script += (scanMode == 1) ? L"$script:HolyCheckFullScan=$true\n" : L"$script:HolyCheckFullScan=$false\n";
+    script += L"$script:HolyCheckDebugLog='" + EscapePowerShellSingleQuotedForDebug(GetHolyCheckDebugLogPath()) + L"'\n";
+    script += L"$script:HolyCheckSelfExe='" + EscapePowerShellSingleQuotedForDebug(selfExePath) + L"'\n";
+    script += LR"HCPS(
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
 try{Add-Type -AssemblyName System.IO.Compression.FileSystem}catch{}
-function AddRoot([string]$p){ if(-not [string]::IsNullOrWhiteSpace($p) -and (Test-Path -LiteralPath $p)){ $script:roots += (Resolve-Path -LiteralPath $p).Path } }
+function HCLog([string]$m){
+  try{
+    $ts=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+    Add-Content -LiteralPath $script:HolyCheckDebugLog -Encoding Unicode -Value ($ts + ' [ps:checkmods] ' + $m)
+  }catch{}
+}
+HCLog ('start fullscan=' + $script:HolyCheckFullScan)
+
+$script:roots=@()
+$script:rootKeys=@{}
+$script:downloadRoots=@()
+$script:downloadRootKeys=@{}
+$script:sevenZipSkipReported=$false
+
+function PathKey([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return ''}
+  return (($p -replace '/','\').TrimEnd('\')).ToLowerInvariant()
+}
+function AddRoot([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return}
+  try{
+    if(-not (Test-Path -LiteralPath $p)){return}
+    foreach($rp in @(Resolve-Path -LiteralPath $p -ErrorAction SilentlyContinue)){
+      $v=$rp.Path
+      if([string]::IsNullOrWhiteSpace($v)){continue}
+      $k=PathKey $v
+      if(-not $script:rootKeys.ContainsKey($k)){
+        $script:rootKeys[$k]=1
+        $script:roots += $v
+        HCLog ('root add: ' + $v)
+      }
+    }
+  }catch{}
+}
+function AddDownloadRoot([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return}
+  try{
+    if(-not (Test-Path -LiteralPath $p)){return}
+    foreach($rp in @(Resolve-Path -LiteralPath $p -ErrorAction SilentlyContinue)){
+      $v=$rp.Path
+      if([string]::IsNullOrWhiteSpace($v)){continue}
+      $k=PathKey $v
+      if(-not $script:downloadRootKeys.ContainsKey($k)){
+        $script:downloadRootKeys[$k]=1
+        $script:downloadRoots += $v
+        HCLog ('download/archive root add: ' + $v)
+      }
+      AddRoot $v
+    }
+  }catch{}
+}
+function GetReadyDriveRoots(){
+  $list=New-Object System.Collections.Generic.List[string]
+  try{
+    [IO.DriveInfo]::GetDrives() | Where-Object {
+      $_.IsReady -and ($_.DriveType -eq [IO.DriveType]::Fixed -or $_.DriveType -eq [IO.DriveType]::Removable)
+    } | ForEach-Object {
+      $root=$_.RootDirectory.FullName
+      if(-not [string]::IsNullOrWhiteSpace($root) -and -not $list.Contains($root)){[void]$list.Add($root)}
+    }
+  }catch{}
+  if($list.Count -eq 0){
+    try{
+      Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+        $root=$_.Root
+        if(-not [string]::IsNullOrWhiteSpace($root) -and (Test-Path -LiteralPath $root) -and -not $list.Contains($root)){[void]$list.Add($root)}
+      }
+    }catch{}
+  }
+  HCLog ('ready drives: ' + (($list | ForEach-Object {[string]$_}) -join ', '))
+  return @($list)
+}
+function IsExcludedSystemPath([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return $true}
+  $x=($p -replace '/','\')
+  if($x -match '^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|System Volume Information|\$Recycle\.Bin)(\\|$)'){return $true}
+  if($x -match '\\Windows\\(System32|SysWOW64|WinSxS|Installer|servicing|INF|SystemApps|Temp)(\\|$)'){return $true}
+  if($x -match '\\(System Volume Information|\$Recycle\.Bin|Recovery)(\\|$)'){return $true}
+  if($x -match '\\ProgramData\\(Microsoft|Package Cache)(\\|$)'){return $true}
+  return $false
+}
 function IsAllowedPath([string]$p){
   if([string]::IsNullOrWhiteSpace($p)){return $false}
-  if($p -match '^C:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|System Volume Information|\\\$Recycle\.Bin)(\\|$)'){return $false}
+  if(IsExcludedSystemPath $p){return $false}
   if($p -match '\\(jdk|jre|java|javapath|libraries|assets|runtime|versions)\\'){return $false}
   if($p -match '\\.minecraft\\(libraries|assets|runtime|versions)\\'){return $false}
   if($p -match '\\.tlauncher\\legacy\\Minecraft\\game\\(libraries|assets|runtime|versions)\\'){return $false}
   return $true
+}
+function ShouldSkipDirectory([string]$p){
+  if(IsExcludedSystemPath $p){return $true}
+  try{
+    $leaf=[IO.Path]::GetFileName(($p -replace '/','\').TrimEnd('\'))
+    if($leaf -in @('Windows','Program Files','Program Files (x86)','ProgramData','$Recycle.Bin','System Volume Information','Recovery','WinSxS','Installer')){return $true}
+    $attrs=[IO.File]::GetAttributes($p)
+    if(($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0){return $true}
+  }catch{return $true}
+  return $false
+}
+function IsCandidateExtension([string]$ext){
+  if([string]::IsNullOrWhiteSpace($ext)){return $false}
+  $e=$ext.ToLowerInvariant()
+  return ($e -eq '.jar' -or $e -eq '.zip' -or $e -eq '.rar' -or $e -eq '.7z')
+}
+function EnumerateCandidateFiles([string]$root){
+  if([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)){return}
+  HCLog ('enumerate start: ' + $root + ' fullscan=' + $script:HolyCheckFullScan)
+  if(-not $script:HolyCheckFullScan){
+    try{
+      Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { (IsCandidateExtension $_.Extension) -and (IsAllowedPath $_.FullName) }
+    }catch{}
+    return
+  }
+
+  $stack=New-Object System.Collections.Generic.Stack[string]
+  $dirSeen=@{}
+  try{[void]$stack.Push((Resolve-Path -LiteralPath $root -ErrorAction Stop).Path)}catch{ HCLog ('enumerate resolve failed: ' + $root + ' error=' + $_.Exception.Message); return}
+
+  while($stack.Count -gt 0){
+    $dir=$stack.Pop()
+    if([string]::IsNullOrWhiteSpace($dir)){continue}
+    $dk=PathKey $dir
+    if($dirSeen.ContainsKey($dk)){continue}
+    $dirSeen[$dk]=1
+    if(ShouldSkipDirectory $dir){continue}
+
+    try{
+      foreach($sub in [IO.Directory]::EnumerateDirectories($dir)){
+        if(-not (ShouldSkipDirectory $sub)){[void]$stack.Push($sub)}
+      }
+    }catch{}
+
+    try{
+      foreach($file in [IO.Directory]::EnumerateFiles($dir)){
+        try{
+          $ext=[IO.Path]::GetExtension($file)
+          if((IsCandidateExtension $ext) -and (IsAllowedPath $file)){
+            New-Object System.IO.FileInfo -ArgumentList $file
+          }
+        }catch{}
+      }
+    }catch{}
+  }
 }
 function Find7Zip(){
   $c=@('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe')
@@ -4725,61 +5065,365 @@ function HashFileHex([string]$path){
 }
 $items=New-Object System.Collections.Generic.List[object]
 $nameHits=New-Object System.Collections.Generic.List[object]
+$cleanupHits=New-Object System.Collections.Generic.List[object]
 $reported=@{}
 function AddNameHit([string]$name,[string]$path){
   if([string]::IsNullOrWhiteSpace($path)){return}
-  $k=$path.ToLowerInvariant()
+  $k=PathKey $path
   if($script:reported.ContainsKey($k)){return}
   $script:reported[$k]=1
   $script:nameHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
+}
+function AddCleanupHit([string]$name,[string]$path){
+  if([string]::IsNullOrWhiteSpace($path)){return}
+  $script:cleanupHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
 }
 function AddJarItem([string]$name,[string]$path,[string]$hash){
   if(IsCheatJarName $name){ AddNameHit $name $path; return }
   if([string]::IsNullOrWhiteSpace($hash)){return}
   $script:items.Add([PSCustomObject]@{Hash=$hash.ToLowerInvariant();Name=$name;Path=$path}) | Out-Null
 }
-$roots=@()
-if(Test-Path -LiteralPath 'C:\Users'){
-  Get-ChildItem -LiteralPath 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    AddRoot (Join-Path $_.FullName 'Downloads')
-    AddRoot (Join-Path $_.FullName 'Desktop')
-    AddRoot (Join-Path $_.FullName 'Documents')
-    AddRoot (Join-Path $_.FullName 'AppData\Roaming\.minecraft\mods')
-    AddRoot (Join-Path $_.FullName 'AppData\Roaming\.tlauncher\legacy\Minecraft\game\mods')
-    AddRoot (Join-Path $_.FullName 'AppData\Roaming\PrismLauncher\instances')
-    AddRoot (Join-Path $_.FullName 'curseforge\minecraft\Instances')
-  }
-}
-$roots=@($roots | Where-Object {$_} | Select-Object -Unique)
-if($roots.Count -eq 0){'mods folder not found'; exit}
-$seen=@{}
-$archives=@{}
-foreach($r in $roots){
+
+$driveRoots=@(GetReadyDriveRoots)
+HCLog ('drive root count=' + $driveRoots.Count)
+foreach($drive in $driveRoots){
   try{
-    Get-ChildItem -LiteralPath $r -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { IsAllowedPath $_.FullName } | ForEach-Object {
-      $ext=$_.Extension.ToLowerInvariant()
-      $k=$_.FullName.ToLowerInvariant()
-      if(-not $seen.ContainsKey($k)){
-        $seen[$k]=1
-        if($ext -eq '.jar'){
-          if(IsCheatJarName $_.Name){ AddNameHit $_.Name $_.FullName }
-          else{ AddJarItem $_.Name $_.FullName (HashFileHex $_.FullName) }
-        }elseif($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
-          $archives[$k]=$_
-        }
+    $users=Join-Path $drive 'Users'
+    if(Test-Path -LiteralPath $users){
+      Get-ChildItem -LiteralPath $users -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        AddDownloadRoot (Join-Path $_.FullName 'Downloads')
+        AddDownloadRoot (Join-Path $_.FullName 'Desktop')
+        AddDownloadRoot (Join-Path $_.FullName 'OneDrive\Desktop')
+        AddRoot (Join-Path $_.FullName 'Documents')
+        AddRoot (Join-Path $_.FullName '.lunarclient\profiles')
+        AddRoot (Join-Path $_.FullName 'AppData\Roaming\.minecraft\mods')
+        AddRoot (Join-Path $_.FullName 'AppData\Roaming\.tlauncher\legacy\Minecraft\game\mods')
+        AddRoot (Join-Path $_.FullName 'AppData\Roaming\PrismLauncher\instances')
+        AddRoot (Join-Path $_.FullName 'curseforge\minecraft\Instances')
       }
     }
   }catch{}
 }
+if($env:USERPROFILE){
+  AddDownloadRoot (Join-Path $env:USERPROFILE 'Downloads')
+  AddDownloadRoot (Join-Path $env:USERPROFILE 'Desktop')
+  AddRoot (Join-Path $env:USERPROFILE 'Documents')
+  AddRoot (Join-Path $env:USERPROFILE '.lunarclient\profiles')
+}
+try{ AddDownloadRoot ([Environment]::GetFolderPath('Desktop')) }catch{}
+foreach($od in @($env:OneDrive,$env:OneDriveConsumer,$env:OneDriveCommercial)){
+  if(-not [string]::IsNullOrWhiteSpace($od)){ AddDownloadRoot (Join-Path $od 'Desktop') }
+}
+if($env:APPDATA){
+  AddRoot (Join-Path $env:APPDATA '.minecraft\mods')
+  AddRoot (Join-Path $env:APPDATA '.tlauncher\legacy\Minecraft\game\mods')
+  AddRoot (Join-Path $env:APPDATA 'PrismLauncher\instances')
+}
+if($script:HolyCheckFullScan){
+  foreach($drive in $driveRoots){ AddRoot $drive }
+}
+
+HCLog ('final roots=' + $roots.Count + '; download/archive roots=' + $downloadRoots.Count)
+if($roots.Count -eq 0){HCLog 'no roots, exit'; 'mods folder not found'; exit}
+$seen=@{}
+$archives=@{}
+$downloadArchives=@{}
+foreach($r in $roots){
+  $rootCandidateCount=0
+  HCLog ('scan root begin: ' + $r)
+  foreach($f in @(EnumerateCandidateFiles $r)){
+    try{
+      if($null -eq $f){continue}
+      $rootCandidateCount++
+      $ext=$f.Extension.ToLowerInvariant()
+      $k=PathKey $f.FullName
+      if(-not $seen.ContainsKey($k)){
+        $seen[$k]=1
+        if($ext -eq '.jar'){
+          if(IsCheatJarName $f.Name){ AddNameHit $f.Name $f.FullName; HCLog ('name hit: ' + $f.FullName) }
+          else{ AddJarItem $f.Name $f.FullName (HashFileHex $f.FullName) }
+        }elseif($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
+          $archives[$k]=$f
+        }
+      }
+    }catch{HCLog ('scan root item error: ' + $_.Exception.Message)}
+  }
+  HCLog ('scan root done: ' + $r + ' candidates=' + $rootCandidateCount + ' unique=' + $seen.Count + ' archives=' + $archives.Count + ' jars=' + $items.Count + ' nameHits=' + $nameHits.Count)
+}
+foreach($dr in $downloadRoots){
+  $downloadCandidateCount=0
+  HCLog ('download/archive scan begin: ' + $dr)
+  foreach($f in @(EnumerateCandidateFiles $dr)){
+    try{
+      if($null -eq $f){continue}
+      $downloadCandidateCount++
+      $ext=$f.Extension.ToLowerInvariant()
+      if($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
+        $downloadArchives[(PathKey $f.FullName)]=$f
+      }
+    }catch{HCLog ('download/archive item error: ' + $_.Exception.Message)}
+  }
+  HCLog ('download/archive scan done: ' + $dr + ' candidates=' + $downloadCandidateCount + ' archives=' + $downloadArchives.Count)
+}
+HCLog ('collection done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count + '; archives=' + $archives.Count + '; holy archives candidates=' + $downloadArchives.Count)
 )HCPS";
 
     script += LR"HCPS(
 $tempRoot=Join-Path $env:TEMP ('HolyCheck_checkmods_' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 $seven=Find7Zip
+$sevenText = if($seven){$seven}else{'not found'}
+HCLog ('tempRoot=' + $tempRoot + '; sevenZip=' + $sevenText)
+function QuoteProcArg([string]$s){
+  if($null -eq $s){return '""'}
+  return '"' + ($s -replace '"','\"') + '"'
+}
+function Invoke7ZipListSafe([string]$path){
+  if(-not $seven){return $null}
+  $p=$null
+  try{
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$seven
+    $psi.Arguments=('l -slt -p"" ' + (QuoteProcArg $path))
+    $psi.UseShellExecute=$false
+    $psi.RedirectStandardInput=$true
+    $psi.RedirectStandardOutput=$true
+    $psi.RedirectStandardError=$true
+    $psi.CreateNoWindow=$true
+    $p=New-Object System.Diagnostics.Process
+    $p.StartInfo=$psi
+    [void]$p.Start()
+    $stdout=$p.StandardOutput.ReadToEndAsync()
+    $stderr=$p.StandardError.ReadToEndAsync()
+    try{$p.StandardInput.Close()}catch{}
+    if(-not $p.WaitForExit(15000)){
+      try{$p.Kill()}catch{}
+      HCLog ('7z list timeout, archive skipped: ' + $path)
+      return $null
+    }
+    $out=($stdout.Result + "`n" + $stderr.Result)
+    HCLog ('7z list exit=' + $p.ExitCode + ' path=' + $path)
+    return @($out -split "`r?`n")
+  }catch{
+    HCLog ('7z list error: ' + $path + ' error=' + $_.Exception.Message)
+    return $null
+  }finally{
+    if($p){try{$p.Dispose()}catch{}}
+  }
+}
+function Invoke7ZipExtractJarsSafe([string]$archive,[string]$outDir){
+  if(-not $seven){return $false}
+  $p=$null
+  try{
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$seven
+    $psi.Arguments=('x -y -p"" ' + (QuoteProcArg ('-o' + $outDir)) + ' ' + (QuoteProcArg $archive) + ' "*.jar"')
+    $psi.UseShellExecute=$false
+    $psi.RedirectStandardInput=$true
+    $psi.RedirectStandardOutput=$true
+    $psi.RedirectStandardError=$true
+    $psi.CreateNoWindow=$true
+    $p=New-Object System.Diagnostics.Process
+    $p.StartInfo=$psi
+    [void]$p.Start()
+    $stdout=$p.StandardOutput.ReadToEndAsync()
+    $stderr=$p.StandardError.ReadToEndAsync()
+    try{$p.StandardInput.Close()}catch{}
+    if(-not $p.WaitForExit(30000)){
+      try{$p.Kill()}catch{}
+      HCLog ('7z extract timeout, archive skipped: ' + $archive)
+      return $false
+    }
+    $null=$stdout.Result
+    $err=$stderr.Result
+    HCLog ('7z extract exit=' + $p.ExitCode + ' archive=' + $archive)
+    if($p.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($err)){ HCLog ('7z extract stderr: ' + ($err.Substring(0,[Math]::Min(200,$err.Length)))) }
+    return ($p.ExitCode -eq 0)
+  }catch{
+    HCLog ('7z extract error: ' + $archive + ' error=' + $_.Exception.Message)
+    return $false
+  }finally{
+    if($p){try{$p.Dispose()}catch{}}
+  }
+}
+function ZipHasEncryptedEntries([string]$path){
+  $fs=$null; $br=$null
+  try{
+    $fs=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    if($fs.Length -lt 22){return $false}
+    $max=[int][Math]::Min([int64]66000,$fs.Length)
+    [void]$fs.Seek(-$max,[IO.SeekOrigin]::End)
+    $buf=New-Object byte[] $max
+    $read=$fs.Read($buf,0,$max)
+    $eocd=-1
+    for($i=$read-22; $i -ge 0; $i--){
+      if($buf[$i] -eq 0x50 -and $buf[$i+1] -eq 0x4b -and $buf[$i+2] -eq 0x05 -and $buf[$i+3] -eq 0x06){$eocd=$i; break}
+    }
+    if($eocd -lt 0){return $false}
+    $cdSize=[BitConverter]::ToUInt32($buf,$eocd+12)
+    $cdOffset=[BitConverter]::ToUInt32($buf,$eocd+16)
+    $entries=[BitConverter]::ToUInt16($buf,$eocd+10)
+    if($cdSize -eq 0 -or $cdOffset -ge $fs.Length){return $false}
+    [void]$fs.Seek([int64]$cdOffset,[IO.SeekOrigin]::Begin)
+    $br=New-Object IO.BinaryReader($fs)
+    $limit=[Math]::Min(([int64]$cdOffset + [int64]$cdSize), $fs.Length)
+    $count=0
+    while($fs.Position + 46 -le $limit -and ($entries -eq 0 -or $count -lt $entries) -and $count -lt 100000){
+      $entryStart=$fs.Position
+      $sig=$br.ReadUInt32()
+      if($sig -ne 0x02014b50){break}
+      [void]$fs.Seek($entryStart + 8,[IO.SeekOrigin]::Begin)
+      $flags=$br.ReadUInt16()
+      if(($flags -band 1) -ne 0){return $true}
+      [void]$fs.Seek($entryStart + 28,[IO.SeekOrigin]::Begin)
+      $nameLen=$br.ReadUInt16(); $extraLen=$br.ReadUInt16(); $commentLen=$br.ReadUInt16()
+      $next=$entryStart + 46 + $nameLen + $extraLen + $commentLen
+      if($next -le $entryStart -or $next -gt $fs.Length){break}
+      [void]$fs.Seek($next,[IO.SeekOrigin]::Begin)
+      $count++
+    }
+  }catch{
+    HCLog ('zip encryption check error: ' + $path + ' error=' + $_.Exception.Message)
+    return $false
+  }finally{
+    if($br){try{$br.Dispose()}catch{}}
+    elseif($fs){try{$fs.Dispose()}catch{}}
+  }
+  return $false
+}
+function SevenZipListIndicatesEncrypted($lines){
+  foreach($line in @($lines)){
+    if($line -match '^(Encrypted|Headers Encrypted)\s*=\s*\+'){return $true}
+    if($line -match 'Wrong password|Can not open encrypted archive|password is incorrect|Headers Error'){return $true}
+  }
+  return $false
+}
+$script:sha256=[Security.Cryptography.SHA256]::Create()
+$script:HolyCheckSelfSha256=$null
+function HashStreamSha256Hex([IO.Stream]$stream){
+  $h=$script:sha256.ComputeHash($stream)
+  return ([BitConverter]::ToString($h)).Replace('-','').ToLowerInvariant()
+}
+function HashFileSha256Hex([string]$path){
+  $fs=$null
+  try{
+    $fs=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    return HashStreamSha256Hex $fs
+  }catch{
+    HCLog ('sha256 file error: ' + $path + ' error=' + $_.Exception.Message)
+    return $null
+  }finally{ if($fs){$fs.Dispose()} }
+}
+function InitHolyCheckSelfHash(){
+  if(-not [string]::IsNullOrWhiteSpace($script:HolyCheckSelfSha256)){return $true}
+  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfExe)){ HCLog 'self exe path empty; archive self cleanup disabled'; return $false }
+  if(-not (Test-Path -LiteralPath $script:HolyCheckSelfExe)){ HCLog ('self exe missing; archive self cleanup disabled: ' + $script:HolyCheckSelfExe); return $false }
+  $script:HolyCheckSelfSha256=HashFileSha256Hex $script:HolyCheckSelfExe
+  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfSha256)){ HCLog ('self sha256 unavailable; archive self cleanup disabled: ' + $script:HolyCheckSelfExe); return $false }
+  HCLog ('self sha256=' + $script:HolyCheckSelfSha256 + ' exe=' + $script:HolyCheckSelfExe)
+  return $true
+}
+function IsArchiveEntryExecutable([string]$entryPath){
+  if([string]::IsNullOrWhiteSpace($entryPath)){return $false}
+  try{ return (([IO.Path]::GetExtension($entryPath)) -ieq '.exe') }catch{return $false}
+}
+function ArchiveIsEncryptedOrUnreadable([string]$path,[string]$ext){
+  if($ext -eq '.zip'){
+    if(ZipHasEncryptedEntries $path){ HCLog ('encrypted zip archive skipped: ' + $path); return $true }
+    return $false
+  }
+  if(($ext -eq '.rar' -or $ext -eq '.7z') -and $seven){
+    $lines=Invoke7ZipListSafe $path
+    if($null -eq $lines){ HCLog ('7z archive list unavailable, archive skipped: ' + $path); return $true }
+    if(SevenZipListIndicatesEncrypted $lines){ HCLog ('encrypted archive skipped: ' + $path); return $true }
+  }
+  return $false
+}
+function ZipContainsCurrentHolyCheckExe([string]$path){
+  HCLog ('zip self-exe scan disabled, using name-only HolyCheck release cleanup: ' + $path)
+  return $false
+}
+function Invoke7ZipExtractExesSafe([string]$archive,[string]$outDir){
+  if(-not $seven){return $false}
+  $p=$null
+  try{
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$seven
+    $psi.Arguments=('x -y -p"" ' + (QuoteProcArg ('-o' + $outDir)) + ' ' + (QuoteProcArg $archive) + ' "*.exe" -r')
+    $psi.UseShellExecute=$false
+    $psi.RedirectStandardInput=$true
+    $psi.RedirectStandardOutput=$true
+    $psi.RedirectStandardError=$true
+    $psi.CreateNoWindow=$true
+    $p=New-Object System.Diagnostics.Process
+    $p.StartInfo=$psi
+    [void]$p.Start()
+    $stdout=$p.StandardOutput.ReadToEndAsync()
+    $stderr=$p.StandardError.ReadToEndAsync()
+    try{$p.StandardInput.Close()}catch{}
+    if(-not $p.WaitForExit(30000)){
+      try{$p.Kill()}catch{}
+      HCLog ('7z exe extract timeout, archive skipped: ' + $archive)
+      return $false
+    }
+    $null=$stdout.Result
+    $err=$stderr.Result
+    HCLog ('7z exe extract exit=' + $p.ExitCode + ' archive=' + $archive)
+    if($p.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($err)){ HCLog ('7z exe extract stderr: ' + ($err.Substring(0,[Math]::Min(200,$err.Length)))) }
+    return ($p.ExitCode -eq 0)
+  }catch{
+    HCLog ('7z exe extract error: ' + $archive + ' error=' + $_.Exception.Message)
+    return $false
+  }finally{
+    if($p){try{$p.Dispose()}catch{}}
+  }
+}
+function SevenZipContainsCurrentHolyCheckExe([string]$path){
+  HCLog ('7z/rar self-exe scan disabled, using name-only HolyCheck release cleanup: ' + $path)
+  return $false
+}
+function TryDeleteHolyArchive([string]$path){
+  HCLog ('self archive delete attempt: ' + $path)
+  try{
+    [IO.File]::Delete($path)
+    if(Test-Path -LiteralPath $path){ HCLog ('self archive delete failed still exists: ' + $path); AddCleanupHit 'holycheck archive delete failed' $path }
+    else{ HCLog ('self archive deleted: ' + $path); AddCleanupHit 'holycheck archive deleted' $path }
+  }catch{
+    $msg=$_.Exception.Message
+    if($msg.Length -gt 90){$msg=$msg.Substring(0,90)}
+    HCLog ('self archive delete exception: ' + $path + ' error=' + $msg)
+    AddCleanupHit ('holycheck archive delete failed: ' + $msg) $path
+  }
+}
+function IsHolyCheckReleaseArchiveName([string]$name){
+  if([string]::IsNullOrWhiteSpace($name)){return $false}
+  $leaf=[IO.Path]::GetFileName($name)
+  return ($leaf -match '^HolyCheck-v\d+(?:\.\d+)*\.zip$')
+}
+function CheckHolyArchiveAndDelete([System.IO.FileInfo]$a){
+  try{
+    if($null -eq $a){return}
+    if(-not (Test-Path -LiteralPath $a.FullName)){ HCLog ('holycheck release archive already missing skip: ' + $a.FullName); return }
+    if(IsHolyCheckReleaseArchiveName $a.Name){
+      HCLog ('holycheck release archive matched by name: ' + $a.FullName)
+      TryDeleteHolyArchive $a.FullName
+    }else{
+      HCLog ('holycheck release archive name skip: ' + $a.FullName)
+    }
+  }catch{HCLog ('holycheck release archive cleanup error: ' + $a.FullName + ' error=' + $_.Exception.Message)}
+}
 try{
+  $holyArchiveCandidates=@{}
+  foreach($a in @($downloadArchives.Values)){ if($a -and (IsHolyCheckReleaseArchiveName $a.Name)){ $holyArchiveCandidates[(PathKey $a.FullName)]=$a } }
+  HCLog ('holycheck release archive cleanup begin candidates=' + $holyArchiveCandidates.Values.Count + ' downloadDesktop=' + $downloadArchives.Values.Count + ' scanArchives=' + $archives.Values.Count + ' mode=name-only')
+  foreach($a in @($holyArchiveCandidates.Values)){ CheckHolyArchiveAndDelete $a }
+  HCLog ('embedded jar archive scan begin count=' + $archives.Values.Count)
   foreach($a in @($archives.Values)){
+    if($null -eq $a){continue}
+    if(-not (Test-Path -LiteralPath $a.FullName)){ HCLog ('embedded jar archive missing after self cleanup skip: ' + $a.FullName); continue }
     $ext=[IO.Path]::GetExtension($a.FullName).ToLowerInvariant()
+    HCLog ('embedded jar archive scan: ' + $a.FullName)
+    if(ArchiveIsEncryptedOrUnreadable $a.FullName $ext){ HCLog ('embedded jar archive encrypted/unreadable skip: ' + $a.FullName); continue }
     if($ext -eq '.zip'){
       $zip=$null
       try{
@@ -4798,7 +5442,7 @@ try{
       try{
         $out=Join-Path $tempRoot ([Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $out | Out-Null
-        & $seven x '-y' ('-o'+$out) $a.FullName '*.jar' | Out-Null
+        if(-not (Invoke7ZipExtractJarsSafe $a.FullName $out)){ Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue; continue }
         Get-ChildItem -LiteralPath $out -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
           if($_.FullName -notmatch '\\(libraries|assets|runtime|versions)\\'){
             try{
@@ -4816,19 +5460,25 @@ try{
 }finally{
   Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
   try{$sha.Dispose()}catch{}
+  try{$sha256.Dispose()}catch{}
+  HCLog ('archive phase done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count + '; cleanupHits=' + $cleanupHits.Count)
 }
-if($items.Count -eq 0 -and $nameHits.Count -eq 0){'mods not found'; exit}
+if($items.Count -eq 0 -and $nameHits.Count -eq 0 -and $cleanupHits.Count -eq 0){HCLog 'no items/hits after archive phase, exit'; 'mods not found'; exit}
 $known=@{}
+HCLog ('modrinth lookup begin count=' + $items.Count)
 for($i=0;$i -lt $items.Count;$i+=100){
   $to=[Math]::Min($i+99,$items.Count-1)
   if($to -lt $i){break}
   $batch=@($items[$i..$to])
   $body=@{hashes=@($batch|ForEach-Object{$_.Hash});algorithm='sha512'}|ConvertTo-Json -Compress
   try{
+    HCLog ('modrinth batch begin from=' + $i + ' to=' + $to)
     $res=Invoke-RestMethod -Uri 'https://api.modrinth.com/v2/version_files' -Method Post -ContentType 'application/json' -Body $body -Headers @{'User-Agent'='HolyCheck/1.0'} -TimeoutSec 15
     if($res){$res.PSObject.Properties.Name|ForEach-Object{$known[$_]=1}}
-  }catch{}
+    HCLog ('modrinth batch done from=' + $i + ' known=' + $known.Count)
+  }catch{HCLog ('modrinth batch failed from=' + $i + ' error=' + $_.Exception.Message)}
 }
+HCLog ('modrinth lookup done known=' + $known.Count)
 function FormatFoundModLine([string]$name,[string]$path,[bool]$forbiddenName){
   $prefix=''
   if($forbiddenName){ $prefix=([string][char]0xE002) }
@@ -4836,10 +5486,11 @@ function FormatFoundModLine([string]$name,[string]$path,[bool]$forbiddenName){
   return ($prefix + ('{0} | {1}' -f $name,$path))
 }
 $bad=0
+foreach($it in $cleanupHits){ $bad++; FormatFoundModLine $it.Name $it.Path $true }
 foreach($it in $nameHits){ $bad++; FormatFoundModLine $it.Name $it.Path $true }
 foreach($it in $items){
   if(-not $known.ContainsKey($it.Hash)){
-    $k=$it.Path.ToLowerInvariant()
+    $k=PathKey $it.Path
     if(-not $reported.ContainsKey($k)){
       $bad++
       $reported[$k]=1
@@ -4847,15 +5498,22 @@ foreach($it in $items){
     }
   }
 }
+HCLog ('finish bad=' + $bad + '; known=' + $known.Count + '; cleanupHits=' + $cleanupHits.Count + '; nameHits=' + $nameHits.Count + '; items=' + $items.Count)
 if($bad -eq 0){'не найдено'}
 )HCPS";
 
     std::wstring output;
-    if (!RunHiddenPowerShellScriptCapture(script, output, 300000))
+    DWORD timeoutMs = (scanMode == 1) ? 900000 : 300000;
+    DebugLogLine(L"checkmods", L"powershell capture start timeout=" + std::to_wstring(timeoutMs));
+    if (!RunHiddenPowerShellScriptCapture(script, output, timeoutMs))
     {
-        lines.push_back(L"не удалось запустить checkmods");
+        DebugLogLine(L"checkmods", L"powershell capture launch failed mode=" + std::to_wstring(scanMode));
+        lines.push_back((scanMode == 1) ? L"не удалось запустить checkmods fullscan" : L"не удалось запустить checkmods");
+        lines.push_back(L"подробный лог: " + GetHolyCheckDebugLogPath());
         return lines;
     }
+    DebugLogLine(L"checkmods", L"powershell capture done timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
+        L" exit=" + std::to_wstring(g_lastHiddenProcessExitCode) + L" outputChars=" + std::to_wstring(output.size()));
 
     std::vector<std::wstring> raw = SplitAutomationTextLines(output);
     for (const std::wstring& line : raw)
@@ -4867,6 +5525,7 @@ if($bad -eq 0){'не найдено'}
     if (lines.size() == 1)
         lines.push_back(L"не найдено");
 
+    DebugLogLine(L"checkmods", L"result lines=" + std::to_wstring(lines.size()));
     return lines;
 }
 
@@ -4943,9 +5602,7 @@ if($count -eq 0){'не найдено'}
 
 static std::vector<std::wstring> ScanPage4ByMode(int mode)
 {
-    if (mode == 1)
-        return ScanUnsignedDlls();
-    return ScanModrinthHashes();
+    return ScanModrinthHashes(mode == 1 ? 1 : 0);
 }
 
 static std::vector<std::wstring> ScanInjGenStyle()
@@ -5255,9 +5912,15 @@ static void StoreAutomationCachedLines(int cacheKey, const std::vector<std::wstr
     }
 }
 
-static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool unsignedOnly)
+static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool unsignedOnly, int activityMode, int page4Mode)
 {
+    DebugLogLine(L"automation", L"execute start target=" + std::to_wstring(target) +
+        L" unsignedOnly=" + std::to_wstring(unsignedOnly ? 1 : 0) +
+        L" activityMode=" + std::to_wstring(activityMode) +
+        L" page4Mode=" + std::to_wstring(page4Mode));
+
     std::vector<std::wstring> lines;
+    UNREFERENCED_PARAMETER(activityMode);
 
     if (target == AUTOMATION_OUTPUT_BAM)
         lines = ScanBamRegistry(unsignedOnly);
@@ -5273,7 +5936,7 @@ static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool un
     else if (target == AUTOMATION_OUTPUT_MC_LOGS)
         lines = ScanExeDeletedFromUsnDeleteClose();
     else if (target == AUTOMATION_OUTPUT_PAGE4)
-        lines = ScanModrinthHashes();
+        lines = ScanPage4ByMode(page4Mode);
     else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         lines = ScanUnsignedDlls();
     else if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY)
@@ -5285,6 +5948,9 @@ static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool un
         SortAutomationOutputLinesByPipeColumnDateDesc(lines, 0, 1);
     else
         SortAutomationOutputLinesByDateDesc(lines, target == AUTOMATION_OUTPUT_EVENTVWR ? 0 : 1);
+
+    DebugLogLine(L"automation", L"execute finish target=" + std::to_wstring(target) +
+        L" lines=" + std::to_wstring(lines.size()));
     return lines;
 }
 
@@ -5307,11 +5973,19 @@ static void PostAutomationBatchDone(std::vector<AutomationBatchItem>&& items)
 static void StartAutomationScan(int target)
 {
     bool unsignedOnly = g_bamUnsignedOnly.load();
-    int cacheKey = CurrentAutomationScanCacheKey(target, unsignedOnly);
+    int activityMode = g_activityScanMode.load();
+    int page4Mode = g_page4ScanMode.load();
+    int cacheKey = BuildAutomationScanCacheKey(target, unsignedOnly, activityMode, page4Mode);
+    DebugLogLine(L"automation", L"start request target=" + std::to_wstring(target) +
+        L" cacheKey=" + std::to_wstring(cacheKey) +
+        L" unsignedOnly=" + std::to_wstring(unsignedOnly ? 1 : 0) +
+        L" activityMode=" + std::to_wstring(activityMode) +
+        L" page4Mode=" + std::to_wstring(page4Mode));
 
     std::vector<std::wstring> cached;
     if (TryGetAutomationCachedLines(cacheKey, cached))
     {
+        DebugLogLine(L"automation", L"cache hit target=" + std::to_wstring(target) + L" cacheKey=" + std::to_wstring(cacheKey) + L" lines=" + std::to_wstring(cached.size()));
         SetAutomationLines(target, std::move(cached));
         if (AutomationEditForTarget(target))
             UpdateAutomationEditWindow(target);
@@ -5324,6 +5998,7 @@ static void StartAutomationScan(int target)
 
     if (!working.compare_exchange_strong(expected, true))
     {
+        DebugLogLine(L"automation", L"start skipped already working target=" + std::to_wstring(target));
         SetAutomationStatusLine(target, L"сканирование...");
         InvalidateAutomationPanel(target);
         return;
@@ -5334,10 +6009,11 @@ static void StartAutomationScan(int target)
         UpdateAutomationEditWindow(target);
     InvalidateAutomationPanel(target);
 
-    std::thread([target, unsignedOnly, cacheKey]()
+    std::thread([target, unsignedOnly, activityMode, page4Mode, cacheKey]()
     {
-        std::vector<std::wstring> lines = ExecuteAutomationScanTarget(target, unsignedOnly);
+        std::vector<std::wstring> lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
         StoreAutomationCachedLines(cacheKey, lines);
+        DebugLogLine(L"automation", L"post done target=" + std::to_wstring(target) + L" lines=" + std::to_wstring(lines.size()));
         PostAutomationDone(target, std::move(lines));
     }).detach();
 }
@@ -5345,12 +6021,18 @@ static void StartAutomationScan(int target)
 static void StartAutomationBatchScan(const std::vector<int>& targets)
 {
     bool unsignedOnly = g_bamUnsignedOnly.load();
+    int activityMode = g_activityScanMode.load();
+    int page4Mode = g_page4ScanMode.load();
+    DebugLogLine(L"automation", L"batch start targets=" + std::to_wstring(targets.size()) +
+        L" unsignedOnly=" + std::to_wstring(unsignedOnly ? 1 : 0) +
+        L" activityMode=" + std::to_wstring(activityMode) +
+        L" page4Mode=" + std::to_wstring(page4Mode));
     std::vector<std::pair<int, int>> started;
     started.reserve(targets.size());
 
     for (int target : targets)
     {
-        int cacheKey = CurrentAutomationScanCacheKey(target, unsignedOnly);
+        int cacheKey = BuildAutomationScanCacheKey(target, unsignedOnly, activityMode, page4Mode);
         std::vector<std::wstring> cached;
         if (TryGetAutomationCachedLines(cacheKey, cached))
         {
@@ -5381,7 +6063,7 @@ static void StartAutomationBatchScan(const std::vector<int>& targets)
     if (started.empty())
         return;
 
-    std::thread([started, unsignedOnly]()
+    std::thread([started, unsignedOnly, activityMode, page4Mode]()
     {
         std::vector<AutomationBatchItem> items;
         std::mutex itemsMutex;
@@ -5392,11 +6074,11 @@ static void StartAutomationBatchScan(const std::vector<int>& targets)
         {
             int target = startedItem.first;
             int cacheKey = startedItem.second;
-            workers.emplace_back([target, unsignedOnly, cacheKey, &items, &itemsMutex]()
+            workers.emplace_back([target, unsignedOnly, activityMode, page4Mode, cacheKey, &items, &itemsMutex]()
             {
                 AutomationBatchItem item;
                 item.target = target;
-                item.lines = ExecuteAutomationScanTarget(target, unsignedOnly);
+                item.lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
                 StoreAutomationCachedLines(cacheKey, item.lines);
                 std::lock_guard<std::mutex> lock(itemsMutex);
                 items.push_back(std::move(item));
@@ -5418,12 +6100,15 @@ static bool IsAllowedDownloadLogLine(const std::wstring& line)
 {
     return line.rfind(L"скачивается:", 0) == 0 ||
         line.rfind(L"не скачалось:", 0) == 0 ||
+        line.rfind(L"лог:", 0) == 0 ||
         line == L"текст скопирован" ||
         line == L"текст не скопирован";
 }
 
 static void PostLog(const std::wstring& line)
 {
+    DebugLogLine(L"ui-log", line);
+
     if (!IsAllowedDownloadLogLine(line))
         return;
 
@@ -6099,13 +6784,44 @@ static bool ParseUnsignedLongLong(const std::wstring& value, unsigned long long&
     return hasDigit;
 }
 
+static std::wstring DownloadErrorToString(DownloadError error)
+{
+    switch (error)
+    {
+    case DownloadError::None: return L"None";
+    case DownloadError::Cancelled: return L"Cancelled";
+    case DownloadError::InvalidUrl: return L"InvalidUrl";
+    case DownloadError::OpenSessionFailed: return L"OpenSessionFailed";
+    case DownloadError::ConnectFailed: return L"ConnectFailed";
+    case DownloadError::OpenRequestFailed: return L"OpenRequestFailed";
+    case DownloadError::SendFailed: return L"SendFailed";
+    case DownloadError::ReceiveFailed: return L"ReceiveFailed";
+    case DownloadError::HttpStatus: return L"HttpStatus";
+    case DownloadError::HtmlInsteadOfFile: return L"HtmlInsteadOfFile";
+    case DownloadError::HtmlLinkNotFound: return L"HtmlLinkNotFound";
+    case DownloadError::ReadFailed: return L"ReadFailed";
+    case DownloadError::FileOpenFailed: return L"FileOpenFailed";
+    case DownloadError::FileWriteFailed: return L"FileWriteFailed";
+    case DownloadError::MoveFailed: return L"MoveFailed";
+    case DownloadError::SizeMismatch: return L"SizeMismatch";
+    case DownloadError::TooManyRedirects: return L"TooManyRedirects";
+    case DownloadError::Stalled: return L"Stalled";
+    }
+    return L"Unknown";
+}
+
 static void LogDownloadAttemptFailure(const std::wstring& displayName, int attempt, int totalAttempts, const DownloadResult& result)
 {
-    (void)displayName;
-    (void)attempt;
-    (void)totalAttempts;
-    (void)result;
-
+    DebugLogLine(L"download", L"WinHTTP attempt failed item=" + displayName +
+        L" attempt=" + std::to_wstring(attempt) + L"/" + std::to_wstring(totalAttempts) +
+        L" error=" + DownloadErrorToString(result.error) +
+        L" http=" + std::to_wstring(result.httpStatus) +
+        L" win32=" + FormatWin32ErrorForLog(result.win32Error) +
+        L" retryable=" + std::to_wstring(result.retryable ? 1 : 0) +
+        L" contentLength=" + std::to_wstring(result.contentLength) +
+        L" bytesWritten=" + std::to_wstring(result.bytesWritten) +
+        L" resumeFrom=" + std::to_wstring(result.resumeFrom) +
+        L" finalUrl=" + result.finalUrl);
 }
 
 static DWORD GetRetryDelayMs(int attempt)

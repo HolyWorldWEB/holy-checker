@@ -113,6 +113,7 @@ static bool WaitForDirectoryToStabilize(const std::wstring& dir, DWORD timeoutMs
 
 static DWORD RunHiddenProcessAndWait(std::wstring commandLine, DWORD timeoutMs)
 {
+    DebugLogLine(L"process", L"RunHiddenProcessAndWait start timeout=" + std::to_wstring(timeoutMs) + L" command=" + commandLine);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
@@ -135,6 +136,7 @@ static DWORD RunHiddenProcessAndWait(std::wstring commandLine, DWORD timeoutMs)
         &si,
         &pi))
     {
+        DebugLogLine(L"process", L"RunHiddenProcessAndWait CreateProcess failed error=" + FormatWin32ErrorForLog(GetLastError()) + L" command=" + commandLine);
         return static_cast<DWORD>(-1);
     }
 
@@ -151,6 +153,7 @@ static DWORD RunHiddenProcessAndWait(std::wstring commandLine, DWORD timeoutMs)
         GetExitCodeProcess(pi.hProcess, &exitCode);
     }
 
+    DebugLogLine(L"process", L"RunHiddenProcessAndWait finish wait=" + std::to_wstring(wait) + L" exit=" + std::to_wstring(exitCode));
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return exitCode;
@@ -300,20 +303,38 @@ static bool ExtractZipWithShellFallback(const std::wstring& zipPath, const std::
 static bool ExtractZip(const std::wstring& zipPath, const std::wstring& destDir)
 {
     std::lock_guard<std::mutex> lock(g_zipMutex);
+    DebugLogLine(L"extract", L"ExtractZip start zip=" + zipPath + L" dest=" + destDir);
 
     if (!FileExists(zipPath))
+    {
+        DebugLogLine(L"extract", L"ExtractZip missing zip=" + zipPath);
         return false;
+    }
 
     if (!EnsureDirectory(destDir))
+    {
+        DebugLogLine(L"extract", L"ExtractZip cannot create dest=" + destDir);
         return false;
+    }
 
     if (ExtractZipWithTar(zipPath, destDir))
+    {
+        DebugLogLine(L"extract", L"ExtractZip ok via tar zip=" + zipPath);
         return true;
+    }
+
+    DebugLogLine(L"extract", L"ExtractZip tar failed zip=" + zipPath);
 
     if (ExtractZipWithPowerShell(zipPath, destDir))
+    {
+        DebugLogLine(L"extract", L"ExtractZip ok via PowerShell zip=" + zipPath);
         return true;
+    }
 
-    return ExtractZipWithShellFallback(zipPath, destDir);
+    DebugLogLine(L"extract", L"ExtractZip PowerShell failed zip=" + zipPath);
+    bool shellOk = ExtractZipWithShellFallback(zipPath, destDir);
+    DebugLogLine(L"extract", L"ExtractZip shell result=" + std::to_wstring(shellOk ? 1 : 0) + L" zip=" + zipPath);
+    return shellOk;
 }
 
 static std::wstring EscapePowerShellSingleQuoted(std::wstring s)

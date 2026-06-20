@@ -102,6 +102,7 @@ using namespace Gdiplus;
 #define IDC_PAGE4_NAV 2123
 #define IDC_MOD_HASH 2124
 #define IDC_DLL_UNSIGNED 2125
+#define IDC_MOD_FULLSCAN 2135
 #define IDC_DLL_ACTIVITY 2127
 #define IDC_PAGE5_NAV 2126
 #define IDC_INJGEN_CHECK 2128
@@ -261,6 +262,7 @@ HWND g_hPfDeleted = nullptr;
 HWND g_hMcLogs = nullptr;
 HWND g_hPage4Nav = nullptr;
 HWND g_hModHash = nullptr;
+HWND g_hModFullScan = nullptr;
 HWND g_hDllUnsigned = nullptr;
 HWND g_hDllActivity = nullptr;
 HWND g_hPage5Nav = nullptr;
@@ -322,6 +324,9 @@ static thread_local bool g_lastTransferStalled = false;
 static thread_local bool g_lastDownloadedPayloadInvalid = false;
 static thread_local std::wstring g_lastDownloadMethod;
 static thread_local unsigned long long g_lastDownloadSpeedBps = 0;
+static thread_local bool g_lastHiddenProcessTimedOut = false;
+static thread_local DWORD g_lastHiddenProcessExitCode = 0;
+static thread_local DWORD g_lastHiddenProcessCreateError = 0;
 
 static void ClearTransferStalledFlag()
 {
@@ -361,6 +366,7 @@ std::mutex g_activeDownloadsMutex;
 std::mutex g_itemBusyMutex;
 std::mutex g_httpHandlesMutex;
 std::mutex g_ericDownloadMutex;
+std::mutex g_debugLogMutex;
 
 struct HttpHandleSlot
 {
@@ -391,6 +397,7 @@ struct AutomationCacheEntry
 
 std::map<int, AutomationCacheEntry> g_automationCache;
 std::vector<ActiveDownloadInfo> g_activeDownloads;
+std::wstring g_debugLogPath;
 int g_logScrollOffset = 0;
 int g_bamScrollOffset = 0;
 int g_eventVwrScrollOffset = 0;
@@ -550,6 +557,11 @@ static RECT MakeAutomationButtonRect(int top)
 static RECT GetAutomationBamButtonRect(const RECT&)
 {
     return MakeAutomationButtonRect(84);
+}
+
+static RECT GetModFullScanButtonRect(const RECT&)
+{
+    return MakeAutomationButtonRect(124);
 }
 
 static RECT GetAutomationEventButtonRect(const RECT&)

@@ -1410,6 +1410,7 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_hMcLogs, SW_HIDE);
             ShowWindow(g_hPage4Nav, SW_HIDE);
             ShowWindow(g_hModHash, SW_HIDE);
+            ShowWindow(g_hModFullScan, SW_HIDE);
             ShowWindow(g_hDllUnsigned, SW_HIDE);
             ShowWindow(g_hDllActivity, SW_HIDE);
             ShowWindow(g_hPage5Nav, SW_HIDE);
@@ -1426,6 +1427,7 @@ static void LayoutControls(HWND hwnd)
         if (g_currentPage == 1)
         {
             RECT scanButton = GetAutomationBamButtonRect(rc);
+            RECT fullScanButton = GetModFullScanButtonRect(rc);
             RECT eventButton = GetAutomationEventButtonRect(rc);
             RECT jarPageButton = GetAutomationJarPageButtonRect(rc);
 
@@ -1438,6 +1440,7 @@ static void LayoutControls(HWND hwnd)
             page5Button.left = page5Button.right - navButtonW;
 
             MoveChildWindow(g_hModHash, scanButton.left, scanButton.top, scanButton.right - scanButton.left, scanButton.bottom - scanButton.top, TRUE);
+            MoveChildWindow(g_hModFullScan, fullScanButton.left, fullScanButton.top, fullScanButton.right - fullScanButton.left, fullScanButton.bottom - fullScanButton.top, TRUE);
             MoveChildWindow(g_hAutomationJarPage, jarPageButton.left, jarPageButton.top, jarPageButton.right - jarPageButton.left, jarPageButton.bottom - jarPageButton.top, TRUE);
             MoveChildWindow(g_hPage4Nav, page4Button.left, page4Button.top, page4Button.right - page4Button.left, page4Button.bottom - page4Button.top, TRUE);
             MoveChildWindow(g_hPage5Nav, page5Button.left, page5Button.top, page5Button.right - page5Button.left, page5Button.bottom - page5Button.top, TRUE);
@@ -1447,12 +1450,14 @@ static void LayoutControls(HWND hwnd)
             ShowScrollBar(g_hEventEdit, SB_BOTH, FALSE);
             SetWindowTextW(g_hAutomationNav, L"check");
             SetWindowTextW(g_hModHash, L"scan");
+            SetWindowTextW(g_hModFullScan, L"fullscan");
             SetWindowTextW(g_hAutomationJarPage, L"dll | jar");
             SetWindowTextW(g_hPage4Nav, L"");
             SetWindowTextW(g_hPage5Nav, L"injection");
 
             ShowWindow(g_hAutomationBam, SW_HIDE);
             ShowWindow(g_hModHash, SW_SHOWNA);
+            ShowWindow(g_hModFullScan, SW_SHOWNA);
             ShowWindow(g_hAutomationBamUnsignedOnly, SW_HIDE);
             ShowWindow(g_hAutomationEventVwr, SW_HIDE);
             ShowWindow(g_hAutomationJarPage, SW_SHOWNA);
@@ -1481,6 +1486,7 @@ static void LayoutControls(HWND hwnd)
         else if (g_currentPage == 3)
         {
             ShowWindow(g_hModHash, SW_HIDE);
+            ShowWindow(g_hModFullScan, SW_HIDE);
             ShowWindow(g_hDllUnsigned, SW_HIDE);
         }
         else if (g_currentPage == 4)
@@ -1522,6 +1528,7 @@ static void LayoutControls(HWND hwnd)
         InvalidateRect(g_hMcLogs, nullptr, TRUE);
         InvalidateRect(g_hPage4Nav, nullptr, TRUE);
         InvalidateRect(g_hModHash, nullptr, TRUE);
+        InvalidateRect(g_hModFullScan, nullptr, TRUE);
         InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
         InvalidateRect(g_hDllActivity, nullptr, TRUE);
         InvalidateRect(g_hPage5Nav, nullptr, TRUE);
@@ -1542,6 +1549,7 @@ static void LayoutControls(HWND hwnd)
     ShowWindow(g_hMcLogs, SW_HIDE);
     ShowWindow(g_hPage4Nav, SW_HIDE);
     ShowWindow(g_hModHash, SW_HIDE);
+    ShowWindow(g_hModFullScan, SW_HIDE);
     ShowWindow(g_hDllUnsigned, SW_HIDE);
     ShowWindow(g_hDllActivity, SW_HIDE);
     ShowWindow(g_hPage5Nav, SW_HIDE);
@@ -1677,6 +1685,7 @@ static void LayoutControls(HWND hwnd)
     InvalidateRect(g_hMcLogs, nullptr, TRUE);
     InvalidateRect(g_hPage4Nav, nullptr, TRUE);
     InvalidateRect(g_hModHash, nullptr, TRUE);
+        InvalidateRect(g_hModFullScan, nullptr, TRUE);
     InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
         InvalidateRect(g_hDllActivity, nullptr, TRUE);
     InvalidateRect(g_hPage5Nav, nullptr, TRUE);
@@ -1812,7 +1821,7 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         id == IDC_AUTOMATION_NAV || id == IDC_AUTOMATION_BAM || id == IDC_AUTOMATION_EVENTVWR ||
 id == IDC_AUTOMATION_JAR_PAGE || id == IDC_JAR_ACTIV ||
         id == IDC_EXE_DELETED || id == IDC_PF_DELETED || id == IDC_PAGE4_NAV ||
-        id == IDC_MOD_HASH || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY || id == IDC_PAGE5_NAV || id == IDC_INJGEN_CHECK))
+        id == IDC_MOD_HASH || id == IDC_MOD_FULLSCAN || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY || id == IDC_PAGE5_NAV || id == IDC_INJGEN_CHECK))
     {
         if (selected)
         {

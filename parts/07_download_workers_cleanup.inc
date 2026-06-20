@@ -131,13 +131,21 @@ static bool IsSpeedSensitiveSequentialItem(const DownloadItem& item)
 
 static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder, bool extractZip = true)
 {
+    DebugLogLine(L"download", L"process item start name=" + item.name + L" file=" + item.file +
+        L" tab=" + std::to_wstring(item.tab) + L" base=" + baseFolder +
+        L" extractZip=" + std::to_wstring(extractZip ? 1 : 0) + L" url=" + item.url);
+
     if (IsCancelRequested())
+    {
+        DebugLogLine(L"download", L"process item cancelled before start name=" + item.name);
         return false;
+    }
 
     std::wstring tabFolder = CombinePath(baseFolder, GetTabFolderName(item.tab));
 
     if (!EnsureDirectory(tabFolder))
     {
+        DebugLogLine(L"download", L"process item failed ensure tab folder name=" + item.name + L" folder=" + tabFolder);
         return false;
     }
 
@@ -149,8 +157,12 @@ static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder
     bool hadFileBefore = FileExists(target);
     bool downloadedThisRun = false;
 
+    DebugLogLine(L"download", L"process item target=" + target + L" hadFileBefore=" + std::to_wstring(hadFileBefore ? 1 : 0));
     if (hadFileBefore && !ValidateDownloadedFileOrDelete(item, target))
+    {
+        DebugLogLine(L"download", L"existing file validation failed name=" + item.name + L" target=" + target);
         hadFileBefore = false;
+    }
 
     if (!hadFileBefore)
     {
@@ -162,14 +174,19 @@ static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder
 
         if (!downloaded)
         {
+            DebugLogLine(L"download", L"download failed name=" + item.name + L" target=" + target);
             return false;
         }
 
+        DebugLogLine(L"download", L"download ok name=" + item.name + L" target=" + target + L" size=" + std::to_wstring(GetFileSizeBytesOrZero(target)));
         downloadedThisRun = true;
     }
 
     if (IsCancelRequested())
+    {
+        DebugLogLine(L"download", L"process item cancelled after download name=" + item.name);
         return false;
+    }
 
     if (zipItem)
     {
@@ -188,15 +205,19 @@ static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder
             DeleteDirectoryTree(extractDir);
             EnsureDirectory(extractDir);
 
+            DebugLogLine(L"download", L"extract start name=" + item.name + L" zip=" + target + L" dir=" + extractDir);
             if (!ExtractZip(target, extractDir))
             {
+                DebugLogLine(L"download", L"extract failed name=" + item.name + L" zip=" + target + L" dir=" + extractDir);
                 return false;
             }
 
             if (!WaitForExtractedExe(extractDir, exePath))
             {
+                DebugLogLine(L"download", L"extract exe wait failed name=" + item.name + L" dir=" + extractDir);
                 return false;
             }
+            DebugLogLine(L"download", L"extract ok name=" + item.name + L" exe=" + exePath);
 
             if (!ShouldSkipXmlCleanupForItem(item))
                 CleanupXmlFiles(extractDir);
@@ -208,7 +229,12 @@ static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder
     if (!ShouldSkipXmlCleanupForItem(item))
         CleanupXmlFiles(tabFolder);
 
-    return FileExists(target) && !IsCancelRequested();
+    {
+        bool ok = FileExists(target) && !IsCancelRequested();
+        DebugLogLine(L"download", L"process item finish name=" + item.name + L" ok=" + std::to_wstring(ok ? 1 : 0) +
+            L" target=" + target + L" size=" + std::to_wstring(GetFileSizeBytesOrZero(target)));
+        return ok;
+    }
 }
 
 
@@ -287,6 +313,8 @@ static unsigned long long GetEstimatedDownloadOrderBytes(const DownloadItem& ite
 
 static void DownloadWorker(std::vector<DownloadItem> items)
 {
+    DebugLogSeparator(L"download batch worker start");
+    DebugLogLine(L"download", L"worker start items=" + std::to_wstring(items.size()) + L" log=" + GetHolyCheckDebugLogPath());
     g_working = true;
 
     std::stable_sort(items.begin(), items.end(), [](const DownloadItem& a, const DownloadItem& b)
@@ -307,6 +335,7 @@ static void DownloadWorker(std::vector<DownloadItem> items)
 
     if (!EnsureDirectory(folder))
     {
+        DebugLogLine(L"download", L"worker failed ensure holycheck folder=" + folder);
         PostLog(L"Не создана папка holycheck");
         PostProgress(0);
 
@@ -390,6 +419,9 @@ static void DownloadWorker(std::vector<DownloadItem> items)
 
     runDownloadBatch(items);
 
+    DebugLogLine(L"download", L"worker downloads done downloaded=" + std::to_wstring(downloadedItems.size()) +
+        L" failed=" + std::to_wstring(failedItems.size()) + L" cancelled=" + std::to_wstring(IsCancelRequested() ? 1 : 0));
+
     CleanupXmlFiles(folder);
 
     ClearActiveDownloads();
@@ -442,6 +474,7 @@ static void SetDownloadControlsEnabled(bool enabled)
 
 static void StartDownload(const std::vector<DownloadItem>& items)
 {
+    DebugLogLine(L"download", L"start download request items=" + std::to_wstring(items.size()) + L" working=" + std::to_wstring(g_working.load() ? 1 : 0));
     if (items.empty())
         return;
 
@@ -460,6 +493,7 @@ static void StartDownload(const std::vector<DownloadItem>& items)
     SetDownloadControlsEnabled(false);
     g_progressPercent = 0;
     ClearDownloadLog();
+    PostLog(L"лог: " + GetHolyCheckDebugLogPath());
     ClearActiveDownloads();
     InvalidateBottomPanel();
 
@@ -482,6 +516,13 @@ static void DownloadCurrentTab()
 
 static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, const std::wstring& baseFolder)
 {
+    if (IsSystemInformerItem(item))
+    {
+        std::wstring installedPath = FindInstalledSystemInformerPath();
+        if (!installedPath.empty())
+            return installedPath;
+    }
+
     std::wstring target = GetItemTargetPath(item, baseFolder);
 
     if (EndsWithI(target, L".zip"))
@@ -495,6 +536,8 @@ static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, c
 
 static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
 {
+    DebugLogSeparator(L"single download worker start");
+    DebugLogLine(L"download", L"single worker start index=" + std::to_wstring(itemIndex) + L" item=" + item.name + L" log=" + GetHolyCheckDebugLogPath());
     std::wstring folder = GetHolyCheckFolder();
     bool foldersOk = EnsureDirectory(folder);
 
@@ -502,6 +545,8 @@ static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
     foldersOk = foldersOk && EnsureDirectory(tabFolder);
 
     bool processed = foldersOk && ProcessItem(item, folder, true);
+    DebugLogLine(L"download", L"single worker processed item=" + item.name + L" foldersOk=" + std::to_wstring(foldersOk ? 1 : 0) +
+        L" processed=" + std::to_wstring(processed ? 1 : 0));
 
     if (processed && !IsCancelRequested())
     {
@@ -553,6 +598,7 @@ static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
 
 static void OpenOrDownloadSingleById(int id)
 {
+    DebugLogLine(L"download", L"single request id=" + std::to_wstring(id));
     int index = id - IDC_TILE_BASE;
 
     if (index < 0 || index >= static_cast<int>(g_items.size()))
@@ -575,6 +621,7 @@ static void OpenOrDownloadSingleById(int id)
 
     if (!quickLaunchPath.empty() && FileExists(quickLaunchPath))
     {
+        DebugLogLine(L"download", L"single quick launch item=" + item.name + L" path=" + quickLaunchPath);
         if (item.tab == 0)
             CleanupOldJuniorTextFiles(tabFolder);
 
@@ -592,6 +639,7 @@ static void OpenOrDownloadSingleById(int id)
         g_singleDone = 0;
         g_progressPercent = 0;
         ClearDownloadLog();
+        PostLog(L"лог: " + GetHolyCheckDebugLogPath());
         ClearActiveDownloads();
     }
 
@@ -1146,6 +1194,120 @@ static void DeletePowerShellCheckOutputFiles()
 }
 
 
+static bool IsHolyCheckReleaseZipName(const std::wstring& fileName)
+{
+    std::wstring lower = ToLower(fileName);
+    const std::wstring prefix = L"holycheck-v";
+    const std::wstring suffix = L".zip";
+
+    if (lower.size() <= prefix.size() + suffix.size())
+        return false;
+
+    if (lower.compare(0, prefix.size(), prefix) != 0)
+        return false;
+
+    if (lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) != 0)
+        return false;
+
+    std::wstring version = lower.substr(prefix.size(), lower.size() - prefix.size() - suffix.size());
+    if (version.empty() || version.front() == L'.' || version.back() == L'.')
+        return false;
+
+    bool hasDigit = false;
+    bool previousDot = false;
+
+    for (wchar_t ch : version)
+    {
+        if (ch >= L'0' && ch <= L'9')
+        {
+            hasDigit = true;
+            previousDot = false;
+            continue;
+        }
+
+        if (ch == L'.')
+        {
+            if (previousDot)
+                return false;
+            previousDot = true;
+            continue;
+        }
+
+        return false;
+    }
+
+    return hasDigit;
+}
+
+static std::wstring GetKnownFolderPathSafe(REFKNOWNFOLDERID folderId)
+{
+    PWSTR raw = nullptr;
+    std::wstring result;
+
+    if (SUCCEEDED(SHGetKnownFolderPath(folderId, 0, nullptr, &raw)) && raw)
+    {
+        result = raw;
+        CoTaskMemFree(raw);
+    }
+
+    return result;
+}
+
+static bool IsCurrentUserDesktopOrDownloads(const std::wstring& folder)
+{
+    std::wstring full = ToLower(GetFullPathSafe(folder));
+    if (full.empty())
+        return false;
+
+    std::wstring downloads = ToLower(GetFullPathSafe(GetKnownFolderPathSafe(FOLDERID_Downloads)));
+    std::wstring desktop = ToLower(GetFullPathSafe(GetKnownFolderPathSafe(FOLDERID_Desktop)));
+
+    return (!downloads.empty() && full == downloads) || (!desktop.empty() && full == desktop);
+}
+
+static void DeleteHolyCheckReleaseZipsInFolder(const std::wstring& folder, int& deletedCount)
+{
+    if (!IsCurrentUserDesktopOrDownloads(folder) || !DirectoryExists(folder))
+        return;
+
+    std::wstring mask = CombinePath(folder, L"HolyCheck-v*.zip");
+    WIN32_FIND_DATAW data{};
+    HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
+
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+            continue;
+
+        if (!IsHolyCheckReleaseZipName(data.cFileName))
+            continue;
+
+        std::wstring path = CombinePath(folder, data.cFileName);
+        DebugLogLine(L"cleanup", L"delete HolyCheck release zip candidate: " + path);
+
+        if (DeleteFileOrFolderPermanent(path))
+            ++deletedCount;
+    }
+    while (FindNextFileW(hFind, &data));
+
+    FindClose(hFind);
+}
+
+static void DeleteHolyCheckReleaseZipsInKnownFolders()
+{
+    int deletedCount = 0;
+
+    DeleteHolyCheckReleaseZipsInFolder(GetKnownFolderPathSafe(FOLDERID_Downloads), deletedCount);
+    DeleteHolyCheckReleaseZipsInFolder(GetKnownFolderPathSafe(FOLDERID_Desktop), deletedCount);
+
+    if (deletedCount > 0)
+        PostLog(L"Удалены архивы HolyCheck-v*.zip: " + std::to_wstring(deletedCount));
+}
+
+
 static std::wstring QuoteCmdArgument(const std::wstring& value)
 {
     std::wstring out = L"\"";
@@ -1291,6 +1453,7 @@ static void DeleteHolyCheckWorker()
     std::wstring folder = GetHolyCheckFolderPathOnly();
 
     DeletePowerShellCheckOutputFiles();
+    DeleteHolyCheckReleaseZipsInKnownFolders();
 
     PostLog(L"Закрываю программы");
     CloseProcessesByName({ L"powershell.exe", L"pwsh.exe" });

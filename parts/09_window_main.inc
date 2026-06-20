@@ -714,6 +714,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(g_hModHash, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hModHash);
 
+        g_hModFullScan = CreateWindowExW(0, L"BUTTON", L"fullscan", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_MOD_FULLSCAN), g_hInst, nullptr);
+        SendMessageW(g_hModFullScan, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+        MakeButtonNoErase(g_hModFullScan);
+
         g_hDllUnsigned = CreateWindowExW(0, L"BUTTON", L"unsigned dll", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_DLL_UNSIGNED), g_hInst, nullptr);
         SendMessageW(g_hDllUnsigned, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hDllUnsigned);
@@ -1245,6 +1249,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        if (id == IDC_MOD_FULLSCAN)
+        {
+            g_page4ScanMode.store(1);
+            StartAutomationScan(AUTOMATION_OUTPUT_EVENTVWR);
+            StartAutomationScan(AUTOMATION_OUTPUT_PAGE4);
+            return 0;
+        }
+
         if (id == IDC_DLL_UNSIGNED)
         {
             StartAutomationScan(AUTOMATION_OUTPUT_DLL_UNSIGNED);
@@ -1275,7 +1287,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_POWERSHELL)
         {
-            CopyHelperText(POWERSHELL_TXT, L"PowerShell");
             OpenPowerShellMinecraft();
             return 0;
         }
@@ -1430,6 +1441,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         InvalidateRect(g_hMcLogs, nullptr, TRUE);
         InvalidateRect(g_hPage4Nav, nullptr, TRUE);
         InvalidateRect(g_hModHash, nullptr, TRUE);
+        InvalidateRect(g_hModFullScan, nullptr, TRUE);
         InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
         InvalidateRect(g_hDllActivity, nullptr, TRUE);
         InvalidateRect(g_hPage5Nav, nullptr, TRUE);
@@ -1465,6 +1477,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         InvalidateRect(g_hMcLogs, nullptr, TRUE);
         InvalidateRect(g_hPage4Nav, nullptr, TRUE);
         InvalidateRect(g_hModHash, nullptr, TRUE);
+        InvalidateRect(g_hModFullScan, nullptr, TRUE);
         InvalidateRect(g_hDllUnsigned, nullptr, TRUE);
         InvalidateRect(g_hDllActivity, nullptr, TRUE);
         InvalidateRect(g_hPage5Nav, nullptr, TRUE);

@@ -192,13 +192,23 @@ static bool WaitForDownloadProcessWithInstantFallback(
     unsigned long long lowWindowSize = lastSize;
     unsigned long long speedWindowSize = lastSize;
     g_lastDownloadSpeedBps = 0;
+    DebugLogLine(L"download", L"wait process start item=" + itemName + L" method=" + methodName +
+        L" link=" + std::to_wstring(linkIndex) + L"/" + std::to_wstring(linkTotal) +
+        L" timeout=" + std::to_wstring(timeoutMs) +
+        L" noProgress=" + std::to_wstring(noProgressAbortMs) +
+        L" lowSpeedWindow=" + std::to_wstring(lowSpeedWindowMs) +
+        L" minBps=" + std::to_wstring(minBytesPerSecond) +
+        L" part=" + partPath);
 
     if (!itemName.empty())
         UpdateActiveDownloadStatus(itemName, methodName, linkIndex, linkTotal, lastSize, 0);
 
-    auto abortProcess = [&]() -> bool
+    auto abortProcess = [&](const std::wstring& reason) -> bool
     {
         MarkTransferStalled();
+        DebugLogLine(L"download", L"wait process abort item=" + itemName + L" method=" + methodName +
+            L" reason=" + reason + L" partBytes=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)) +
+            L" speed=" + std::to_wstring(g_lastDownloadSpeedBps));
         if (!itemName.empty())
             UpdateActiveDownloadStatus(itemName, methodName, linkIndex, linkTotal, GetFileSizeBytesOrZero(partPath), g_lastDownloadSpeedBps);
         TerminateProcess(pi.hProcess, 1);
@@ -230,11 +240,19 @@ static bool WaitForDownloadProcessWithInstantFallback(
         {
             if (!itemName.empty())
                 UpdateActiveDownloadStatus(itemName, methodName, linkIndex, linkTotal, currentSize, g_lastDownloadSpeedBps);
+            DebugLogLine(L"download", L"wait process finished item=" + itemName + L" method=" + methodName +
+                L" bytes=" + std::to_wstring(currentSize) + L" speed=" + std::to_wstring(g_lastDownloadSpeedBps));
             return true;
         }
 
-        if (waitResult == WAIT_FAILED || IsCancelRequested() || now - started > timeoutMs)
-            return abortProcess();
+        if (waitResult == WAIT_FAILED)
+            return abortProcess(L"WaitForSingleObject failed");
+
+        if (IsCancelRequested())
+            return abortProcess(L"cancel requested");
+
+        if (now - started > timeoutMs)
+            return abortProcess(L"timeout");
 
         if (currentSize > lastSize)
         {
@@ -243,7 +261,7 @@ static bool WaitForDownloadProcessWithInstantFallback(
         }
 
         if (noProgressAbortMs > 0 && now - lastProgress >= noProgressAbortMs)
-            return abortProcess();
+            return abortProcess(L"no progress");
 
         if (lowSpeedWindowMs > 0 && minBytesPerSecond > 0)
         {
@@ -254,7 +272,7 @@ static bool WaitForDownloadProcessWithInstantFallback(
                 unsigned long long bytesPerSecond = (delta * 1000ull) / std::max<ULONGLONG>(1, windowMs);
 
                 if (bytesPerSecond < minBytesPerSecond)
-                    return abortProcess();
+                    return abortProcess(L"low speed " + std::to_wstring(bytesPerSecond) + L" < " + std::to_wstring(minBytesPerSecond));
 
                 lowWindowStarted = now;
                 lowWindowSize = currentSize;
@@ -266,19 +284,26 @@ static bool WaitForDownloadProcessWithInstantFallback(
 static bool WaitForProcessOrCancel(PROCESS_INFORMATION& pi, DWORD timeoutMs)
 {
     ULONGLONG started = GetTickCount64();
+    DebugLogLine(L"process", L"wait external process start timeout=" + std::to_wstring(timeoutMs));
 
     for (;;)
     {
         DWORD waitResult = WaitForSingleObject(pi.hProcess, 250);
 
         if (waitResult == WAIT_OBJECT_0)
+        {
+            DebugLogLine(L"process", L"wait external process done");
             return true;
+        }
 
         ULONGLONG now = GetTickCount64();
 
         if (waitResult == WAIT_FAILED || IsCancelRequested() || now - started > timeoutMs)
         {
             MarkTransferStalled();
+            DebugLogLine(L"process", L"wait external process abort waitResult=" + std::to_wstring(waitResult) +
+                L" cancel=" + std::to_wstring(IsCancelRequested() ? 1 : 0) +
+                L" elapsed=" + std::to_wstring(now - started));
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, 1000);
             return false;
@@ -336,7 +361,10 @@ static bool DownloadWithCurlFallback(
     const wchar_t* appName = FileExists(curlExe) ? curlExe.c_str() : nullptr;
 
     if (!CreateProcessW(appName, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        DebugLogLine(L"download", L"CreateProcess failed command=" + command + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     if (!WaitForDownloadProcessWithInstantFallback(
         pi, partPath, timeoutMs,
@@ -350,6 +378,8 @@ static bool DownloadWithCurlFallback(
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLogLine(L"download", L"process exit command=" + command + L" exit=" + std::to_wstring(exitCode) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -363,8 +393,12 @@ static bool DownloadWithCurlFallback(
     DeleteFileW(targetPath.c_str());
 
     if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
+    {
+        DebugLogLine(L"download", L"curl MoveFile failed item=" + itemName + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
+    DebugLogLine(L"download", L"curl success item=" + itemName + L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
     return true;
 }
 
@@ -419,7 +453,10 @@ static bool DownloadWithCurlBrowserLike(
     const wchar_t* appName = FileExists(curlExe) ? curlExe.c_str() : nullptr;
 
     if (!CreateProcessW(appName, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        DebugLogLine(L"download", L"CreateProcess failed command=" + command + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     if (!WaitForDownloadProcessWithInstantFallback(
         pi, partPath, timeoutMs,
@@ -433,6 +470,8 @@ static bool DownloadWithCurlBrowserLike(
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLogLine(L"download", L"process exit command=" + command + L" exit=" + std::to_wstring(exitCode) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -499,7 +538,10 @@ static bool DownloadWithCurlGitHubFast(
     const wchar_t* appName = FileExists(curlExe) ? curlExe.c_str() : nullptr;
 
     if (!CreateProcessW(appName, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        DebugLogLine(L"download", L"CreateProcess failed command=" + command + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     if (!WaitForDownloadProcessWithInstantFallback(
         pi, partPath, timeoutMs,
@@ -513,6 +555,8 @@ static bool DownloadWithCurlGitHubFast(
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLogLine(L"download", L"process exit command=" + command + L" exit=" + std::to_wstring(exitCode) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -613,7 +657,10 @@ static bool DownloadWithPowerShellFallback(
     const wchar_t* appName = FileExists(powerShellExe) ? powerShellExe.c_str() : nullptr;
 
     if (!CreateProcessW(appName, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        DebugLogLine(L"download", L"CreateProcess failed command=" + command + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     if (!WaitForDownloadProcessWithInstantFallback(
         pi, partPath, timeoutMs,
@@ -627,6 +674,8 @@ static bool DownloadWithPowerShellFallback(
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLogLine(L"download", L"process exit command=" + command + L" exit=" + std::to_wstring(exitCode) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -661,6 +710,8 @@ static bool DownloadWithWinInetFallback(
 
     std::wstring partPath = targetPath + L".part";
     DeleteFileW(partPath.c_str());
+    DebugLogLine(L"download", L"WinINet start item=" + itemName + L" url=" + url + L" target=" + targetPath +
+        L" timeout=" + std::to_wstring(timeoutMs));
 
     HINTERNET session = InternetOpenW(
         L"Mozilla/5.0 HolyCheckDownloader/WinINet",
@@ -671,7 +722,10 @@ static bool DownloadWithWinInetFallback(
     );
 
     if (!session)
+    {
+        DebugLogLine(L"download", L"WinINet InternetOpen failed item=" + itemName + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     DWORD connectTimeout = timeoutMs >= 300000 ? 6000 : 5000;
     DWORD receiveTimeout = IsProblemDownloadName(itemName) ? 7000 : 9000;
@@ -705,6 +759,7 @@ static bool DownloadWithWinInetFallback(
 
     if (!handle)
     {
+        DebugLogLine(L"download", L"WinINet InternetOpenUrl failed item=" + itemName + L" error=" + FormatWin32ErrorForLog(GetLastError()) + L" url=" + url);
         InternetCloseHandle(session);
         return false;
     }
@@ -715,6 +770,7 @@ static bool DownloadWithWinInetFallback(
     {
         if (status < 200 || status >= 300)
         {
+            DebugLogLine(L"download", L"WinINet HTTP status failed item=" + itemName + L" status=" + std::to_wstring(status));
             InternetCloseHandle(handle);
             InternetCloseHandle(session);
             return false;
@@ -733,6 +789,7 @@ static bool DownloadWithWinInetFallback(
 
     if (file == INVALID_HANDLE_VALUE)
     {
+        DebugLogLine(L"download", L"WinINet part open failed item=" + itemName + L" part=" + partPath + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         InternetCloseHandle(handle);
         InternetCloseHandle(session);
         return false;
@@ -833,12 +890,22 @@ static bool DownloadWithWinInetFallback(
     InternetCloseHandle(session);
 
     if (!ok || !FileExists(partPath) || IsCancelRequested())
+    {
+        DebugLogLine(L"download", L"WinINet failed item=" + itemName + L" ok=" + std::to_wstring(ok ? 1 : 0) +
+            L" partExists=" + std::to_wstring(FileExists(partPath) ? 1 : 0) +
+            L" cancelled=" + std::to_wstring(IsCancelRequested() ? 1 : 0) +
+            L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
         return TryFinalizeAbortedPartFile(itemName, partPath, targetPath);
+    }
 
     DeleteFileW(targetPath.c_str());
     if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
+    {
+        DebugLogLine(L"download", L"WinINet MoveFile failed item=" + itemName + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
+    DebugLogLine(L"download", L"WinINet success item=" + itemName + L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
     return true;
 }
 
@@ -928,9 +995,226 @@ static std::wstring GetItemExtractDir(const DownloadItem& item, const std::wstri
     return CombinePath(tabFolder, RemoveExtension(item.file));
 }
 
+static std::wstring TrimLaunchString(std::wstring value)
+{
+    while (!value.empty() && iswspace(value.front()))
+        value.erase(value.begin());
+
+    while (!value.empty() && iswspace(value.back()))
+        value.pop_back();
+
+    while (!value.empty() && (value.front() == L'\"' || value.front() == L'\''))
+        value.erase(value.begin());
+
+    while (!value.empty() && (value.back() == L'\"' || value.back() == L'\'' || value.back() == L','))
+        value.pop_back();
+
+    while (!value.empty() && iswspace(value.back()))
+        value.pop_back();
+
+    return value;
+}
+
+static std::wstring ExtractExecutablePathFromRegistryValue(std::wstring value)
+{
+    value = TrimLaunchString(value);
+
+    if (value.empty())
+        return L"";
+
+    if (value.front() == L'\"')
+    {
+        size_t endQuote = value.find(L'\"', 1);
+        if (endQuote != std::wstring::npos)
+            return TrimLaunchString(value.substr(1, endQuote - 1));
+    }
+
+    std::wstring lower = ToLower(value);
+    size_t exePos = lower.find(L".exe");
+
+    if (exePos != std::wstring::npos)
+        return TrimLaunchString(value.substr(0, exePos + 4));
+
+    size_t commaPos = value.find(L',');
+    if (commaPos != std::wstring::npos)
+        value = value.substr(0, commaPos);
+
+    return TrimLaunchString(value);
+}
+
+static bool LaunchRegistryGetString(HKEY key, const wchar_t* valueName, std::wstring& out)
+{
+    DWORD type = 0;
+    DWORD cb = 0;
+
+    if (RegQueryValueExW(key, valueName, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS)
+        return false;
+
+    if ((type != REG_SZ && type != REG_EXPAND_SZ) || cb == 0)
+        return false;
+
+    std::wstring value(cb / sizeof(wchar_t), L'\0');
+
+    if (RegQueryValueExW(key, valueName, nullptr, &type, reinterpret_cast<LPBYTE>(&value[0]), &cb) != ERROR_SUCCESS)
+        return false;
+
+    while (!value.empty() && value.back() == L'\0')
+        value.pop_back();
+
+    if (type == REG_EXPAND_SZ)
+    {
+        wchar_t expanded[4096]{};
+        DWORD expandedLen = ExpandEnvironmentStringsW(value.c_str(), expanded, ARRAYSIZE(expanded));
+
+        if (expandedLen > 0 && expandedLen < ARRAYSIZE(expanded))
+            value = expanded;
+    }
+
+    out = value;
+    return !out.empty();
+}
+
+static void AddUniqueSystemInformerLaunchCandidate(std::vector<std::wstring>& candidates, const std::wstring& rawPath)
+{
+    std::wstring path = ExtractExecutablePathFromRegistryValue(rawPath);
+
+    if (path.empty())
+        return;
+
+    std::wstring lower = ToLower(path);
+    bool systemInformerName = lower.find(L"systeminformer") != std::wstring::npos ||
+        (lower.find(L"system") != std::wstring::npos && lower.find(L"informer") != std::wstring::npos);
+
+    if (!EndsWithI(lower, L".exe") || !systemInformerName)
+        return;
+
+    for (const std::wstring& existing : candidates)
+    {
+        if (ToLower(existing) == lower)
+            return;
+    }
+
+    candidates.push_back(path);
+}
+
+static void AddSystemInformerCandidateFromEnv(std::vector<std::wstring>& candidates, const wchar_t* envName, const wchar_t* relativePath)
+{
+    wchar_t base[MAX_PATH * 4]{};
+    DWORD len = GetEnvironmentVariableW(envName, base, ARRAYSIZE(base));
+
+    if (len == 0 || len >= ARRAYSIZE(base))
+        return;
+
+    AddUniqueSystemInformerLaunchCandidate(candidates, CombinePath(base, relativePath));
+}
+
+static void AddSystemInformerAppPathRegistryCandidates(std::vector<std::wstring>& candidates, HKEY root, REGSAM wowFlags)
+{
+    HKEY key{};
+    if (RegOpenKeyExW(root,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SystemInformer.exe",
+            0, KEY_READ | wowFlags, &key) != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    std::wstring value;
+    if (LaunchRegistryGetString(key, nullptr, value))
+        AddUniqueSystemInformerLaunchCandidate(candidates, value);
+
+    RegCloseKey(key);
+}
+
+static void AddSystemInformerUninstallRegistryCandidates(std::vector<std::wstring>& candidates, HKEY root, REGSAM wowFlags)
+{
+    HKEY uninstallKey{};
+    if (RegOpenKeyExW(root,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            0, KEY_READ | wowFlags, &uninstallKey) != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    for (DWORD index = 0;; ++index)
+    {
+        wchar_t subName[512]{};
+        DWORD subNameLen = ARRAYSIZE(subName);
+
+        if (RegEnumKeyExW(uninstallKey, index, subName, &subNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+
+        HKEY itemKey{};
+        if (RegOpenKeyExW(uninstallKey, subName, 0, KEY_READ | wowFlags, &itemKey) != ERROR_SUCCESS)
+            continue;
+
+        std::wstring displayName;
+        if (LaunchRegistryGetString(itemKey, L"DisplayName", displayName))
+        {
+            std::wstring lowerDisplayName = ToLower(displayName);
+            if (lowerDisplayName.find(L"systeminformer") != std::wstring::npos ||
+                (lowerDisplayName.find(L"system") != std::wstring::npos && lowerDisplayName.find(L"informer") != std::wstring::npos))
+            {
+                std::wstring installLocation;
+                if (LaunchRegistryGetString(itemKey, L"InstallLocation", installLocation))
+                {
+                    installLocation = TrimLaunchString(installLocation);
+                    if (!installLocation.empty())
+                    {
+                        AddUniqueSystemInformerLaunchCandidate(candidates, CombinePath(installLocation, L"SystemInformer.exe"));
+                        AddUniqueSystemInformerLaunchCandidate(candidates, CombinePath(installLocation, L"System Informer.exe"));
+                    }
+                }
+
+                std::wstring displayIcon;
+                if (LaunchRegistryGetString(itemKey, L"DisplayIcon", displayIcon))
+                    AddUniqueSystemInformerLaunchCandidate(candidates, displayIcon);
+            }
+        }
+
+        RegCloseKey(itemKey);
+    }
+
+    RegCloseKey(uninstallKey);
+}
+
+static std::wstring FindInstalledSystemInformerPath()
+{
+    std::vector<std::wstring> candidates;
+
+    AddSystemInformerAppPathRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddSystemInformerAppPathRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddSystemInformerAppPathRegistryCandidates(candidates, HKEY_CURRENT_USER, 0);
+
+    AddSystemInformerUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddSystemInformerUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddSystemInformerUninstallRegistryCandidates(candidates, HKEY_CURRENT_USER, 0);
+
+    AddSystemInformerCandidateFromEnv(candidates, L"ProgramFiles", L"SystemInformer\\SystemInformer.exe");
+    AddSystemInformerCandidateFromEnv(candidates, L"ProgramFiles", L"System Informer\\SystemInformer.exe");
+    AddSystemInformerCandidateFromEnv(candidates, L"ProgramFiles(x86)", L"SystemInformer\\SystemInformer.exe");
+    AddSystemInformerCandidateFromEnv(candidates, L"ProgramFiles(x86)", L"System Informer\\SystemInformer.exe");
+    AddSystemInformerCandidateFromEnv(candidates, L"LOCALAPPDATA", L"Programs\\SystemInformer\\SystemInformer.exe");
+    AddSystemInformerCandidateFromEnv(candidates, L"LOCALAPPDATA", L"Programs\\System Informer\\SystemInformer.exe");
+
+    for (const std::wstring& path : candidates)
+    {
+        if (FileExists(path))
+            return path;
+    }
+
+    return L"";
+}
+
 static std::wstring FindLaunchPathForItem(const DownloadItem& item, const std::wstring& baseFolder)
 {
     std::wstring target = GetItemTargetPath(item, baseFolder);
+
+    if (IsSystemInformerItem(item))
+    {
+        std::wstring installedPath = FindInstalledSystemInformerPath();
+        if (!installedPath.empty())
+            return installedPath;
+    }
 
     if (EndsWithI(target, L".zip"))
     {
@@ -1357,7 +1641,11 @@ static bool IsValidDownloadedPayload(const DownloadItem& item, const std::wstrin
 
 static bool ValidateDownloadedFileOrDelete(const DownloadItem& item, const std::wstring& targetPath)
 {
-    if (IsValidDownloadedPayload(item, targetPath))
+    bool valid = IsValidDownloadedPayload(item, targetPath);
+    DebugLogLine(L"download", L"validate payload item=" + item.name + L" path=" + targetPath +
+        L" valid=" + std::to_wstring(valid ? 1 : 0) +
+        L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
+    if (valid)
         return true;
 
     DeleteFileW(targetPath.c_str());
@@ -1511,6 +1799,11 @@ static bool DownloadWithWinHttpValidated(
         return true;
     }
 
+    DebugLogLine(L"download", L"WinHTTP validated failed item=" + item.name +
+        L" stalled=" + std::to_wstring(DidLastTransferStall() ? 1 : 0) +
+        L" invalidPayload=" + std::to_wstring(DidLastDownloadedPayloadInvalid() ? 1 : 0) +
+        L" targetSize=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath + L".part")));
     DeleteFileW(targetPath.c_str());
     DeleteFileW((targetPath + L".part").c_str());
     return false;
@@ -1554,7 +1847,10 @@ static bool DownloadWithBitsAdminFallback(
     const wchar_t* appName = FileExists(bitsExe) ? bitsExe.c_str() : nullptr;
 
     if (!CreateProcessW(appName, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        DebugLogLine(L"download", L"CreateProcess failed command=" + command + L" error=" + FormatWin32ErrorForLog(GetLastError()));
         return false;
+    }
 
     UpdateActiveDownloadStatus(itemName, L"BITS", linkIndex, linkTotal, 0, 0);
 
@@ -1562,6 +1858,8 @@ static bool DownloadWithBitsAdminFallback(
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    DebugLogLine(L"download", L"process exit command=" + command + L" exit=" + std::to_wstring(exitCode) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(partPath)));
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -1623,8 +1921,17 @@ static bool TryDirectDownloadCandidate(
     DownloadMethodChoice method,
     bool relaxedSpeedGuard = false)
 {
+    std::wstring methodName = GetDownloadMethodDisplayName(method);
+    DebugLogLine(L"download", L"candidate start item=" + item.name +
+        L" method=" + methodName + L" link=" + std::to_wstring(linkIndex) + L"/" + std::to_wstring(linkTotal) +
+        L" timeout=" + std::to_wstring(timeoutMs) + L" relaxed=" + std::to_wstring(relaxedSpeedGuard ? 1 : 0) +
+        L" target=" + targetPath + L" url=" + url);
+
     if (IsCancelRequested())
+    {
+        DebugLogLine(L"download", L"candidate cancelled before start item=" + item.name + L" method=" + methodName);
         return false;
+    }
 
     ClearDownloadedPayloadInvalidFlag();
     ClearTransferStalledFlag();
@@ -1643,7 +1950,14 @@ static bool TryDirectDownloadCandidate(
     DWORD powerShellNoProgressAbortMs = relaxedSpeedGuard ? 90000 : GetPowerShellNoProgressAbortMs(item);
 
     if (method == DownloadMethodChoice::WinHttp)
-        return DownloadWithWinHttpValidated(item, url, targetPath, linkIndex, linkTotal);
+    {
+        bool ok = DownloadWithWinHttpValidated(item, url, targetPath, linkIndex, linkTotal);
+        DebugLogLine(L"download", L"candidate finish item=" + item.name + L" method=" + methodName +
+            L" ok=" + std::to_wstring(ok ? 1 : 0) + L" stalled=" + std::to_wstring(DidLastTransferStall() ? 1 : 0) +
+            L" invalidPayload=" + std::to_wstring(DidLastDownloadedPayloadInvalid() ? 1 : 0) +
+            L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
+        return ok;
+    }
 
     if (method == DownloadMethodChoice::WinInet)
     {
@@ -1659,12 +1973,20 @@ static bool TryDirectDownloadCandidate(
         {
             g_lastDownloadMethod = L"WinINet";
             UpdateActiveDownloadStatus(item.name, L"готово WinINet", linkIndex, linkTotal, GetFileSizeBytesOrZero(targetPath), g_lastDownloadSpeedBps);
+            DebugLogLine(L"download", L"candidate success item=" + item.name + L" method=" + methodName + L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
             return true;
         }
     }
 
     if (method == DownloadMethodChoice::Bits)
-        return DownloadBitsValidated(item, url, targetPath, timeoutMs, linkIndex, linkTotal);
+    {
+        bool ok = DownloadBitsValidated(item, url, targetPath, timeoutMs, linkIndex, linkTotal);
+        DebugLogLine(L"download", L"candidate finish item=" + item.name + L" method=" + methodName +
+            L" ok=" + std::to_wstring(ok ? 1 : 0) + L" stalled=" + std::to_wstring(DidLastTransferStall() ? 1 : 0) +
+            L" invalidPayload=" + std::to_wstring(DidLastDownloadedPayloadInvalid() ? 1 : 0) +
+            L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
+        return ok;
+    }
 
     if (method == DownloadMethodChoice::PowerShell)
     {
@@ -1680,6 +2002,7 @@ static bool TryDirectDownloadCandidate(
         {
             g_lastDownloadMethod = L"PowerShell";
             UpdateActiveDownloadStatus(item.name, L"готово PowerShell", linkIndex, linkTotal, GetFileSizeBytesOrZero(targetPath), g_lastDownloadSpeedBps);
+            DebugLogLine(L"download", L"candidate success item=" + item.name + L" method=" + methodName + L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
             return true;
         }
     }
@@ -1699,10 +2022,16 @@ static bool TryDirectDownloadCandidate(
         {
             g_lastDownloadMethod = L"curl";
             UpdateActiveDownloadStatus(item.name, L"готово curl", linkIndex, linkTotal, GetFileSizeBytesOrZero(targetPath), g_lastDownloadSpeedBps);
+            DebugLogLine(L"download", L"candidate success item=" + item.name + L" method=" + methodName + L" size=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
             return true;
         }
     }
 
+    DebugLogLine(L"download", L"candidate failed item=" + item.name + L" method=" + methodName +
+        L" stalled=" + std::to_wstring(DidLastTransferStall() ? 1 : 0) +
+        L" invalidPayload=" + std::to_wstring(DidLastDownloadedPayloadInvalid() ? 1 : 0) +
+        L" targetSize=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)) +
+        L" partSize=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath + L".part")));
     DeleteFileW(targetPath.c_str());
     DeleteFileW((targetPath + L".part").c_str());
     return false;
@@ -1760,6 +2089,8 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
 
     DWORD timeoutMs = GetPrimaryUrlOnlyTimeoutMs(item);
     std::vector<std::wstring> urls = GetDirectDownloadUrls(item);
+    DebugLogLine(L"download", L"direct download start item=" + item.name + L" target=" + targetPath +
+        L" urls=" + std::to_wstring(urls.size()) + L" timeout=" + std::to_wstring(timeoutMs));
 
     auto tryOne = [&](size_t i, DownloadMethodChoice method, bool relaxedSpeedGuard = false) -> bool
     {
@@ -1785,6 +2116,7 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
             }
         }
 
+        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all problem methods exhausted");
         return false;
     }
 
@@ -1808,7 +2140,10 @@ static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std:
     if (tryAllLinksWithMethod(DownloadMethodChoice::WinInet))
         return true;
 
-    return tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);
+    bool ok = tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);
+    if (!ok)
+        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all methods exhausted");
+    return ok;
 }
 
 static void AddEricZimmermanKnownUrls(const DownloadItem& item, std::vector<std::wstring>& urls)
