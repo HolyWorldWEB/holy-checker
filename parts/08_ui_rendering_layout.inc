@@ -1,4 +1,3 @@
-// Used by drawing code before 09_window_main.inc is included.
 static bool IsPathLikeAutomationCell(const std::wstring& cell);
 
 static void InitParticles(int width, int height)
@@ -607,7 +606,6 @@ static bool IsPipeSeparatedAutomationRow(const std::wstring& line)
 
 static size_t AutomationPathColumnForDraw(int target, const std::vector<std::wstring>& cols)
 {
-    // Current .jar activity / .exe activity format is fixed:
     // date | program | path.  Do not auto-detect the program column as a path
     // just because the program name ends with .jar/.exe; otherwise the real
     // path column becomes narrow and the full path is hidden.
@@ -689,7 +687,6 @@ static std::vector<float> ComputeAutomationColumnWidths(Graphics& g, const std::
     {
         for (size_t c = widths.size(); c-- > 0; )
         {
-            // Prefer the rightmost path-like column when the target has no fixed path column.
             for (size_t i = startIndex; i < endIndex; ++i)
             {
                 std::vector<std::wstring> cols = NormalizeAutomationColumnsForDraw(lines[i], target);
@@ -704,7 +701,6 @@ static std::vector<float> ComputeAutomationColumnWidths(Graphics& g, const std::
         }
     }
 
-    // Keep small metadata columns compact and give the path/name column all remaining room.
     if (widths.size() >= 3)
     {
         for (size_t c = 0; c < widths.size(); ++c)
@@ -753,7 +749,6 @@ static std::vector<float> ComputeAutomationColumnWidths(Graphics& g, const std::
                     fixed += widths[c];
         }
 
-        // The path/name column is the anchor column: it is measured by the longest
         // path in the whole result set, then it receives any free space. That keeps
         // all rows under the same vertical columns and prevents per-screen jumps.
         widths[pathCol] = std::max(widths[pathCol], std::max(140.0f, usableW - fixed));
@@ -1038,7 +1033,6 @@ static void DrawAutomationOutputPanel(Graphics& g, RECT panelRect, const wchar_t
     float lineY = y + 30.0f;
     SolidBrush rowBrush(Color(26, 92, 116, 170));
     Pen rowLinePen(Color(84, 105, 118, 142), 1.0f);
-    // Calculate columns from the full result set, not only from currently visible
     // rows. The longest path/name becomes the base for every row, so scrolling or
     // new rows do not make columns shift independently.
     std::vector<float> sharedPipeWidths = ComputeAutomationColumnWidths(g, lines, 0, lines.size(), target, lineFont, panelW);
@@ -1078,11 +1072,49 @@ struct AutomationServiceUiRow
     const wchar_t* label;
     const wchar_t* serviceName;
     bool running;
+    DWORD processId;
+    std::wstring startTime;
 };
 
-static bool QueryAutomationServiceRunning(const wchar_t* serviceName, bool& running)
+static std::wstring FormatFileTimeLocalFull(const FILETIME& ft)
+{
+    FILETIME localFt{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&ft, &localFt) || !FileTimeToSystemTime(&localFt, &st))
+        return L"-";
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%02u.%02u.%04u %02u:%02u:%02u", st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+static std::wstring FormatSystemTimeFull(const SYSTEMTIME& st)
+{
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%02u.%02u.%04u %02u:%02u:%02u", st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+static std::wstring QueryProcessStartTimeFull(DWORD processId)
+{
+    if (processId == 0)
+        return L"-";
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process)
+        process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, processId);
+    if (!process)
+        return L"-";
+
+    FILETIME created{}, exited{}, kernel{}, user{};
+    bool ok = GetProcessTimes(process, &created, &exited, &kernel, &user) != FALSE;
+    CloseHandle(process);
+    return ok ? FormatFileTimeLocalFull(created) : L"-";
+}
+
+static bool QueryAutomationServiceRunning(const wchar_t* serviceName, bool& running, DWORD& processId)
 {
     running = false;
+    processId = 0;
 
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
 
@@ -1108,11 +1140,36 @@ static bool QueryAutomationServiceRunning(const wchar_t* serviceName, bool& runn
     );
 
     if (ok)
+    {
         running = status.dwCurrentState == SERVICE_RUNNING;
+        processId = status.dwProcessId;
+    }
 
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
     return ok == TRUE;
+}
+
+static std::wstring GetLastBootTimeText()
+{
+    FILETIME nowFt{};
+    GetSystemTimeAsFileTime(&nowFt);
+    ULARGE_INTEGER now{};
+    now.LowPart = nowFt.dwLowDateTime;
+    now.HighPart = nowFt.dwHighDateTime;
+
+    ULONGLONG uptime100ns = GetTickCount64() * 10000ULL;
+    if (now.QuadPart <= uptime100ns)
+        return L"не удалось получить";
+
+    ULARGE_INTEGER boot{};
+    boot.QuadPart = now.QuadPart - uptime100ns;
+    FILETIME bootFt{ boot.LowPart, boot.HighPart };
+    FILETIME localFt{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&bootFt, &localFt) || !FileTimeToSystemTime(&localFt, &st))
+        return L"не удалось получить";
+    return FormatSystemTimeFull(st);
 }
 
 static std::vector<AutomationServiceUiRow> GetAutomationServiceRows()
@@ -1146,8 +1203,9 @@ static std::vector<AutomationServiceUiRow> GetAutomationServiceRows()
     for (const ServiceDef& def : defs)
     {
         bool running = false;
-        QueryAutomationServiceRunning(def.name, running);
-        rows.push_back({ def.label, def.name, running });
+        DWORD processId = 0;
+        QueryAutomationServiceRunning(def.name, running, processId);
+        rows.push_back({ def.label, def.name, running, processId, running ? QueryProcessStartTimeFull(processId) : L"-" });
     }
 
     cached = rows;
@@ -1174,47 +1232,65 @@ static void DrawAutomationServicesPanel(Graphics& g, RECT panelRect)
     bgPath.AddArc(bgRect.X, bgRect.GetBottom() - 14.0f, 14.0f, 14.0f, 90.0f, 90.0f);
     bgPath.CloseFigure();
 
-    SolidBrush bgBrush(Color(125, 28, 30, 36));
-    Pen borderPen(Color(132, 122, 128, 142), 1.0f);
+    LinearGradientBrush bgBrush(bgRect, Color(235, 22, 25, 32), Color(235, 38, 42, 54), LinearGradientModeVertical);
+    Pen borderPen(Color(180, 122, 128, 142), 1.0f);
     g.FillPath(&bgBrush, &bgPath);
     g.DrawPath(&borderPen, &bgPath);
 
     FontFamily family(L"Consolas");
     Font titleFont(&family, 13.0f, FontStyleRegular, UnitPixel);
-    Font lineFont(&family, 13.0f, FontStyleRegular, UnitPixel);
+    Font lineFont(&family, 12.0f, FontStyleRegular, UnitPixel);
 
-    SolidBrush titleBrush(Color(245, 236, 238, 245));
+    SolidBrush titleBrush(Color(255, 245, 247, 255));
+    SolidBrush headerBrush(Color(220, 178, 185, 202));
     SolidBrush nameBrush(Color(255, 235, 235, 240));
     SolidBrush onBrush(Color(255, 70, 220, 105));
-    SolidBrush offBrush(Color(255, 255, 75, 75));
+    SolidBrush offBrush(Color(255, 255, 95, 95));
+    SolidBrush bootBrush(Color(255, 215, 225, 255));
+    Pen sepPen(Color(75, 170, 178, 196), 1.0f);
 
     StringFormat fmt;
     fmt.SetTrimming(StringTrimmingEllipsisCharacter);
-    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsLineLimit);
 
-    StringFormat rightFmt;
-    rightFmt.SetAlignment(StringAlignmentFar);
-    rightFmt.SetTrimming(StringTrimmingEllipsisCharacter);
-    rightFmt.SetFormatFlags(StringFormatFlagsNoWrap);
+    StringFormat centerFmt;
+    centerFmt.SetAlignment(StringAlignmentCenter);
+    centerFmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    centerFmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsLineLimit);
 
     const float x = static_cast<float>(panelRect.left);
     const float y = static_cast<float>(panelRect.top);
     const float w = static_cast<float>(panelRect.right - panelRect.left);
 
-    g.DrawString(L"Службы", -1, &titleFont, RectF(x + 12.0f, y + 8.0f, w - 24.0f, 18.0f), &fmt, &titleBrush);
+    g.DrawString(L"Службы", -1, &titleFont, RectF(x + 14.0f, y + 9.0f, w - 28.0f, 18.0f), &fmt, &titleBrush);
+    g.DrawLine(&sepPen, x + 12.0f, y + 30.0f, x + w - 12.0f, y + 30.0f);
+
+    const float nameX = x + 14.0f;
+    const float statusX = x + 104.0f;
+    const float timeX = x + 172.0f;
+    g.DrawString(L"имя", -1, &lineFont, RectF(nameX, y + 34.0f, 84.0f, 16.0f), &fmt, &headerBrush);
+    g.DrawString(L"статус", -1, &lineFont, RectF(statusX, y + 34.0f, 62.0f, 16.0f), &fmt, &headerBrush);
+    g.DrawString(L"старт", -1, &lineFont, RectF(timeX, y + 34.0f, w - 186.0f, 16.0f), &fmt, &headerBrush);
 
     std::vector<AutomationServiceUiRow> rows = GetAutomationServiceRows();
-    float rowY = y + 30.0f;
-    const float rowH = 16.0f;
+    float rowY = y + 52.0f;
+    const float rowH = 18.0f;
 
     for (const AutomationServiceUiRow& row : rows)
     {
-        g.DrawString(row.label, -1, &lineFont, RectF(x + 14.0f, rowY, w - 92.0f, rowH), &fmt, &nameBrush);
         const wchar_t* status = row.running ? L"вкл" : L"выкл";
         Brush* statusBrush = row.running ? static_cast<Brush*>(&onBrush) : static_cast<Brush*>(&offBrush);
-        g.DrawString(status, -1, &lineFont, RectF(x + 12.0f, rowY, w - 24.0f, rowH), &rightFmt, statusBrush);
+        g.DrawString(row.label, -1, &lineFont, RectF(nameX, rowY, 84.0f, rowH), &fmt, &nameBrush);
+        g.DrawString(status, -1, &lineFont, RectF(statusX, rowY, 62.0f, rowH), &fmt, statusBrush);
+        g.DrawString(row.startTime.c_str(), -1, &lineFont, RectF(timeX, rowY, w - 186.0f, rowH), &fmt, &nameBrush);
         rowY += rowH;
     }
+
+    g.DrawLine(&sepPen, x + 12.0f, rowY + 4.0f, x + w - 12.0f, rowY + 4.0f);
+    rowY += 12.0f;
+    g.DrawString(L"Вкл ПК", -1, &titleFont, RectF(x + 14.0f, rowY, 96.0f, 18.0f), &fmt, &titleBrush);
+    std::wstring boot = GetLastBootTimeText();
+    g.DrawString(boot.c_str(), -1, &lineFont, RectF(x + 96.0f, rowY + 1.0f, w - 110.0f, 18.0f), &fmt, &bootBrush);
 }
 
 static void DrawAutomationScreen(Graphics& g, RECT rc)
@@ -1254,8 +1330,8 @@ static void DrawPage4Screen(Graphics& g, RECT rc)
 
 static void DrawPage5Screen(Graphics& g, RECT rc)
 {
-    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-    DrawAutomationOutputPanel(g, GetPage5InjGenPanelRect(rc), L"injection", AUTOMATION_OUTPUT_INJGEN);
+    UNREFERENCED_PARAMETER(g);
+    UNREFERENCED_PARAMETER(rc);
 }
 
 
@@ -1302,10 +1378,6 @@ static void DrawScene(HWND hwnd, HDC targetHdc)
     else if (g_currentPage == 3)
     {
         DrawPage4Screen(g, rc);
-    }
-    else if (g_currentPage == 4)
-    {
-        DrawPage5Screen(g, rc);
     }
     else
     {
@@ -1379,7 +1451,7 @@ static void LayoutControls(HWND hwnd)
     SetWindowTextW(g_hAutomationNav, L"check");
     ShowWindow(g_hHomeNav, SW_HIDE);
 
-    if (g_currentPage >= 1 && g_currentPage <= 4)
+    if (g_currentPage >= 1 && g_currentPage <= 3)
     {
         ShowWindow(g_hDeleteHolyCheck, SW_HIDE);
         ShowWindow(g_hEnableServices, SW_HIDE);
@@ -1435,15 +1507,10 @@ static void LayoutControls(HWND hwnd)
             page4Button.right = page4Button.left - topGap;
             page4Button.left = page4Button.right - navButtonW;
 
-            RECT page5Button = page4Button;
-            page5Button.right = page5Button.left - topGap;
-            page5Button.left = page5Button.right - navButtonW;
-
             MoveChildWindow(g_hModHash, scanButton.left, scanButton.top, scanButton.right - scanButton.left, scanButton.bottom - scanButton.top, TRUE);
             MoveChildWindow(g_hModFullScan, fullScanButton.left, fullScanButton.top, fullScanButton.right - fullScanButton.left, fullScanButton.bottom - fullScanButton.top, TRUE);
             MoveChildWindow(g_hAutomationJarPage, jarPageButton.left, jarPageButton.top, jarPageButton.right - jarPageButton.left, jarPageButton.bottom - jarPageButton.top, TRUE);
             MoveChildWindow(g_hPage4Nav, page4Button.left, page4Button.top, page4Button.right - page4Button.left, page4Button.bottom - page4Button.top, TRUE);
-            MoveChildWindow(g_hPage5Nav, page5Button.left, page5Button.top, page5Button.right - page5Button.left, page5Button.bottom - page5Button.top, TRUE);
 
             RECT eventPanel = GetAutomationEventPanelRect(rc);
             MoveChildWindow(g_hEventEdit, eventPanel.left + 10, eventPanel.top + 30, eventPanel.right - eventPanel.left - 22, eventPanel.bottom - eventPanel.top - 40, TRUE);
@@ -1453,7 +1520,6 @@ static void LayoutControls(HWND hwnd)
             SetWindowTextW(g_hModFullScan, L"fullscan");
             SetWindowTextW(g_hAutomationJarPage, L"dll | jar");
             SetWindowTextW(g_hPage4Nav, L"");
-            SetWindowTextW(g_hPage5Nav, L"injection");
 
             ShowWindow(g_hAutomationBam, SW_HIDE);
             ShowWindow(g_hModHash, SW_SHOWNA);
@@ -1462,7 +1528,6 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_hAutomationEventVwr, SW_HIDE);
             ShowWindow(g_hAutomationJarPage, SW_SHOWNA);
             ShowWindow(g_hPage4Nav, SW_HIDE);
-            if (page5Button.left > AUTOMATION_PANEL_X) ShowWindow(g_hPage5Nav, SW_SHOWNA);
             ShowWindow(g_hEventEdit, SW_SHOWNA);
         }
         else if (g_currentPage == 2)
@@ -1489,14 +1554,6 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_hModFullScan, SW_HIDE);
             ShowWindow(g_hDllUnsigned, SW_HIDE);
         }
-        else if (g_currentPage == 4)
-        {
-            RECT injButton = GetInjGenButtonRect(rc);
-            MoveChildWindow(g_hInjGenCheck, injButton.left, injButton.top, injButton.right - injButton.left, injButton.bottom - injButton.top, TRUE);
-            ShowWindow(g_hInjGenCheck, SW_SHOWNA);
-
-        }
-
         auto showTopNavAll = [&]()
         {
             int x = navX;
@@ -1509,7 +1566,7 @@ static void LayoutControls(HWND hwnd)
                 x -= navButtonW + topGap;
             };
             place(g_hHomeNav, L"Главная");
-            place(g_hPage5Nav, L"injection");
+            ShowWindow(g_hPage5Nav, SW_HIDE);
             ShowWindow(g_hPage4Nav, SW_HIDE);
             place(g_hAutomationJarPage, L"dll | jar");
             place(g_hAutomationNav, L"check");
@@ -1783,8 +1840,6 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         selected = true;
     if (id == IDC_PAGE4_NAV && g_currentPage == 3)
         selected = true;
-    if (id == IDC_PAGE5_NAV && g_currentPage == 4)
-        selected = true;
 
     bool copyButton = id == IDC_COPY_EVERYTHING_1 ||
         id == IDC_COPY_EVERYTHING_2 ||
@@ -1821,7 +1876,7 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         id == IDC_AUTOMATION_NAV || id == IDC_AUTOMATION_BAM || id == IDC_AUTOMATION_EVENTVWR ||
 id == IDC_AUTOMATION_JAR_PAGE || id == IDC_JAR_ACTIV ||
         id == IDC_EXE_DELETED || id == IDC_PF_DELETED || id == IDC_PAGE4_NAV ||
-        id == IDC_MOD_HASH || id == IDC_MOD_FULLSCAN || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY || id == IDC_PAGE5_NAV || id == IDC_INJGEN_CHECK))
+        id == IDC_MOD_HASH || id == IDC_MOD_FULLSCAN || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY))
     {
         if (selected)
         {
@@ -1916,6 +1971,7 @@ static std::wstring BuildMinecraftPowerShellScript()
 
     script += LR"HCPS($ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+try{ if($PSCommandPath){ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } }catch{}
 function Out($s){[Console]::WriteLine([string]$s)}
 try{
     Out 'Команда: Remove-Module PSReadLine -Force'
@@ -2270,17 +2326,14 @@ while($true){
 
 static std::wstring GetHolyCheckerMinecraftScriptPath()
 {
-    wchar_t tempPath[MAX_PATH]{};
-    DWORD len = GetTempPathW(ARRAYSIZE(tempPath), tempPath);
-
-    if (len == 0 || len >= ARRAYSIZE(tempPath))
-        return L"HolyChecker_minecraft_check.ps1";
-
-    return CombinePath(tempPath, L"HolyChecker_minecraft_check.ps1");
+    std::wstring dir = CombinePath(GetHolyCheckTempRoot(), L"PowerShell");
+    EnsureDirectory(dir);
+    return CombinePath(dir, L"HolyChecker_minecraft_check_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L".ps1");
 }
 
 static void OpenPowerShellMinecraft()
 {
+    CleanupHolyCheckTempScriptsLocalEarly();
     std::wstring script = BuildMinecraftPowerShellScript();
     std::wstring scriptPath = GetHolyCheckerMinecraftScriptPath();
 
@@ -2305,9 +2358,15 @@ static void OpenPowerShellMinecraft()
     );
 
     if (reinterpret_cast<INT_PTR>(result) <= 32)
+    {
+        DeleteFileOrScheduleLocalEarly(scriptPath);
         PostLog(L"PowerShell не открыт: ошибка запуска");
+    }
     else
+    {
+        MoveFileExW(scriptPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         PostLog(L"PowerShell открыт: выберите путь для запуска check");
+    }
 }
 
 static void OpenCmdEnableServices()

@@ -1267,6 +1267,111 @@ static bool OpenPathElevated(const std::wstring& path)
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+
+static const wchar_t* GetEverythingCheatsQuery();
+
+static bool IsEverythingItem(const DownloadItem& item)
+{
+    std::wstring name = ToLower(item.name);
+    return name.find(L"everything") != std::wstring::npos;
+}
+
+static std::wstring QuotePowerShellSingleArgLocal(std::wstring value)
+{
+    std::wstring out;
+    for (wchar_t ch : value)
+        out += (ch == L'\'') ? L"''" : std::wstring(1, ch);
+    return out;
+}
+
+static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExplorerExe)
+{
+    if (registryExplorerExe.empty())
+        return false;
+
+    std::wstring exeDir;
+    size_t slash = registryExplorerExe.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        exeDir = registryExplorerExe.substr(0, slash);
+
+    std::wstring script;
+    script.reserve(8192);
+    script += L"$ErrorActionPreference='Stop'\n";
+    script += L"$exe='" + QuotePowerShellSingleArgLocal(registryExplorerExe) + L"'\n";
+    script += L"$dir='" + QuotePowerShellSingleArgLocal(exeDir) + L"'\n";
+    script += LR"HCPS(
+function Out($s){[Console]::WriteLine([string]$s)}
+$runtimeName='Microsoft.WindowsDesktop.App'
+$major='8'
+try{
+  $runtimeConfig=Get-ChildItem -LiteralPath $dir -Filter '*.runtimeconfig.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*RegistryExplorer*' } | Select-Object -First 1
+  if($runtimeConfig){
+    $json=Get-Content -LiteralPath $runtimeConfig.FullName -Raw | ConvertFrom-Json
+    $fx=@($json.runtimeOptions.frameworks)+@($json.runtimeOptions.framework) | Where-Object { $_ }
+    $desktop=$fx | Where-Object { $_.name -eq 'Microsoft.WindowsDesktop.App' } | Select-Object -First 1
+    if($desktop -and $desktop.version){ $major=([string]$desktop.version).Split('.')[0] }
+  }
+}catch{}
+try{
+  $runtimes=& dotnet --list-runtimes 2>$null
+  if($LASTEXITCODE -eq 0 -and ($runtimes -match ('^' + [regex]::Escape($runtimeName) + '\s+' + [regex]::Escape($major) + '\.'))){ Out 'runtime-ok'; exit 0 }
+}catch{}
+$temp=Join-Path ([IO.Path]::GetTempPath()) 'HolyCheck\RegistryExplorerRuntime'
+New-Item -ItemType Directory -Force -Path $temp | Out-Null
+$installer=Join-Path $temp ('windowsdesktop-runtime-' + $major + '.0-win-x64.exe')
+$url='https://aka.ms/dotnet/' + $major + '.0/windowsdesktop-runtime-win-x64.exe'
+Out ('runtime-missing: ' + $runtimeName + ' ' + $major + '.x')
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 120
+$sig=Get-AuthenticodeSignature -LiteralPath $installer
+if($sig.Status -ne 'Valid'){ throw 'Installer signature is not valid: ' + $sig.Status }
+$p=Start-Process -FilePath $installer -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+if($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010){ throw 'Installer exit code: ' + $p.ExitCode }
+Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+Out 'runtime-installed'
+)HCPS";
+
+    std::wstring output;
+    bool ok = RunHiddenPowerShellScriptCapture(script, output, 180000);
+    if (!ok)
+    {
+        PostLog(L"RegistryExplorer: не удалось проверить .NET Desktop Runtime");
+        return false;
+    }
+
+    std::wstring lower = ToLower(output);
+    if (lower.find(L"runtime-ok") != std::wstring::npos || lower.find(L"runtime-installed") != std::wstring::npos)
+        return true;
+
+    PostLog(L"RegistryExplorer: не удалось установить Microsoft.WindowsDesktop.App Runtime");
+    if (!output.empty())
+        DebugLogLine(L"registryexplorer", L"runtime output=" + output);
+    return false;
+}
+
+static bool OpenEverythingPath(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    std::wstring params = L"-search ";
+    params += QuoteProcessArgument(GetEverythingCheatsQuery());
+
+    HINSTANCE result = ShellExecuteW(
+        g_hMain,
+        L"open",
+        path.c_str(),
+        params.c_str(),
+        nullptr,
+        SW_SHOWNORMAL
+    );
+
+    bool ok = reinterpret_cast<INT_PTR>(result) > 32;
+    if (ok)
+        PostLog(L"Everything открыт с заполненным поиском");
+    return ok;
+}
+
 static bool ShouldOpenItemElevated(const DownloadItem& item)
 {
     std::wstring name = ToLower(item.name);
@@ -1278,6 +1383,12 @@ static bool ShouldOpenItemElevated(const DownloadItem& item)
 
 static bool OpenItemPath(const DownloadItem& item, const std::wstring& path)
 {
+    if (IsEverythingItem(item))
+        return OpenEverythingPath(path);
+
+    if (IsRegistryExplorerItem(item) && !EnsureRegistryExplorerDotNetRuntime(path))
+        return false;
+
     if (ShouldOpenItemElevated(item))
         return OpenPathElevated(path);
 
@@ -1328,7 +1439,13 @@ static void CopyHelperText(const wchar_t* text, const std::wstring& name)
         PostLog(L"текст не скопирован");
 }
 
-static const wchar_t* EVERYTHING_QUERY_1 = LR"HCEV1(ext:.exe;.jar;.zip;.rar regex:(impact|wurst|bleach[-_]?hack|aristois|huzuni|skill[-_]?client|nodus|inertia|ares|sigma|meteor|BetterHitReg|atomic|zamorozka|liquid[-_]?bounce|nurik|nursultan|celestial|calestial|celka|expensive|neverhook|excellent|wexside|wild|minced|deadcode|akrien|future|dreampool|vape|infinity|squad|no[-_]?rules|konas|zeus[-_]?client|rich[-_]?client|ghost[-_]?client|rusher[-_]?hack|thunder[-_]?hack|moon[-_]?hack|winner|nova|exire|doomsday|nightware|ricardo|extazyy|troxill|arbuz|dauntiblyat|rename[-_]?me[-_]?please|edit[-_]?me|takker|faker|xameleon|fuze[-_]?client|wise[-_]?folder|net[-_]?limiter|feather|delta|eclipse|venus|jex|hakari|hush|hach|rogalik|catlavan|haruka|wissend|fluger|sperma|vortex|newcode|astra|britva|bariton|bot|player|freecam|bedrock|hotbar|swap|chest|gumball|tweak|entity|crystal|lowdurabilityswitcher|optimizer|viabackwards|viaforge|viaproxy|hitbox|elytra|through|mob|auto|place|health|inventory|x[-_]?ray|clean[-_]?cut|smart[-_]?moving|save[-_]?searcher|world[-_]?downloader|trade[-_]?finder|chorus[-_]?find|inv[-_]?move|chunk[-_]?copy|seed[-_]?cracker|diamond[-_]?sim|forge[-_]?hax|step[-_]?up|client[-_]?commands|camera[-_]?utils|cheat[-_]?utils|universal[-_]?mod|swing[-_]?through[-_]?grass|Destra[-_]?Visuals|minimap))HCEV1";
+static const wchar_t* EVERYTHING_QUERY_1 = LR"HCEV1(ext:.exe;.jar;.zip;.rar regex:(impact|wurst|bleach[-*]?hack|aristois|huzuni|skill[-*]?client|nodus|inertia|ares|sigma|meteor|BetterHitReg|atomic|zamorozka|liquid[-*]?bounce|nurik|nursultan|celestial|calestial|celka|expensive|neverhook|excellent|wexside|wild|minced|deadcode|akrien|future|dreampool|vape|infinity|squad|no[-*]?rules|konas|zeus[-*]?client|rich[-*]?client|ghost[-*]?client|rusher[-*]?hack|thunder[-*]?hack|moon[-*]?hack|winner|nova|exire|doomsday|nightware|ricardo|extazyy|troxill|arbuz|dauntiblyat|rename[-*]?me[-*]?please|edit[-*]?me|takker|faker|xameleon|fuze[-*]?client|wise[-*]?folder|net[-*]?limiter|feather|delta|eclipse|venus|jex|hakari|hush|hach|rogalik|catlavan|haruka|wissend|fluger|sperma|vortex|newcode|astra|britva|bariton|bot|player|freecam|bedrock|hotbar|swap|chest|gumball|tweak|entity|crystal|lowdurabilityswitcher|optimizer|viabackwards|viaforge|viaproxy|hitbox|elytra|through|mob|auto|place|health|inventory|x[-*]?ray|clean[-*]?cut|smart[-*]?moving|save[-*]?searcher|world[-*]?downloader|trade[-*]?finder|chorus[-*]?find|inv[-*]?move|chunk[-*]?copy|seed[-*]?cracker|diamond[-*]?sim|forge[-*]?hax|step[-*]?up|client[-*]?commands|camera[-*]?utils|cheat[-*]?utils|universal[-*]?mod|swing[-*]?through[-*]?grass|Destra[-*]?Visuals|minimap))HCEV1";
+
+static const wchar_t* GetEverythingCheatsQuery()
+{
+    return EVERYTHING_QUERY_1;
+}
+
 
 static const wchar_t* EVERYTHING_QUERY_2 = LR"HCEV2(ext:.txt;.json;.toml;.yml;.cfg;.properties;.ini | folder: dm:last14days regex:(shellbag|bariton|bot|player|freecam|bedrock|hotbar|swap|chest|gumball|tweak|entity|crystal|optimizer|viabackwards|viaforge|viaproxy|hitbox|elytra|through|mob|auto|place|health|inventory|x[-_]?ray|clean[-_]?cut|smart[-_]?moving|save[-_]?searcher|world[-_]?downloader|trade[-_]?finder|chorus[-_]?find|inv[-_]?move|chunk[-_]?copy|seed[-_]?cracker|diamond[-_]?sim|forge[-_]?hax|step[-_]?up|client[-_]?commands|camera[-_]?utils|cheat[-_]?utils|universal[-_]?mod|swing[-_]?through[-_]?grass))HCEV2";
 

@@ -33,6 +33,7 @@
 #include <winevt.h>
 #include <wintrust.h>
 #include <softpub.h>
+#include <psapi.h>
 
 #include <string>
 #include <vector>
@@ -76,6 +77,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wevtapi.lib")
 #pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "psapi.lib")
 
 using namespace Gdiplus;
 
@@ -89,6 +91,7 @@ using namespace Gdiplus;
 #define IDC_COPY_EVERYTHING_2 2109
 #define IDC_COPY_POWERSHELL 2110
 #define IDC_COPY_SITES      2111
+#define IDC_REFRESH_BOOT    2116
 #define IDC_AUTOMATION_NAV  2112
 #define IDC_AUTOMATION_BAM  2113
 #define IDC_AUTOMATION_EVENTVWR 2114
@@ -250,6 +253,7 @@ HWND g_hCopyEverything1 = nullptr;
 HWND g_hCopyEverything2 = nullptr;
 HWND g_hCopyPowerShell = nullptr;
 HWND g_hCopySites = nullptr;
+HWND g_hRefreshBoot = nullptr;
 HWND g_hAutomationNav = nullptr;
 HWND g_hHomeNav = nullptr;
 HWND g_hAutomationBam = nullptr;
@@ -465,8 +469,8 @@ static const int AUTOMATION_BUTTON_W = 104;
 static const int AUTOMATION_BUTTON_H = 30;
 static const int AUTOMATION_PANEL_MIN_W = 520;
 static const int AUTOMATION_PANEL_H = 156;
-static const int AUTOMATION_SERVICE_PANEL_W = 220;
-static const int AUTOMATION_SERVICE_PANEL_H = 150;
+static const int AUTOMATION_SERVICE_PANEL_W = 360;
+static const int AUTOMATION_SERVICE_PANEL_H = 210;
 static const int AUTOMATION_SERVICE_PANEL_MARGIN = 24;
 static const size_t AUTOMATION_MAX_LINES = 5000;
 static const size_t AUTOMATION_VISIBLE_LINES = 10;

@@ -302,7 +302,6 @@ static bool IsLikelySystemExecutable(const std::wstring& path)
         return lower.find(needle) != std::wstring::npos;
     };
 
-    // Самый надёжный быстрый фильтр для этой утилиты: не хешировать каждый exe,
     // а не пропускать Windows/SystemRoot/WinSxS/WindowsApps/Microsoft системные пути.
     // Хеши без локальной базы эталонных системных хешей не дают 100% результата и сильно тормозят скан.
     if ((!winDir.empty() && (lower.rfind(winDir + L"\\", 0) == 0 || (!winLeafNeedle.empty() && lower.find(winLeafNeedle) != std::wstring::npos))) ||
@@ -366,7 +365,6 @@ static bool IsLikelySystemExecutable(const std::wstring& path)
             return true;
     }
 
-    // Дополнительные системные/служебные зоны. Это быстрее и надёжнее для live-скана,
     // чем хешировать каждый exe без локальной базы эталонных системных хешей.
     if (has(L"\\program files\\microsoft\\") ||
         has(L"\\program files (x86)\\microsoft\\") ||
@@ -1106,7 +1104,7 @@ static size_t GetAutomationVisibleLineCapacity(int target)
     else if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY)
         panel = GetDllActivityPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
-        panel = GetPage5InjGenPanelRect(rc);
+        SetRectEmpty(&panel);
     else
         panel = GetAutomationBamPanelRect(rc);
 
@@ -1321,7 +1319,7 @@ static RECT GetAutomationPanelRectForTarget(int target, const RECT& rc)
     if (target == AUTOMATION_OUTPUT_PAGE4) return (g_currentPage == 1) ? GetAutomationBamPanelRect(rc) : GetPage4PanelRect(rc);
     if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED) return GetDllUnsignedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY) return GetDllActivityPanelRect(rc);
-    if (target == AUTOMATION_OUTPUT_INJGEN) return GetPage5InjGenPanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_INJGEN) { RECT empty{}; return empty; }
     return GetAutomationBamPanelRect(rc);
 }
 
@@ -1403,14 +1401,11 @@ static int AutomationScrollTargetAtPoint(POINT pt)
     int targetsPage1[] = { AUTOMATION_OUTPUT_PAGE4, AUTOMATION_OUTPUT_EVENTVWR };
     int targetsPage2[] = { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_DLL_ACTIVITY, AUTOMATION_OUTPUT_DLL_UNSIGNED };
     int targetsPage3[] = { AUTOMATION_OUTPUT_PAGE4 };
-    int targetsPage4[] = { AUTOMATION_OUTPUT_INJGEN };
-
     const int* targets = nullptr;
     int count = 0;
     if (g_currentPage == 1) { targets = targetsPage1; count = 2; }
     else if (g_currentPage == 2) { targets = targetsPage2; count = 3; }
     else if (g_currentPage == 3) { targets = targetsPage3; count = 1; }
-    else if (g_currentPage == 4) { targets = targetsPage4; count = 1; }
 
     for (int i = 0; i < count; ++i)
     {
@@ -1451,7 +1446,7 @@ static void InvalidateAutomationPanel(int target)
     else if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY)
         panel = GetDllActivityPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
-        panel = GetPage5InjGenPanelRect(rc);
+        SetRectEmpty(&panel);
     else
         panel = GetAutomationBamPanelRect(rc);
     InflateRect(&panel, 10, 10);
@@ -2234,18 +2229,92 @@ static bool WriteUtf16LeTextFileLocal(const std::wstring& path, const std::wstri
     return ok != FALSE;
 }
 
-static std::wstring MakeAutomationTempPs1Path(const wchar_t* prefix)
+static bool EnsureDirectoryLocalEarly(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return true;
+
+    int r = SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
+    attr = GetFileAttributesW(path.c_str());
+    return r == ERROR_SUCCESS || r == ERROR_ALREADY_EXISTS ||
+        (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+static std::wstring CombinePathLocalEarly(const std::wstring& a, const std::wstring& b)
+{
+    if (a.empty())
+        return b;
+    if (b.empty())
+        return a;
+    if (b.size() >= 2 && b[1] == L':')
+        return b;
+    if (b[0] == L'\\' || b[0] == L'/')
+        return b;
+
+    std::wstring out = a;
+    if (!out.empty() && out.back() != L'\\' && out.back() != L'/')
+        out.push_back(L'\\');
+    out += b;
+    return out;
+}
+
+static std::wstring GetHolyCheckTempRoot()
 {
     wchar_t tempDir[MAX_PATH]{};
     DWORD len = GetTempPathW(ARRAYSIZE(tempDir), tempDir);
-    std::wstring dir = (len > 0 && len < ARRAYSIZE(tempDir)) ? std::wstring(tempDir, len) : L"C:\\Windows\\Temp\\";
-    if (!dir.empty() && dir.back() != L'\\')
-        dir.push_back(L'\\');
-    return dir + prefix + L"_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount()) + L".ps1";
+    std::wstring root = (len > 0 && len < ARRAYSIZE(tempDir)) ? std::wstring(tempDir, len) : L"C:\\Windows\\Temp\\";
+    if (!root.empty() && root.back() != L'\\')
+        root.push_back(L'\\');
+    root += L"HolyCheck";
+    EnsureDirectoryLocalEarly(root);
+    return root;
+}
+
+static std::wstring MakeAutomationTempPs1Path(const wchar_t* prefix)
+{
+    std::wstring dir = CombinePathLocalEarly(GetHolyCheckTempRoot(), L"Automation");
+    EnsureDirectoryLocalEarly(dir);
+    return CombinePathLocalEarly(dir, std::wstring(prefix ? prefix : L"script") + L"_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L".ps1");
+}
+
+static void DeleteFileOrScheduleLocalEarly(const std::wstring& path)
+{
+    if (path.empty())
+        return;
+    if (!DeleteFileW(path.c_str()) && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+static void CleanupHolyCheckTempScriptsLocalEarly()
+{
+    std::wstring root = GetHolyCheckTempRoot();
+    const wchar_t* subdirs[] = { L"Automation", L"PowerShell" };
+    for (const wchar_t* sub : subdirs)
+    {
+        std::wstring dir = CombinePathLocalEarly(root, sub);
+        std::wstring mask = CombinePathLocalEarly(dir, L"*.ps1");
+        WIN32_FIND_DATAW data{};
+        HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
+        if (hFind == INVALID_HANDLE_VALUE)
+            continue;
+        do
+        {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                DeleteFileOrScheduleLocalEarly(CombinePathLocalEarly(dir, data.cFileName));
+        }
+        while (FindNextFileW(hFind, &data));
+        FindClose(hFind);
+    }
 }
 
 static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::wstring& output, DWORD timeoutMs)
 {
+    CleanupHolyCheckTempScriptsLocalEarly();
     std::wstring ps1 = MakeAutomationTempPs1Path(L"holycheck_scan");
     DebugLogLine(L"powershell", L"write ps1=" + ps1 + L" chars=" + std::to_wstring(script.size()) + L" timeout=" + std::to_wstring(timeoutMs));
     if (!WriteUtf16LeTextFileLocal(ps1, script))
@@ -2273,14 +2342,8 @@ static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::ws
     DebugLogLine(L"powershell", L"finish ok=" + std::to_wstring(ok ? 1 : 0) +
         L" timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
         L" exit=" + std::to_wstring(g_lastHiddenProcessExitCode) + L" outputChars=" + std::to_wstring(output.size()));
-    if (g_lastHiddenProcessTimedOut)
-    {
-        DebugLogLine(L"powershell", L"timeout: temp script kept for debugging: " + ps1);
-    }
-    else
-    {
-        DeleteFileW(ps1.c_str());
-    }
+    DeleteFileOrScheduleLocalEarly(ps1);
+    CleanupHolyCheckTempScriptsLocalEarly();
     return ok;
 }
 
@@ -2674,8 +2737,6 @@ static bool ContainsExtensionToken(const std::wstring& text, const std::wstring&
 
     if (lowerExt == L".jar")
     {
-        // Для .jar activity показываем только настоящие .jar-файлы.
-        // Временные загрузки вроде mod.jar.download больше не проходят фильтр.
         if (name.size() < 4)
             return false;
         return name.compare(name.size() - 4, 4, L".jar") == 0;
@@ -4926,22 +4987,7 @@ function Find7Zip(){
   try{$cmd=Get-Command 7z.exe -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
   return $null
 }
-$cheatJarNames=@(
-  "akrien", "ares", "aristois", "armor hotswap", "arbuz", "atomic", "autoattack", "aimbot", "autoclicky",
-  "bedrock breaker mode", "bleachhack", "BetterHitReg",
-  "calestial", "celestial", "celka", "chunk copy", "clean cut", "clientcommands", "clickcrystals", "crystal optimizer", "camerautils", "chest", "cutthrough",
-  "dauntiblyat", "deadcode", "delta", "diamond sim", "doomsday", "double hotbar", "dreampool", "Destra Visuals",
-  "eclipse", "elytra swap", "elytra hack", "entity outliner", "entity xray", "expensive", "exire", "extazyy",
-  "feather client", "forge hax", "freecam", "future", "fuzeclient",
-  "hakari", "hush", "huzuni", "hach",
-  "impact", "infinity", "inertia", "invmove", "inventory walk", "inventory profiles next", "invtweaks", "inventorysorter",
-  "jex", "konas", "librarian trade finder", "liquidbounce", "lowdurabilityswitcher",
-  "meteor", "minced", "mobhitbox", "mobhealthbar", "moonhack", "neverhook", "nightware", "nodus", "nova", "nurik", "nursultan", "nemo's inventory",
-  "ricardo", "richclient", "rogalik", "rusherhack",
-  "sacurachorusfind", "save searcher", "seed cracker", "sigma", "skill client", "smart moving", "squad", "step up", "swingthroughgrass", "showinginvisibleplayers",
-  "takker", "thunderhack", "topkaautobuy", "troxill", "tweakeroo", "topkaautodrop", "tool swap", "torohealth",
-  "vape", "venus", "viaforge", "viabackwards", "viaproxy", "worlddownloader", "xray", "zamorozka"
-)
+$cheatJarNames=@()
 function NormName([string]$s){ return (([IO.Path]::GetFileNameWithoutExtension($s)).ToLowerInvariant() -replace '[^a-z0-9]+','') }
 function VersionAtLeast2530([int]$maj,[int]$min,[int]$patch){
   if($maj -gt 25){return $true}
@@ -4956,16 +5002,76 @@ function IsBadXaeroMinimap([string]$name){
   $base=([IO.Path]::GetFileNameWithoutExtension($name)).ToLowerInvariant()
   if($base -notmatch '(xaeros?[\s_\.-]*minimap|xaerominimap)'){return $false}
 
-  # Xaero's Minimap filenames often contain both the Minecraft version and the mod version:
   #   xaerominimap-fabric-26.1.2-25.3.14.jar
-  # Here 26.1.2 is the game version, so check the last semantic version in the filename.
   $matches=[regex]::Matches($base, '(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)')
   if($matches.Count -le 0){return $false}
   $m=$matches[$matches.Count-1]
   return (VersionAtLeast2530 ([int]$m.Groups[1].Value) ([int]$m.Groups[2].Value) ([int]$m.Groups[3].Value))
 }
 $cheatKeys=New-Object System.Collections.Generic.List[string]
-foreach($n in $cheatJarNames){ $k=NormName ($n + '.jar'); if(-not [string]::IsNullOrWhiteSpace($k) -and -not $cheatKeys.Contains($k)){ $cheatKeys.Add($k) } }
+function AddRedName([string]$value){
+  if([string]::IsNullOrWhiteSpace($value)){return}
+  $k=NormName ($value + '.jar')
+  if(-not [string]::IsNullOrWhiteSpace($k) -and $k.Length -ge 3 -and -not $script:cheatKeys.Contains($k)){ $script:cheatKeys.Add($k) }
+}
+function AddRedNamesFromText([string]$text){
+  if([string]::IsNullOrWhiteSpace($text)){return}
+  $t=$text -replace '<script[\s\S]*?</script>',' ' -replace '<style[\s\S]*?</style>',' ' -replace '<[^>]+>',' '
+  foreach($m in [regex]::Matches($t,'[A-Za-z0-9][A-Za-z0-9_\.\- ]{1,63}[A-Za-z0-9]')){
+    $v=([string]$m.Value).Trim()
+    if($v.Length -ge 3 -and $v.Length -le 64){ AddRedName $v }
+  }
+}
+function AddRedNamesFromSource([string]$source){
+  if([string]::IsNullOrWhiteSpace($source)){return}
+  try{
+    if($source -match '^https?://'){
+      $headers=@{'User-Agent'='HolyCheck/1.0';'Cache-Control'='no-cache';'Pragma'='no-cache'}
+      if($source -match 'gist\.githubusercontent\.com/[^/]+/([0-9a-fA-F]+)/raw'){
+        try{
+          $api='https://api.github.com/gists/' + $matches[1] + '?t=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $g=Invoke-RestMethod -Uri $api -UseBasicParsing -TimeoutSec 10 -Headers $headers
+          foreach($file in $g.files.PSObject.Properties){
+            if($file.Value -and $file.Value.content){ AddRedNamesFromText ([string]$file.Value.content) }
+          }
+          return
+        }catch{}
+      }
+      $sep=if($source.Contains('?')){'&'}else{'?'}
+      $url=$source + $sep + 't=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      $r=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -Headers $headers
+      AddRedNamesFromText ([string]$r.Content)
+    }elseif(Test-Path -LiteralPath $source){
+      AddRedNamesFromText (Get-Content -LiteralPath $source -Raw -ErrorAction SilentlyContinue)
+    }
+  }catch{}
+}
+function LoadRemoteRedNames(){
+  foreach($n in $cheatJarNames){ AddRedName $n }
+  $sources=New-Object System.Collections.Generic.List[string]
+  [void]$sources.Add('https://gist.githubusercontent.com/IOPODL/8487494183e47a7e9d66c93a9a54efb0/raw/rednames.txt')
+  foreach($v in @($env:HOLYCHECK_CHECKMODS_RED_URL,$env:HOLYCHECK_CHECKMODS_RED_URLS)){
+    if(-not [string]::IsNullOrWhiteSpace($v)){
+      foreach($x in ($v -split '[;,]')){ if(-not [string]::IsNullOrWhiteSpace($x)){ [void]$sources.Add($x.Trim()) } }
+    }
+  }
+  $cfg=@()
+  try{ if(-not [string]::IsNullOrWhiteSpace($script:HolyCheckSelfExe)){ $cfg += (Join-Path ([IO.Path]::GetDirectoryName($script:HolyCheckSelfExe)) 'checkmods_red_sources.txt') } }catch{}
+  try{ $cfg += (Join-Path $env:APPDATA 'HolyCheck\checkmods_red_sources.txt') }catch{}
+  try{ $cfg += (Join-Path $env:ProgramData 'HolyCheck\checkmods_red_sources.txt') }catch{}
+  foreach($file in $cfg){
+    try{
+      if(Test-Path -LiteralPath $file){
+        foreach($line in @(Get-Content -LiteralPath $file -ErrorAction SilentlyContinue)){
+          $x=([string]$line).Trim()
+          if($x.Length -gt 0 -and -not $x.StartsWith('#')){ [void]$sources.Add($x) }
+        }
+      }
+    }catch{}
+  }
+  foreach($src in @($sources)){ AddRedNamesFromSource $src }
+}
+LoadRemoteRedNames
 function IsCheatJarName([string]$name){
   if([string]::IsNullOrWhiteSpace($name)){return $false}
   if([IO.Path]::GetExtension($name).ToLowerInvariant() -ne '.jar'){return $false}
@@ -5263,6 +5369,13 @@ function ArchiveIsEncryptedOrUnreadable([string]$path,[string]$ext){
   }
   return $false
 }
+function ShouldSkipHugeArchive([System.IO.FileInfo]$a){
+  try{
+    if($null -eq $a){return $true}
+    if($a.Length -gt 805306368){ HCLog ('huge archive skipped (>768MB): ' + $a.FullName); return $true }
+  }catch{}
+  return $false
+}
 function ZipContainsCurrentHolyCheckExe([string]$path){
   HCLog ('zip self-exe scan disabled, using name-only HolyCheck release cleanup: ' + $path)
   return $false
@@ -5337,13 +5450,11 @@ function CheckHolyArchiveAndDelete([System.IO.FileInfo]$a){
   }catch{HCLog ('holycheck release archive cleanup error: ' + $a.FullName + ' error=' + $_.Exception.Message)}
 }
 try{
-  $holyArchiveCandidates=@{}
-  foreach($a in @($downloadArchives.Values)){ if($a -and (IsHolyCheckReleaseArchiveName $a.Name)){ $holyArchiveCandidates[(PathKey $a.FullName)]=$a } }
-  HCLog ('holycheck release archive cleanup begin candidates=' + $holyArchiveCandidates.Values.Count + ' downloadDesktop=' + $downloadArchives.Values.Count + ' scanArchives=' + $archives.Values.Count + ' mode=name-only')
-  foreach($a in @($holyArchiveCandidates.Values)){ CheckHolyArchiveAndDelete $a }
+  HCLog ('holycheck archive cleanup skipped in checkmods; delete is button-only')
   HCLog ('embedded jar archive scan begin count=' + $archives.Values.Count)
   foreach($a in @($archives.Values)){
     if($null -eq $a){continue}
+    if(ShouldSkipHugeArchive $a){continue}
     if(-not (Test-Path -LiteralPath $a.FullName)){ HCLog ('embedded jar archive missing after self cleanup skip: ' + $a.FullName); continue }
     $ext=[IO.Path]::GetExtension($a.FullName).ToLowerInvariant()
     HCLog ('embedded jar archive scan: ' + $a.FullName)
@@ -5387,7 +5498,7 @@ try{
   try{$sha256.Dispose()}catch{}
   HCLog ('archive phase done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count + '; cleanupHits=' + $cleanupHits.Count)
 }
-if($items.Count -eq 0 -and $nameHits.Count -eq 0 -and $cleanupHits.Count -eq 0){HCLog 'no items/hits after archive phase, exit'; 'mods not found'; exit}
+if($items.Count -eq 0 -and $nameHits.Count -eq 0){HCLog 'no items/hits after archive phase, exit'; 'mods not found'; exit}
 $known=@{}
 HCLog ('modrinth lookup begin count=' + $items.Count)
 for($i=0;$i -lt $items.Count;$i+=100){
@@ -5410,7 +5521,6 @@ function FormatFoundModLine([string]$name,[string]$path,[bool]$forbiddenName){
   return ($prefix + ('{0} | {1}' -f $name,$path))
 }
 $bad=0
-foreach($it in $cleanupHits){ $bad++; FormatFoundModLine $it.Name $it.Path $true }
 foreach($it in $nameHits){ $bad++; FormatFoundModLine $it.Name $it.Path $true }
 foreach($it in $items){
   if(-not $known.ContainsKey($it.Hash)){
@@ -5422,7 +5532,7 @@ foreach($it in $items){
     }
   }
 }
-HCLog ('finish bad=' + $bad + '; known=' + $known.Count + '; cleanupHits=' + $cleanupHits.Count + '; nameHits=' + $nameHits.Count + '; items=' + $items.Count)
+HCLog ('finish bad=' + $bad + '; known=' + $known.Count + '; nameHits=' + $nameHits.Count + '; items=' + $items.Count)
 if($bad -eq 0){'не найдено'}
 )HCPS";
 

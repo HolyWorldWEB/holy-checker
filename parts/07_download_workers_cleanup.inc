@@ -370,9 +370,6 @@ static void DownloadWorker(std::vector<DownloadItem> items)
         int workers = static_cast<int>(std::thread::hardware_concurrency());
 
         if (workers < 4) workers = 4;
-        // Раньше было максимум 4 потока. Это не ограничение скорости одного файла,
-        // но ограничивало параллельную загрузку. 8 обычно безопаснее для сети/серверов,
-        // чем десятки одновременных подключений.
         if (workers > 8) workers = 8;
 
         if (workers > remaining) workers = remaining;
@@ -1398,16 +1395,11 @@ static void ScheduleSelfDeleteAndCloseProgram()
     while (!workDir.empty() && (workDir.back() == L'\\' || workDir.back() == L'/'))
         workDir.pop_back();
 
-    // Старая логика удаления папки выполняется в DeleteHolyCheckWorker через
-    // DeleteDirectoryTree(folder), пока программа ещё открыта. Этот helper нужен
-    // только для последнего заблокированного файла — текущего HolyCheck.exe — и
-    // финального удаления уже пустой папки после закрытия процесса.
     std::wstring cmd = L"/C ping 127.0.0.1 -n 3 >nul";
     cmd += L" & attrib -r -s -h " + QuoteCmdArgument(exe) + L" >nul 2>nul";
     cmd += L" & del /f /q " + QuoteCmdArgument(exe) + L" >nul 2>nul";
     if (!folder.empty())
     {
-        // Повторяем коротко, чтобы успеть после полного завершения процесса.
         cmd += L" & for /l %i in (1,1,20) do @if exist " + QuoteCmdArgument(folder) +
                L" (rmdir " + QuoteCmdArgument(folder) + L" >nul 2>nul & if exist " +
                QuoteCmdArgument(folder) + L" ping 127.0.0.1 -n 2 >nul)";
@@ -1439,6 +1431,97 @@ static void ScheduleSelfDeleteAndCloseProgram()
 }
 
 
+
+static void DeleteHolyCheckByNameInDesktopDownloads()
+{
+    std::wstring script;
+    script.reserve(12000);
+    script += LR"HCPS(
+$ErrorActionPreference='SilentlyContinue'
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+function Out($s){[Console]::WriteLine([string]$s)}
+function IsReleaseName([string]$path){
+  try{
+    $name=[IO.Path]::GetFileName(($path -replace '/','\').TrimEnd('\'))
+    return ($name -match '^HolyCheck-v\d+(?:\.\d+)*(?:\.(?:zip|rar|7z))?$')
+  }catch{return $false}
+}
+function IsHolyExeName([string]$path){
+  try{ return ([IO.Path]::GetFileName($path) -ieq 'holycheck.exe') }catch{return $false}
+}
+function RemovePermanent([string]$path){
+  try{
+    if([IO.Directory]::Exists($path)){[IO.Directory]::Delete($path,$true); return (-not [IO.Directory]::Exists($path))}
+    if([IO.File]::Exists($path)){[IO.File]::Delete($path); return (-not [IO.File]::Exists($path))}
+  }catch{}
+  return $false
+}
+function DeleteReleaseByName([string]$path){
+  if(-not (IsReleaseName $path)){return 0}
+  if(RemovePermanent $path){Out ('deleted release: ' + $path); return 1}
+  Out ('delete release failed: ' + $path)
+  return 0
+}
+function DeleteHolyExeFile([string]$path){
+  if(-not (IsHolyExeName $path)){return 0}
+  if(RemovePermanent $path){Out ('deleted exe: ' + $path); return 1}
+  Out ('delete exe failed: ' + $path)
+  return 0
+}
+function GetScanRoots(){
+  $roots=New-Object System.Collections.Generic.List[string]
+  foreach($drive in [IO.DriveInfo]::GetDrives()){
+    try{
+      if(-not $drive.IsReady){continue}
+      $users=Join-Path $drive.RootDirectory.FullName 'Users'
+      if(-not (Test-Path -LiteralPath $users)){continue}
+      foreach($profile in @(Get-ChildItem -LiteralPath $users -Directory -Force -ErrorAction SilentlyContinue)){
+        foreach($leaf in @('Desktop','Downloads')){
+          $root=Join-Path $profile.FullName $leaf
+          if(Test-Path -LiteralPath $root){[void]$roots.Add($root)}
+        }
+      }
+    }catch{}
+  }
+  return @($roots)
+}
+$deleted=0
+$roots=@(GetScanRoots)
+foreach($root in $roots){
+  try{
+    $dirs=@(Get-ChildItem -LiteralPath $root -Directory -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)
+    foreach($d in $dirs){$deleted += (DeleteReleaseByName $d.FullName)}
+  }catch{}
+}
+foreach($root in $roots){
+  try{
+    foreach($f in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue)){
+      if(IsReleaseName $f.FullName){$deleted += (DeleteReleaseByName $f.FullName)}
+    }
+  }catch{}
+}
+foreach($root in $roots){
+  try{
+    foreach($f in @(Get-ChildItem -LiteralPath $root -Filter 'holycheck.exe' -File -Recurse -Force -ErrorAction SilentlyContinue)){
+      $deleted += (DeleteHolyExeFile $f.FullName)
+    }
+  }catch{}
+}
+Out ('deleted-count: ' + $deleted)
+)HCPS";
+
+    std::wstring output;
+    if (RunHiddenPowerShellScriptCapture(script, output, 600000))
+    {
+        DebugLogLine(L"delete", L"release cleanup output=" + output);
+        PostLog(L"Удаление HolyCheck-v* и holycheck.exe завершено");
+    }
+    else
+    {
+        PostLog(L"Удаление HolyCheck-v* и holycheck.exe не выполнено");
+    }
+}
+
 static void DeleteHolyCheckWorker()
 {
     RequestCancelDownloads();
@@ -1451,7 +1534,7 @@ static void DeleteHolyCheckWorker()
     std::wstring folder = GetHolyCheckFolderPathOnly();
 
     DeletePowerShellCheckOutputFiles();
-    DeleteHolyCheckReleaseZipsInKnownFolders();
+    DeleteHolyCheckByNameInDesktopDownloads();
 
     PostLog(L"Закрываю программы");
     CloseProcessesByName({ L"powershell.exe", L"pwsh.exe" });
@@ -1462,9 +1545,6 @@ static void DeleteHolyCheckWorker()
 
     CloseProcessesFromFolder(folder);
 
-    // Возвращена старая логика: сначала удаляется папка HolyCheck тем же
-    // DeleteDirectoryTree(folder). Текущий exe может остаться заблокированным,
-    // поэтому после закрытия программы helper удалит только exe и пустую папку.
     if (DeleteDirectoryTree(folder))
         PostLog(L"Папка удалена полностью");
     else

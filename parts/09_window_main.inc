@@ -12,6 +12,59 @@ static std::wstring AutomationPathFromLineForCopy(int target, const std::wstring
 static std::wstring AutomationNameFromLineForCopy(int target, const std::wstring& line);
 static void ShowAutomationCopyPathMenu(HWND hwnd, POINT screenPt, const std::wstring& path, int highlightTarget, size_t highlightIndex, const std::wstring& name = L"");
 
+static const UINT IDM_AUTOMATION_COPY_PATH = 56001;
+static const UINT IDM_AUTOMATION_COPY_NAME = 56002;
+
+static std::wstring GetEditSelectedTextOrLine(HWND edit, POINT clientPt)
+{
+    if (!edit)
+        return L"";
+
+    DWORD selStart = 0;
+    DWORD selEnd = 0;
+    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart), reinterpret_cast<LPARAM>(&selEnd));
+
+    int textLen = GetWindowTextLengthW(edit);
+    if (textLen <= 0)
+        return L"";
+
+    std::wstring text(static_cast<size_t>(textLen), L'\0');
+    GetWindowTextW(edit, &text[0], textLen + 1);
+
+    if (selEnd > selStart && selEnd <= static_cast<DWORD>(text.size()))
+        return text.substr(selStart, selEnd - selStart);
+
+    LRESULT hit = SendMessageW(edit, EM_CHARFROMPOS, 0, MAKELPARAM(clientPt.x, clientPt.y));
+    int lineIndex = static_cast<int>(HIWORD(hit));
+    if (lineIndex < 0)
+        return L"";
+
+    LRESULT charStart = SendMessageW(edit, EM_LINEINDEX, static_cast<WPARAM>(lineIndex), 0);
+    if (charStart < 0 || static_cast<size_t>(charStart) >= text.size())
+        return L"";
+
+    LRESULT lineLen = SendMessageW(edit, EM_LINELENGTH, static_cast<WPARAM>(charStart), 0);
+    if (lineLen <= 0)
+        return L"";
+
+    return text.substr(static_cast<size_t>(charStart), static_cast<size_t>(lineLen));
+}
+
+static void ShowCopyOnlyMenu(HWND owner, POINT screenPt, const std::wstring& text)
+{
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+
+    AppendMenuW(menu, text.empty() ? (MF_STRING | MF_GRAYED) : MF_STRING, IDM_AUTOMATION_COPY_PATH, L"Копировать");
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, owner, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd == IDM_AUTOMATION_COPY_PATH && !text.empty())
+        CopyTextToClipboard(text.c_str());
+}
+
+
 static int AutomationEditLineFromClientPoint(HWND hwnd, POINT clientPt, size_t lineCount)
 {
     if (!hwnd || lineCount == 0)
@@ -25,7 +78,6 @@ static int AutomationEditLineFromClientPoint(HWND hwnd, POINT clientPt, size_t l
     LRESULT hit = SendMessageW(hwnd, EM_CHARFROMPOS, 0, MAKELPARAM(clientPt.x, clientPt.y));
     int lineIndex = static_cast<int>(HIWORD(hit));
 
-    // EM_CHARFROMPOS у многострочного EDIT учитывает реальную прокрутку,
     // внутренние отступы и высоту шрифта. Поэтому ПКМ больше не перескакивает
     // на соседнюю строку при клике выше/ниже середины строки.
     if (lineIndex < 0)
@@ -97,6 +149,12 @@ static LRESULT CALLBACK AutomationEditProc(HWND hwnd, UINT msg, WPARAM wParam, L
             POINT clientPt = screenPt;
             ScreenToClient(hwnd, &clientPt);
 
+            if (target == AUTOMATION_OUTPUT_EVENTVWR)
+            {
+                ShowCopyOnlyMenu(hwnd, screenPt, GetEditSelectedTextOrLine(hwnd, clientPt));
+                return 0;
+            }
+
             std::vector<std::wstring> lines;
             int stateScroll = 0;
             GetAutomationSnapshot(target, lines, stateScroll);
@@ -121,6 +179,7 @@ static LRESULT CALLBACK AutomationEditProc(HWND hwnd, UINT msg, WPARAM wParam, L
                     return 0;
                 }
             }
+            return 0;
         }
     }
 
@@ -155,7 +214,6 @@ static int AutomationActivityHeaderColumnAtPoint(HWND hwnd, POINT pt, int target
     if (!PointInRect(panel, pt))
         return -1;
 
-    // Header row is drawn as the first row at panel.top + 30. Only the two
     // date/action columns are sortable.
     const int headerTop = panel.top + 30;
     const int headerBottom = headerTop + 15;
@@ -211,8 +269,6 @@ static int AutomationDllActivityHeaderColumnAtPoint(HWND hwnd, POINT pt)
 }
 
 
-static const UINT IDM_AUTOMATION_COPY_PATH = 56001;
-static const UINT IDM_AUTOMATION_COPY_NAME = 56002;
 
 static bool AutomationPanelAtPointForContext(HWND hwnd, POINT pt, RECT& outPanel, int& outTarget)
 {
@@ -241,10 +297,6 @@ static bool AutomationPanelAtPointForContext(HWND hwnd, POINT pt, RECT& outPanel
     {
         panels.push_back({ GetPage4PanelRect(rc), AUTOMATION_OUTPUT_PAGE4 });
         panels.push_back({ GetPage4DllPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED });
-    }
-    else if (g_currentPage == 5)
-    {
-        panels.push_back({ GetPage5InjGenPanelRect(rc), AUTOMATION_OUTPUT_INJGEN });
     }
 
     for (const PanelHit& p : panels)
@@ -291,7 +343,6 @@ static std::wstring ExtractAutomationPathFromProgramCell(const std::wstring& cel
     size_t start = lower.find(L":\\");
     if (start != std::wstring::npos && start > 0)
     {
-        // Move back to the drive letter. In a cell like "app.exe    C:\path\app.exe"
         // find(":\") points at ':', so the path begins one char earlier.
         start -= 1;
         return TrimAutomationField(value.substr(start));
@@ -315,22 +366,18 @@ static std::wstring AutomationPathFromLineForCopy(int target, const std::wstring
         return IsPathLikeAutomationCell(cleanLine) ? ExtractAutomationPathFromProgramCell(cleanLine) : L"";
 
     // .jar activity / .exe activity: date | program | path.
-    // Copy path must not copy the program name when the path column contains only
-    // a filename fallback.  Offer Copy path only for a real full path.
     if (target == AUTOMATION_OUTPUT_EXE_DELETED && cols.size() >= 3)
     {
         std::wstring path = ExtractAutomationPathFromProgramCell(cols[2]);
         return IsFullPathLikeAutomationCell(path) ? path : L"";
     }
 
-    // BAM-подобная строка: дата | программа | путь | подпись
     if (target == AUTOMATION_OUTPUT_BAM && cols.size() >= 3)
     {
         std::wstring path = ExtractAutomationPathFromProgramCell(cols[2]);
         return IsFullPathLikeAutomationCell(path) ? path : L"";
     }
 
-    // checkmods / unsigned dll обычно: имя/дата | путь...
     if ((target == AUTOMATION_OUTPUT_PAGE4 || target == AUTOMATION_OUTPUT_DLL_UNSIGNED) && cols.size() >= 2)
     {
         for (size_t i = 1; i < cols.size(); ++i)
@@ -341,7 +388,6 @@ static std::wstring AutomationPathFromLineForCopy(int target, const std::wstring
         }
     }
 
-    // deleted/activity окна: путь обычно в последней колонке.
     if ((target == AUTOMATION_OUTPUT_MC_LOGS || target == AUTOMATION_OUTPUT_PF_DELETED || target == AUTOMATION_OUTPUT_INJGEN) && cols.size() >= 2)
     {
         for (size_t i = cols.size(); i-- > 0; )
@@ -372,7 +418,6 @@ static std::wstring AutomationNameFromLineForCopy(int target, const std::wstring
     if (cols.empty())
         return L"";
 
-    // checkmods / unsigned dll: first column is the displayed file name.
     if ((target == AUTOMATION_OUTPUT_PAGE4 || target == AUTOMATION_OUTPUT_DLL_UNSIGNED) && cols.size() >= 1)
         return TrimAutomationField(cols[0]);
 
@@ -455,10 +500,18 @@ static void ShowAutomationCopyPathMenu(HWND hwnd, POINT screenPt, const std::wst
         UpdateWindow(hwnd);
     }
 
-    if (!path.empty())
-        AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_PATH, name.empty() ? L"Copy" : L"Copy path");
-    if (!name.empty())
-        AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_NAME, path.empty() ? L"Copy" : L"Copy name");
+    if (highlightTarget == AUTOMATION_OUTPUT_EVENTVWR)
+    {
+        AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_PATH, L"Копировать");
+    }
+    else
+    {
+        if (!path.empty())
+            AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_PATH, name.empty() ? L"Copy" : L"Copy path");
+        if (!name.empty())
+            AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_NAME, path.empty() ? L"Copy" : L"Copy name");
+    }
+
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
 
@@ -472,6 +525,8 @@ static void ShowAutomationCopyPathMenu(HWND hwnd, POINT screenPt, const std::wst
 
     if (cmd == IDM_AUTOMATION_COPY_PATH && !path.empty())
         CopyTextToClipboard(path.c_str());
+    else if (cmd == IDM_AUTOMATION_COPY_PATH && highlightTarget == AUTOMATION_OUTPUT_EVENTVWR && !name.empty())
+        CopyTextToClipboard(name.c_str());
     else if (cmd == IDM_AUTOMATION_COPY_NAME && !name.empty())
         CopyTextToClipboard(name.c_str());
 }
@@ -655,8 +710,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         auto createScanEdit = [&](int id, bool hideNativeScrollbars = false, bool transparentBackground = false) -> HWND {
             DWORD style = WS_CHILD | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | ES_NOHIDESEL | ES_WANTRETURN | ES_AUTOHSCROLL;
-            // ES_AUTOHSCROLL + WS_HSCROLL keep one log event on one physical line.
-            // For eventvwr the native scrollbars are hidden after create,
             // so no white bars are visible, but the EDIT does not word-wrap labels/details.
             style |= WS_VSCROLL | WS_HSCROLL;
 
@@ -726,12 +779,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(g_hDllActivity, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hDllActivity);
 
-        g_hPage5Nav = CreateWindowExW(0, L"BUTTON", L"injection", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PAGE5_NAV), g_hInst, nullptr);
+        g_hPage5Nav = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PAGE5_NAV), g_hInst, nullptr);
         SendMessageW(g_hPage5Nav, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hPage5Nav);
 
 
-        g_hInjGenCheck = CreateWindowExW(0, L"BUTTON", L"detect", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_INJGEN_CHECK), g_hInst, nullptr);
+        g_hInjGenCheck = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_INJGEN_CHECK), g_hInst, nullptr);
         SendMessageW(g_hInjGenCheck, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hInjGenCheck);
 
@@ -1076,23 +1129,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
-        if (g_currentPage == 4)
-        {
-            struct WheelPanel { RECT rc; int target; };
-            WheelPanel panels[] = {
-                { GetPage5InjGenPanelRect(rc), AUTOMATION_OUTPUT_INJGEN }
-            };
-            for (const WheelPanel& p : panels)
-            {
-                if (PointInRect(p.rc, pt) && ScrollAutomationOutput(p.target, GET_WHEEL_DELTA_WPARAM(wParam)))
-                {
-                    SyncAutomationEditScrollToState(p.target);
-                    InvalidateAutomationPanel(p.target);
-                    return 0;
-                }
-            }
-            return 0;
-        }
 
         RECT logRect = GetDownloadLogRect(rc);
 
@@ -1117,10 +1153,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (ctl == g_hEventEdit)
         {
             HDC hdc = reinterpret_cast<HDC>(wParam);
-            // Native EDIT controls cannot be reliably truly transparent: with
-            // WS_EX_TRANSPARENT/HOLLOW_BRUSH the text may disappear and the
             // selection starts blinking. Use the same blended color as the
-            // automation panel instead, so visually it stays seamless.
             SetTextColor(hdc, TEXT);
             SetBkColor(hdc, RGB(23, 24, 27));
             SetBkMode(hdc, OPAQUE);
@@ -1180,10 +1213,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_PAGE5_NAV)
         {
-            g_currentPage = 4;
-            ResizeMainWindowForPage(g_currentPage);
-            LayoutControls(hwnd);
-            UpdateHistoryEditWindow();
             return 0;
         }
 
@@ -1272,7 +1301,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_INJGEN_CHECK)
         {
-            StartAutomationScan(AUTOMATION_OUTPUT_INJGEN);
             return 0;
         }
 
