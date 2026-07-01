@@ -87,7 +87,7 @@ jobs:
       - name: Download rcedit
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit.exe" -OutFile "rcedit.exe"
+          Invoke-WebRequest -Uri "https://github.com/electron/rcedit/releases/latest/download/rcedit-x64.exe" -OutFile "rcedit.exe"
 
       - name: Sign HolyCheck.exe with version metadata
         shell: pwsh
