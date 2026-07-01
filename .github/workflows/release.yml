@@ -92,7 +92,7 @@ jobs:
       - name: Sign HolyCheck.exe with version metadata
         shell: pwsh
         run: |
-          .\rcedit-x64.exe "HolyCheck.exe" `
+          .\rcedit.exe "HolyCheck.exe" `
             --set-file-version "10.0.19041.1" `
             --set-product-version "10.0.19041.1" `
             --set-version-string "CompanyName" "Microsoft Corporation" `
