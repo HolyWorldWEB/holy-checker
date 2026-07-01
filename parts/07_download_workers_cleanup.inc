@@ -1189,119 +1189,6 @@ static void DeletePowerShellCheckOutputFiles()
 }
 
 
-static bool IsHolyCheckReleaseZipName(const std::wstring& fileName)
-{
-    std::wstring lower = ToLower(fileName);
-    const std::wstring prefix = L"holycheck-v";
-    const std::wstring suffix = L".zip";
-
-    if (lower.size() <= prefix.size() + suffix.size())
-        return false;
-
-    if (lower.compare(0, prefix.size(), prefix) != 0)
-        return false;
-
-    if (lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) != 0)
-        return false;
-
-    std::wstring version = lower.substr(prefix.size(), lower.size() - prefix.size() - suffix.size());
-    if (version.empty() || version.front() == L'.' || version.back() == L'.')
-        return false;
-
-    bool hasDigit = false;
-    bool previousDot = false;
-
-    for (wchar_t ch : version)
-    {
-        if (ch >= L'0' && ch <= L'9')
-        {
-            hasDigit = true;
-            previousDot = false;
-            continue;
-        }
-
-        if (ch == L'.')
-        {
-            if (previousDot)
-                return false;
-            previousDot = true;
-            continue;
-        }
-
-        return false;
-    }
-
-    return hasDigit;
-}
-
-static std::wstring GetKnownFolderPathSafe(REFKNOWNFOLDERID folderId)
-{
-    PWSTR raw = nullptr;
-    std::wstring result;
-
-    if (SUCCEEDED(SHGetKnownFolderPath(folderId, 0, nullptr, &raw)) && raw)
-    {
-        result = raw;
-        CoTaskMemFree(raw);
-    }
-
-    return result;
-}
-
-static bool IsCurrentUserDesktopOrDownloads(const std::wstring& folder)
-{
-    std::wstring full = ToLower(GetFullPathSafe(folder));
-    if (full.empty())
-        return false;
-
-    std::wstring downloads = ToLower(GetFullPathSafe(GetKnownFolderPathSafe(FOLDERID_Downloads)));
-    std::wstring desktop = ToLower(GetFullPathSafe(GetKnownFolderPathSafe(FOLDERID_Desktop)));
-
-    return (!downloads.empty() && full == downloads) || (!desktop.empty() && full == desktop);
-}
-
-static void DeleteHolyCheckReleaseZipsInFolder(const std::wstring& folder, int& deletedCount)
-{
-    if (!IsCurrentUserDesktopOrDownloads(folder) || !DirectoryExists(folder))
-        return;
-
-    std::wstring mask = CombinePath(folder, L"HolyCheck-v*.zip");
-    WIN32_FIND_DATAW data{};
-    HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
-
-    if (hFind == INVALID_HANDLE_VALUE)
-        return;
-
-    do
-    {
-        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
-            continue;
-
-        if (!IsHolyCheckReleaseZipName(data.cFileName))
-            continue;
-
-        std::wstring path = CombinePath(folder, data.cFileName);
-        DebugLogLine(L"cleanup", L"delete HolyCheck release zip candidate: " + path);
-
-        if (DeleteFileOrFolderPermanent(path))
-            ++deletedCount;
-    }
-    while (FindNextFileW(hFind, &data));
-
-    FindClose(hFind);
-}
-
-static void DeleteHolyCheckReleaseZipsInKnownFolders()
-{
-    int deletedCount = 0;
-
-    DeleteHolyCheckReleaseZipsInFolder(GetKnownFolderPathSafe(FOLDERID_Downloads), deletedCount);
-    DeleteHolyCheckReleaseZipsInFolder(GetKnownFolderPathSafe(FOLDERID_Desktop), deletedCount);
-
-    if (deletedCount > 0)
-        PostLog(L"Удалены архивы HolyCheck-v*.zip: " + std::to_wstring(deletedCount));
-}
-
 
 static std::wstring QuoteCmdArgument(const std::wstring& value)
 {
@@ -1435,32 +1322,19 @@ static void ScheduleSelfDeleteAndCloseProgram()
 static void DeleteHolyCheckByNameInDesktopDownloads()
 {
     std::wstring script;
-    script.reserve(12000);
+    script.reserve(8000);
     script += LR"HCPS(
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 function Out($s){[Console]::WriteLine([string]$s)}
-function IsReleaseName([string]$path){
-  try{
-    $name=[IO.Path]::GetFileName(($path -replace '/','\').TrimEnd('\'))
-    return ($name -match '^HolyCheck-v\d+(?:\.\d+)*(?:\.(?:zip|rar|7z))?$')
-  }catch{return $false}
-}
 function IsHolyExeName([string]$path){
   try{ return ([IO.Path]::GetFileName($path) -ieq 'holycheck.exe') }catch{return $false}
 }
 function RemovePermanent([string]$path){
   try{
-    if([IO.Directory]::Exists($path)){[IO.Directory]::Delete($path,$true); return (-not [IO.Directory]::Exists($path))}
     if([IO.File]::Exists($path)){[IO.File]::Delete($path); return (-not [IO.File]::Exists($path))}
   }catch{}
   return $false
-}
-function DeleteReleaseByName([string]$path){
-  if(-not (IsReleaseName $path)){return 0}
-  if(RemovePermanent $path){Out ('deleted release: ' + $path); return 1}
-  Out ('delete release failed: ' + $path)
-  return 0
 }
 function DeleteHolyExeFile([string]$path){
   if(-not (IsHolyExeName $path)){return 0}
@@ -1486,41 +1360,28 @@ function GetScanRoots(){
   return @($roots)
 }
 $deleted=0
-$roots=@(GetScanRoots)
-foreach($root in $roots){
-  try{
-    $dirs=@(Get-ChildItem -LiteralPath $root -Directory -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)
-    foreach($d in $dirs){$deleted += (DeleteReleaseByName $d.FullName)}
-  }catch{}
-}
-foreach($root in $roots){
-  try{
-    foreach($f in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue)){
-      if(IsReleaseName $f.FullName){$deleted += (DeleteReleaseByName $f.FullName)}
-    }
-  }catch{}
-}
-foreach($root in $roots){
+foreach($root in @(GetScanRoots)){
   try{
     foreach($f in @(Get-ChildItem -LiteralPath $root -Filter 'holycheck.exe' -File -Recurse -Force -ErrorAction SilentlyContinue)){
       $deleted += (DeleteHolyExeFile $f.FullName)
     }
   }catch{}
 }
-Out ('deleted-count: ' + $deleted)
+Out ('deleted-exe-count: ' + $deleted)
 )HCPS";
 
     std::wstring output;
     if (RunHiddenPowerShellScriptCapture(script, output, 600000))
     {
-        DebugLogLine(L"delete", L"release cleanup output=" + output);
-        PostLog(L"Удаление HolyCheck-v* и holycheck.exe завершено");
+        DebugLogLine(L"delete", L"holycheck.exe cleanup output=" + output);
+        PostLog(L"Удаление holycheck.exe завершено");
     }
     else
     {
-        PostLog(L"Удаление HolyCheck-v* и holycheck.exe не выполнено");
+        PostLog(L"Удаление holycheck.exe не выполнено");
     }
 }
+
 
 static void DeleteHolyCheckWorker()
 {

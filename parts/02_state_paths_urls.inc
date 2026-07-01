@@ -2211,7 +2211,7 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
 
 static bool WriteUtf16LeTextFileLocal(const std::wstring& path, const std::wstring& text)
 {
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
         return false;
 
@@ -2278,8 +2278,14 @@ static std::wstring MakeAutomationTempPs1Path(const wchar_t* prefix)
 {
     std::wstring dir = CombinePathLocalEarly(GetHolyCheckTempRoot(), L"Automation");
     EnsureDirectoryLocalEarly(dir);
+
+    // Important: keep the generated file name simple and without spaces.
+    // PowerShell is launched with -File and Windows PowerShell 5.1 is less forgiving
+    // when another scan deletes/replaces the temporary .ps1 between creation and launch.
     return CombinePathLocalEarly(dir, std::wstring(prefix ? prefix : L"script") + L"_" +
-        std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L".ps1");
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetCurrentThreadId()) + L"_" +
+        std::to_wstring(GetTickCount64()) + L".ps1");
 }
 
 static void DeleteFileOrScheduleLocalEarly(const std::wstring& path)
@@ -2290,7 +2296,25 @@ static void DeleteFileOrScheduleLocalEarly(const std::wstring& path)
         MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 
-static void CleanupHolyCheckTempScriptsLocalEarly()
+static bool IsTempScriptOldEnoughToCleanupLocalEarly(const std::wstring& path, ULONGLONG minAgeMs)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+
+    FILETIME nowFt{};
+    GetSystemTimeAsFileTime(&nowFt);
+
+    ULONGLONG now = FileTimeToUInt64(nowFt);
+    ULONGLONG written = FileTimeToUInt64(data.ftLastWriteTime);
+    if (now <= written)
+        return false;
+
+    ULONGLONG ageMs = (now - written) / 10000ULL;
+    return ageMs >= minAgeMs;
+}
+
+static void CleanupHolyCheckTempScriptsLocalEarly(ULONGLONG minAgeMs = 10ULL * 60ULL * 1000ULL)
 {
     std::wstring root = GetHolyCheckTempRoot();
     const wchar_t* subdirs[] = { L"Automation", L"PowerShell" };
@@ -2304,48 +2328,126 @@ static void CleanupHolyCheckTempScriptsLocalEarly()
             continue;
         do
         {
-            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                DeleteFileOrScheduleLocalEarly(CombinePathLocalEarly(dir, data.cFileName));
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+
+            std::wstring candidate = CombinePathLocalEarly(dir, data.cFileName);
+            if (IsTempScriptOldEnoughToCleanupLocalEarly(candidate, minAgeMs))
+                DeleteFileOrScheduleLocalEarly(candidate);
         }
         while (FindNextFileW(hFind, &data));
         FindClose(hFind);
     }
 }
 
+static std::wstring NormalizeExistingPathForPowerShellLocalEarly(const std::wstring& path)
+{
+    if (path.empty())
+        return path;
+
+    std::vector<wchar_t> buffer(32768);
+    DWORD len = GetLongPathNameW(path.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (len > 0 && len < buffer.size())
+        return std::wstring(buffer.data(), len);
+
+    return path;
+}
+
+static bool LooksLikeMissingPowerShellFileErrorLocalEarly(const std::wstring& output)
+{
+    std::wstring lower = ToLowerCopy(output);
+    return lower.find(L"-file") != std::wstring::npos &&
+        (lower.find(L"не существует") != std::wstring::npos ||
+            lower.find(L"does not exist") != std::wstring::npos ||
+            lower.find(L"cannot find") != std::wstring::npos ||
+            lower.find(L"could not find") != std::wstring::npos);
+}
+
 static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::wstring& output, DWORD timeoutMs)
 {
+    static std::mutex s_powerShellScriptMutex;
+    std::lock_guard<std::mutex> psLock(s_powerShellScriptMutex);
+
     CleanupHolyCheckTempScriptsLocalEarly();
-    std::wstring ps1 = MakeAutomationTempPs1Path(L"holycheck_scan");
-    DebugLogLine(L"powershell", L"write ps1=" + ps1 + L" chars=" + std::to_wstring(script.size()) + L" timeout=" + std::to_wstring(timeoutMs));
-    if (!WriteUtf16LeTextFileLocal(ps1, script))
+
+    bool lastOk = false;
+    std::wstring lastOutput;
+
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        DebugLogLine(L"powershell", L"write ps1 failed path=" + ps1 + L" error=" + FormatWin32ErrorForLog(GetLastError()));
-        return false;
+        std::wstring ps1 = MakeAutomationTempPs1Path(L"holycheck_scan");
+        DebugLogLine(L"powershell", L"write ps1=" + ps1 + L" chars=" + std::to_wstring(script.size()) +
+            L" timeout=" + std::to_wstring(timeoutMs) + L" attempt=" + std::to_wstring(attempt + 1));
+
+        if (!WriteUtf16LeTextFileLocal(ps1, script))
+        {
+            DebugLogLine(L"powershell", L"write ps1 failed path=" + ps1 + L" error=" + FormatWin32ErrorForLog(GetLastError()));
+            output = lastOutput;
+            return false;
+        }
+
+        if (GetFileAttributesW(ps1.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            DebugLogLine(L"powershell", L"write ps1 verification failed path=" + ps1 + L" error=" + FormatWin32ErrorForLog(GetLastError()));
+            output = lastOutput;
+            return false;
+        }
+
+        std::wstring launchPs1 = NormalizeExistingPathForPowerShellLocalEarly(ps1);
+        if (GetFileAttributesW(launchPs1.c_str()) == INVALID_FILE_ATTRIBUTES)
+            launchPs1 = ps1;
+
+        std::wstring psExe = L"powershell.exe";
+        wchar_t winDir[MAX_PATH]{};
+        UINT winLen = GetWindowsDirectoryW(winDir, ARRAYSIZE(winDir));
+        if (winLen > 0 && winLen < ARRAYSIZE(winDir))
+        {
+            std::wstring sysnative = std::wstring(winDir) + L"\\Sysnative\\WindowsPowerShell\\v1.0\\powershell.exe";
+            std::wstring system32 = std::wstring(winDir) + L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+            if (PathFileExistsW(sysnative.c_str()))
+                psExe = sysnative;
+            else if (PathFileExistsW(system32.c_str()))
+                psExe = system32;
+        }
+
+        std::wstring args;
+        args.reserve(96 + launchPs1.size());
+        args.assign(L"-NoLogo -NoProfile -ExecutionPolicy Bypass -File ");
+        args.append(QuoteShellArgument(launchPs1));
+        DebugLogLine(L"powershell", L"launch exe=" + psExe + L" args=" + args + L" ps1=" + launchPs1 + L" attempt=" + std::to_wstring(attempt + 1));
+
+        std::wstring attemptOutput;
+        bool ok = RunHiddenProcessCapture(psExe, args, attemptOutput, timeoutMs);
+        lastOk = ok;
+        lastOutput = attemptOutput;
+
+        DebugLogLine(L"powershell", L"finish ok=" + std::to_wstring(ok ? 1 : 0) +
+            L" timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
+            L" exit=" + std::to_wstring(g_lastHiddenProcessExitCode) +
+            L" outputChars=" + std::to_wstring(attemptOutput.size()) +
+            L" attempt=" + std::to_wstring(attempt + 1));
+
+        DeleteFileOrScheduleLocalEarly(ps1);
+
+        // If an external cleanup/AV race removed the .ps1 right before PowerShell opened it,
+        // PowerShell returns exactly the visible error from checkmods. Retry once with a fresh name.
+        if (LooksLikeMissingPowerShellFileErrorLocalEarly(attemptOutput) && attempt == 0)
+        {
+            DebugLogLine(L"powershell", L"missing -File ps1 detected, retrying once");
+            Sleep(80);
+            continue;
+        }
+
+        output = attemptOutput;
+        CleanupHolyCheckTempScriptsLocalEarly();
+        return ok;
     }
 
-    std::wstring psExe = L"powershell.exe";
-    wchar_t winDir[MAX_PATH]{};
-    UINT winLen = GetWindowsDirectoryW(winDir, ARRAYSIZE(winDir));
-    if (winLen > 0 && winLen < ARRAYSIZE(winDir))
-    {
-        std::wstring sysnative = std::wstring(winDir) + L"\\Sysnative\\WindowsPowerShell\\v1.0\\powershell.exe";
-        std::wstring system32 = std::wstring(winDir) + L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-        if (PathFileExistsW(sysnative.c_str()))
-            psExe = sysnative;
-        else if (PathFileExistsW(system32.c_str()))
-            psExe = system32;
-    }
-
-    std::wstring args = L"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"" + ps1 + L"\"";
-    DebugLogLine(L"powershell", L"launch exe=" + psExe + L" ps1=" + ps1);
-    bool ok = RunHiddenProcessCapture(psExe, args, output, timeoutMs);
-    DebugLogLine(L"powershell", L"finish ok=" + std::to_wstring(ok ? 1 : 0) +
-        L" timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
-        L" exit=" + std::to_wstring(g_lastHiddenProcessExitCode) + L" outputChars=" + std::to_wstring(output.size()));
-    DeleteFileOrScheduleLocalEarly(ps1);
+    output = lastOutput;
     CleanupHolyCheckTempScriptsLocalEarly();
-    return ok;
+    return lastOk;
 }
+
 
 static std::wstring TrimAutomationField(std::wstring value)
 {
@@ -3323,6 +3425,25 @@ static void AddJarSearchRootIfExists(std::vector<std::wstring>& roots, const std
     roots.push_back(clean);
 }
 
+static bool IsLunarDependenciesPathForCheckmods(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    std::wstring lower = ToLowerCopy(path);
+    for (wchar_t& ch : lower)
+    {
+        if (ch == L'/')
+            ch = L'\\';
+    }
+
+    bool underLunarProfiles = lower.find(L"\\.lunarclient\\profiles\\") != std::wstring::npos;
+    bool insideDependencies = lower.find(L"\\dependencies\\") != std::wstring::npos ||
+        (lower.size() >= 13 && lower.compare(lower.size() - 13, 13, L"\\dependencies") == 0);
+    return underLunarProfiles && insideDependencies;
+}
+
+
 static void SearchJarModificationRecursive(const std::wstring& root, const std::wstring& lowerName, int depth, int& visited, ULONGLONG& bestTime, std::wstring& bestText, std::wstring& bestPath)
 {
     if (root.empty() || depth < 0 || visited > 14000)
@@ -3341,6 +3462,9 @@ static void SearchJarModificationRecursive(const std::wstring& root, const std::
             continue;
 
         std::wstring full = root + L"\\" + name;
+        if (IsLunarDependenciesPathForCheckmods(full))
+            continue;
+
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
         {
             std::wstring lowerDir = ToLowerCopy(name);
@@ -4918,9 +5042,15 @@ function IsExcludedSystemPath([string]$p){
   if($x -match '\\ProgramData\\(Microsoft|Package Cache)(\\|$)'){return $true}
   return $false
 }
+function IsLunarDependenciesPath([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){return $false}
+  $x=($p -replace '/','\')
+  return ($x -match '\\\.lunarclient\\profiles\\' -and $x -match '\\dependencies(\\|$)')
+}
 function IsAllowedPath([string]$p){
   if([string]::IsNullOrWhiteSpace($p)){return $false}
   if(IsExcludedSystemPath $p){return $false}
+  if(IsLunarDependenciesPath $p){return $false}
   if($p -match '\\(jdk|jre|java|javapath|libraries|assets|runtime|versions)\\'){return $false}
   if($p -match '\\.minecraft\\(libraries|assets|runtime|versions)\\'){return $false}
   if($p -match '\\.tlauncher\\legacy\\Minecraft\\game\\(libraries|assets|runtime|versions)\\'){return $false}
@@ -4928,6 +5058,7 @@ function IsAllowedPath([string]$p){
 }
 function ShouldSkipDirectory([string]$p){
   if(IsExcludedSystemPath $p){return $true}
+  if(IsLunarDependenciesPath $p){return $true}
   try{
     $leaf=[IO.Path]::GetFileName(($p -replace '/','\').TrimEnd('\'))
     if($leaf -in @('Windows','Program Files','Program Files (x86)','ProgramData','$Recycle.Bin','System Volume Information','Recovery','WinSxS','Installer')){return $true}
@@ -4944,13 +5075,11 @@ function IsCandidateExtension([string]$ext){
 function EnumerateCandidateFiles([string]$root){
   if([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)){return}
   HCLog ('enumerate start: ' + $root + ' fullscan=' + $script:HolyCheckFullScan)
-  if(-not $script:HolyCheckFullScan){
-    try{
-      Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { (IsCandidateExtension $_.Extension) -and (IsAllowedPath $_.FullName) }
-    }catch{}
-    return
-  }
 
+  # scan и fullscan отличаются только списком корней:
+  # scan получает только заранее добавленные папки из программы,
+  # fullscan дополнительно получает корни дисков. Сам обход один и тот же,
+  # чтобы обычный scan случайно не уходил за пределы папок через junction/symlink.
   $stack=New-Object System.Collections.Generic.Stack[string]
   $dirSeen=@{}
   try{[void]$stack.Push((Resolve-Path -LiteralPath $root -ErrorAction Stop).Path)}catch{ HCLog ('enumerate resolve failed: ' + $root + ' error=' + $_.Exception.Message); return}
@@ -5346,10 +5475,10 @@ function HashFileSha256Hex([string]$path){
 }
 function InitHolyCheckSelfHash(){
   if(-not [string]::IsNullOrWhiteSpace($script:HolyCheckSelfSha256)){return $true}
-  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfExe)){ HCLog 'self exe path empty; archive self cleanup disabled'; return $false }
-  if(-not (Test-Path -LiteralPath $script:HolyCheckSelfExe)){ HCLog ('self exe missing; archive self cleanup disabled: ' + $script:HolyCheckSelfExe); return $false }
+  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfExe)){ HCLog 'self exe path empty; self-exe archive check disabled'; return $false }
+  if(-not (Test-Path -LiteralPath $script:HolyCheckSelfExe)){ HCLog ('self exe missing; self-exe archive check disabled: ' + $script:HolyCheckSelfExe); return $false }
   $script:HolyCheckSelfSha256=HashFileSha256Hex $script:HolyCheckSelfExe
-  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfSha256)){ HCLog ('self sha256 unavailable; archive self cleanup disabled: ' + $script:HolyCheckSelfExe); return $false }
+  if([string]::IsNullOrWhiteSpace($script:HolyCheckSelfSha256)){ HCLog ('self sha256 unavailable; self-exe archive check disabled: ' + $script:HolyCheckSelfExe); return $false }
   HCLog ('self sha256=' + $script:HolyCheckSelfSha256 + ' exe=' + $script:HolyCheckSelfExe)
   return $true
 }
@@ -5377,7 +5506,7 @@ function ShouldSkipHugeArchive([System.IO.FileInfo]$a){
   return $false
 }
 function ZipContainsCurrentHolyCheckExe([string]$path){
-  HCLog ('zip self-exe scan disabled, using name-only HolyCheck release cleanup: ' + $path)
+  HCLog ('zip self-exe archive scan disabled: ' + $path)
   return $false
 }
 function Invoke7ZipExtractExesSafe([string]$archive,[string]$outDir){
@@ -5416,42 +5545,11 @@ function Invoke7ZipExtractExesSafe([string]$archive,[string]$outDir){
   }
 }
 function SevenZipContainsCurrentHolyCheckExe([string]$path){
-  HCLog ('7z/rar self-exe scan disabled, using name-only HolyCheck release cleanup: ' + $path)
+  HCLog ('7z/rar self-exe archive scan disabled: ' + $path)
   return $false
 }
-function TryDeleteHolyArchive([string]$path){
-  HCLog ('self archive delete attempt: ' + $path)
-  try{
-    [IO.File]::Delete($path)
-    if(Test-Path -LiteralPath $path){ HCLog ('self archive delete failed still exists: ' + $path); AddCleanupHit 'holycheck archive delete failed' $path }
-    else{ HCLog ('self archive deleted: ' + $path); AddCleanupHit 'holycheck archive deleted' $path }
-  }catch{
-    $msg=$_.Exception.Message
-    if($msg.Length -gt 90){$msg=$msg.Substring(0,90)}
-    HCLog ('self archive delete exception: ' + $path + ' error=' + $msg)
-    AddCleanupHit ('holycheck archive delete failed: ' + $msg) $path
-  }
-}
-function IsHolyCheckReleaseArchiveName([string]$name){
-  if([string]::IsNullOrWhiteSpace($name)){return $false}
-  $leaf=[IO.Path]::GetFileName($name)
-  return ($leaf -match '^HolyCheck-v\d+(?:\.\d+)*\.zip$')
-}
-function CheckHolyArchiveAndDelete([System.IO.FileInfo]$a){
-  try{
-    if($null -eq $a){return}
-    if(-not (Test-Path -LiteralPath $a.FullName)){ HCLog ('holycheck release archive already missing skip: ' + $a.FullName); return }
-    if(IsHolyCheckReleaseArchiveName $a.Name){
-      HCLog ('holycheck release archive matched by name: ' + $a.FullName)
-      TryDeleteHolyArchive $a.FullName
-    }else{
-      HCLog ('holycheck release archive name skip: ' + $a.FullName)
-    }
-  }catch{HCLog ('holycheck release archive cleanup error: ' + $a.FullName + ' error=' + $_.Exception.Message)}
-}
 try{
-  HCLog ('holycheck archive cleanup skipped in checkmods; delete is button-only')
-  HCLog ('embedded jar archive scan begin count=' + $archives.Values.Count)
+    HCLog ('embedded jar archive scan begin count=' + $archives.Values.Count)
   foreach($a in @($archives.Values)){
     if($null -eq $a){continue}
     if(ShouldSkipHugeArchive $a){continue}
