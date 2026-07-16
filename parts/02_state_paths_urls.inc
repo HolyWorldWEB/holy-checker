@@ -5176,7 +5176,6 @@ function AddRedNamesFromSource([string]$source){
   }catch{}
 }
 function LoadRemoteRedNames(){
-  foreach($n in $cheatJarNames){ AddRedName $n }
   $sources=New-Object System.Collections.Generic.List[string]
   [void]$sources.Add('https://gist.githubusercontent.com/IOPODL/8487494183e47a7e9d66c93a9a54efb0/raw/rednames.txt')
   foreach($v in @($env:HOLYCHECK_CHECKMODS_RED_URL,$env:HOLYCHECK_CHECKMODS_RED_URLS)){
@@ -5204,7 +5203,6 @@ LoadRemoteRedNames
 function IsCheatJarName([string]$name){
   if([string]::IsNullOrWhiteSpace($name)){return $false}
   if([IO.Path]::GetExtension($name).ToLowerInvariant() -ne '.jar'){return $false}
-  if(IsBadXaeroMinimap $name){return $true}
   $n=NormName $name
   foreach($k in $script:cheatKeys){ if($n.Contains($k)){ return $true } }
   return $false

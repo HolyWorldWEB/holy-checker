@@ -1284,6 +1284,150 @@ static std::wstring QuotePowerShellSingleArgLocal(std::wstring value)
     return out;
 }
 
+static bool ReadWholeFileNarrowLocal(const std::wstring& path, std::string& out)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 8 * 1024 * 1024)
+    {
+        CloseHandle(h);
+        return false;
+    }
+
+    out.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    bool ok = ReadFile(h, &out[0], static_cast<DWORD>(out.size()), &read, nullptr) != 0;
+    CloseHandle(h);
+    if (!ok)
+        return false;
+
+    out.resize(read);
+    return true;
+}
+
+static int ParseRegistryExplorerDesktopMajor(const std::wstring& exeDir)
+{
+    int major = 8;
+
+    std::wstring mask = CombinePath(exeDir, L"*.runtimeconfig.json");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(mask.c_str(), &fd);
+    std::wstring chosen;
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+
+            std::wstring name = ToLower(fd.cFileName);
+            if (name.find(L"registryexplorer") != std::wstring::npos)
+            {
+                chosen = fd.cFileName;
+                break;
+            }
+
+            if (chosen.empty())
+                chosen = fd.cFileName;
+        } while (FindNextFileW(h, &fd));
+
+        FindClose(h);
+    }
+
+    if (chosen.empty())
+        return major;
+
+    std::string json;
+    if (!ReadWholeFileNarrowLocal(CombinePath(exeDir, chosen), json))
+        return major;
+
+    size_t pos = json.find("Microsoft.WindowsDesktop.App");
+    if (pos == std::string::npos)
+        return major;
+
+    size_t vpos = json.find("version", pos);
+    if (vpos == std::string::npos)
+        return major;
+
+    size_t i = vpos + 7;
+    while (i < json.size() && (json[i] < '0' || json[i] > '9'))
+        ++i;
+
+    int parsed = 0;
+    bool any = false;
+    while (i < json.size() && json[i] >= '0' && json[i] <= '9')
+    {
+        parsed = parsed * 10 + (json[i] - '0');
+        any = true;
+        ++i;
+    }
+
+    if (any && parsed > 0)
+        major = parsed;
+
+    return major;
+}
+
+static bool DesktopRuntimeDirHasMajor(const std::wstring& sharedDir, int major)
+{
+    std::wstring mask = CombinePath(sharedDir, L"*");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(mask.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    bool found = false;
+    do
+    {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+        if (_wtoi(fd.cFileName) == major)
+        {
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+    return found;
+}
+
+static bool IsWindowsDesktopRuntimeInstalledNative(int major)
+{
+    if (major <= 0)
+        return false;
+
+    std::vector<std::wstring> roots;
+
+    auto addEnvRoot = [&](const wchar_t* env, const wchar_t* rel)
+    {
+        wchar_t base[MAX_PATH * 4]{};
+        DWORD len = GetEnvironmentVariableW(env, base, ARRAYSIZE(base));
+        if (len > 0 && len < ARRAYSIZE(base))
+            roots.push_back(CombinePath(base, rel));
+    };
+
+    addEnvRoot(L"ProgramW6432", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
+    addEnvRoot(L"ProgramFiles", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
+    addEnvRoot(L"ProgramFiles(x86)", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
+    addEnvRoot(L"DOTNET_ROOT", L"shared\\Microsoft.WindowsDesktop.App");
+    roots.push_back(L"C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App");
+
+    for (const std::wstring& root : roots)
+    {
+        if (DesktopRuntimeDirHasMajor(root, major))
+            return true;
+    }
+
+    return false;
+}
+
 static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExplorerExe)
 {
     if (registryExplorerExe.empty())
@@ -1293,6 +1437,12 @@ static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExpl
     size_t slash = registryExplorerExe.find_last_of(L"\\/");
     if (slash != std::wstring::npos)
         exeDir = registryExplorerExe.substr(0, slash);
+
+    // Fast path: if the required .NET Desktop Runtime is already installed, skip the
+    // slow PowerShell probe and let Registry Explorer open immediately.
+    int requiredMajor = ParseRegistryExplorerDesktopMajor(exeDir);
+    if (IsWindowsDesktopRuntimeInstalledNative(requiredMajor))
+        return true;
 
     std::wstring script;
     script.reserve(8192);
@@ -1381,8 +1531,78 @@ static bool ShouldOpenItemElevated(const DownloadItem& item)
         name.find(L"recuva") != std::wstring::npos;
 }
 
+static bool InstallSystemInformerSilent(const std::wstring& setupPath)
+{
+    if (setupPath.empty())
+        return false;
+
+    // System Informer's setup executable supports silent command-line switches,
+    // so no installer window ever appears.
+    std::wstring params = L"-install -silent";
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = g_hMain;
+    sei.lpVerb = L"runas";
+    sei.lpFile = setupPath.c_str();
+    sei.lpParameters = params.c_str();
+    sei.nShow = SW_HIDE;
+
+    if (!ShellExecuteExW(&sei))
+        return false;
+
+    bool ok = true;
+    if (sei.hProcess)
+    {
+        WaitForSingleObject(sei.hProcess, 300000);
+        DWORD code = 0;
+        if (GetExitCodeProcess(sei.hProcess, &code))
+            ok = (code == 0 || code == 3010);
+        CloseHandle(sei.hProcess);
+    }
+
+    return ok;
+}
+
+static bool OpenSystemInformerItem(const std::wstring& path)
+{
+    // If System Informer is already installed, just launch it.
+    std::wstring installed = FindInstalledSystemInformerPath();
+    if (!installed.empty())
+        return OpenPath(installed);
+
+    std::wstring lower = ToLower(path);
+    bool looksLikeInstaller = lower.find(L"setup") != std::wstring::npos ||
+        lower.find(L"install") != std::wstring::npos;
+
+    if (looksLikeInstaller)
+    {
+        PostLog(L"System Informer: тихая установка...");
+        if (InstallSystemInformerSilent(path))
+        {
+            installed = FindInstalledSystemInformerPath();
+            if (!installed.empty())
+            {
+                PostLog(L"System Informer установлен, запускаю");
+                return OpenPath(installed);
+            }
+
+            PostLog(L"System Informer установлен");
+            return true;
+        }
+
+        PostLog(L"System Informer: тихая установка не удалась, открываю установщик");
+    }
+
+    return OpenPath(path);
+}
+
 static bool OpenItemPath(const DownloadItem& item, const std::wstring& path)
 {
+    if (IsSystemInformerItem(item))
+        return OpenSystemInformerItem(path);
+
     if (IsEverythingItem(item))
         return OpenEverythingPath(path);
 
@@ -2190,68 +2410,179 @@ static std::vector<DownloadMethodChoice> GetOptimizedProblemMethods(const Downlo
     return uniqueMethods;
 }
 
+// ---------------------------------------------------------------------------
+// Program downloads now run "like a browser" in the background using the URLMon
+// engine (the same download stack Internet Explorer / Edge legacy use). This
+// removes the PowerShell / curl / BITS code paths that produced errors and
+// keeps everything silent and window-less.
+// ---------------------------------------------------------------------------
+class BrowserDownloadCallback : public IBindStatusCallback
+{
+public:
+    BrowserDownloadCallback(std::wstring name, size_t linkIndex, size_t linkTotal)
+        : m_name(std::move(name)), m_linkIndex(linkIndex), m_linkTotal(linkTotal)
+    {
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv)
+            return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback)
+        {
+            *ppv = static_cast<IBindStatusCallback*>(this);
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPriority(LONG*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE OnProgress(ULONG ulProgress, ULONG ulProgressMax, ULONG, LPCWSTR) override
+    {
+        UNREFERENCED_PARAMETER(ulProgressMax);
+        if (IsCancelRequested())
+            return E_ABORT;
+
+        ULONGLONG nowTick = GetTickCount64();
+        if (m_startTick == 0)
+        {
+            m_startTick = nowTick;
+            m_lastTick = nowTick;
+            m_lastBytes = static_cast<unsigned long long>(ulProgress);
+        }
+        ULONGLONG dtTick = nowTick - m_lastTick;
+        if (dtTick >= 150)
+        {
+            unsigned long long cur = static_cast<unsigned long long>(ulProgress);
+            unsigned long long deltaBytes = (cur >= m_lastBytes) ? (cur - m_lastBytes) : 0ull;
+            m_lastSpeedBps = deltaBytes * 1000ull / dtTick;
+            m_lastTick = nowTick;
+            m_lastBytes = cur;
+        }
+
+        UpdateActiveDownloadStatus(m_name, L"браузер", m_linkIndex, m_linkTotal,
+            static_cast<unsigned long long>(ulProgress), m_lastSpeedBps);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD* grfBINDF, BINDINFO* pbindinfo) override
+    {
+        if (grfBINDF)
+            *grfBINDF = BINDF_GETNEWESTVERSION | BINDF_NOWRITECACHE | BINDF_PRAGMA_NO_CACHE;
+        if (pbindinfo)
+            pbindinfo->cbSize = sizeof(BINDINFO);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return S_OK; }
+
+private:
+    std::wstring m_name;
+    size_t m_linkIndex;
+    size_t m_linkTotal;
+    ULONGLONG m_startTick = 0;
+    ULONGLONG m_lastTick = 0;
+    unsigned long long m_lastBytes = 0;
+    unsigned long long m_lastSpeedBps = 0;
+};
+
+static bool DownloadViaBrowserBackground(
+    const DownloadItem& item,
+    const std::wstring& url,
+    const std::wstring& targetPath,
+    size_t linkIndex,
+    size_t linkTotal)
+{
+    if (IsCancelRequested())
+        return false;
+
+    if (url.empty())
+        return false;
+
+    std::wstring tempPath = targetPath + L".part";
+
+    // Always start from a clean slate so a stale/partial file never causes errors.
+    DeleteFileW(targetPath.c_str());
+    DeleteFileW(tempPath.c_str());
+
+    g_lastDownloadMethod.clear();
+    UpdateActiveDownloadStatus(item.name, L"браузер", linkIndex, linkTotal, 0, 0);
+    DebugLogLine(L"download", L"browser download start item=" + item.name + L" url=" + url + L" target=" + targetPath);
+
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    BrowserDownloadCallback cb(item.name, linkIndex, linkTotal);
+    HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), tempPath.c_str(), 0, &cb);
+
+    if (SUCCEEDED(hrInit))
+        CoUninitialize();
+
+    if (IsCancelRequested())
+    {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (FAILED(hr))
+    {
+        DebugLogLine(L"download", L"browser download failed item=" + item.name + L" url=" + url +
+            L" hr=" + FormatWin32ErrorForLog(static_cast<DWORD>(hr)));
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    DeleteFileW(targetPath.c_str());
+    if (!MoveFileExW(tempPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        DebugLogLine(L"download", L"browser download move failed item=" + item.name +
+            L" error=" + FormatWin32ErrorForLog(GetLastError()));
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    g_lastDownloadMethod = L"браузер";
+    UpdateActiveDownloadStatus(item.name, L"готово", linkIndex, linkTotal,
+        GetFileSizeBytesOrZero(targetPath), 0);
+    DebugLogLine(L"download", L"browser download ok item=" + item.name +
+        L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
+    return true;
+}
+
 static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std::wstring& targetPath)
 {
     if (IsCancelRequested())
         return false;
 
-    DWORD timeoutMs = GetPrimaryUrlOnlyTimeoutMs(item);
     std::vector<std::wstring> urls = GetDirectDownloadUrls(item);
-    DebugLogLine(L"download", L"direct download start item=" + item.name + L" target=" + targetPath +
-        L" urls=" + std::to_wstring(urls.size()) + L" timeout=" + std::to_wstring(timeoutMs));
+    DebugLogLine(L"download", L"browser download begin item=" + item.name + L" target=" + targetPath +
+        L" urls=" + std::to_wstring(urls.size()));
 
-    auto tryOne = [&](size_t i, DownloadMethodChoice method, bool relaxedSpeedGuard = false) -> bool
+    for (size_t i = 0; i < urls.size(); ++i)
     {
         if (IsCancelRequested())
             return false;
 
-        return TryDirectDownloadCandidate(item, urls[i], targetPath, timeoutMs, i + 1, urls.size(), method, relaxedSpeedGuard);
-    };
+        if (!DownloadViaBrowserBackground(item, urls[i], targetPath, i + 1, urls.size()))
+            continue;
 
-    if (IsProblemDownloadItem(item))
-    {
-        for (size_t i = 0; i < urls.size(); ++i)
-        {
-            std::vector<DownloadMethodChoice> methods = GetOptimizedProblemMethods(item, urls[i]);
+        if (ValidateDownloadedFileOrDelete(item, targetPath))
+            return true;
 
-            for (DownloadMethodChoice method : methods)
-            {
-                if (tryOne(i, method, false))
-                    return true;
-
-                if (IsCancelRequested())
-                    return false;
-            }
-        }
-
-        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all problem methods exhausted");
-        return false;
+        DebugLogLine(L"download", L"browser download payload invalid item=" + item.name + L" url=" + urls[i]);
     }
 
-    auto tryAllLinksWithMethod = [&](DownloadMethodChoice method) -> bool
-    {
-        for (size_t i = 0; i < urls.size(); ++i)
-        {
-            if (IsCancelRequested())
-                return false;
-
-            if (tryOne(i, method, false))
-                return true;
-        }
-
-        return false;
-    };
-
-    if (tryAllLinksWithMethod(DownloadMethodChoice::Curl))
-        return true;
-
-    if (tryAllLinksWithMethod(DownloadMethodChoice::WinInet))
-        return true;
-
-    bool ok = tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);
-    if (!ok)
-        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all methods exhausted");
-    return ok;
+    DebugLogLine(L"download", L"browser download failed item=" + item.name + L" all urls exhausted");
+    return false;
 }
 
 static void AddEricZimmermanKnownUrls(const DownloadItem& item, std::vector<std::wstring>& urls)

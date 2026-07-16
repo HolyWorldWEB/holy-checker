@@ -25,6 +25,7 @@
 #include <shlwapi.h>
 #include <winhttp.h>
 #include <wininet.h>
+#include <urlmon.h>
 #include <ole2.h>
 #include <shldisp.h>
 #include <dwmapi.h>
@@ -69,6 +70,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "uuid.lib")
@@ -114,6 +116,7 @@ using namespace Gdiplus;
 #define IDC_EXE_EDIT 2131
 #define IDC_PF_EDIT 2132
 #define IDC_MC_EDIT 2133
+
 #define IDC_TILE_BASE       3000
 
 #define TAB_COUNT           4
@@ -866,7 +869,7 @@ static std::vector<DownloadItem> g_items =
     { L"Everything",           L"https://www.voidtools.com/Everything-1.5.0.1404a.x64.zip", L"Everything-1.5.0.1404a.x64.zip", 0 },
     { L"ShellBag Analyzer",    L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/shellbag_analyzer_cleaner.exe", L"shellbag_analyzer_cleaner.exe", 0 },
     { L"RecentFilesView",      L"https://www.nirsoft.net/utils/recentfilesview.zip", L"recentfilesview.zip", 0 },
-    { L"SystemInformer",       L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/systeminformer-build-canary-setup.exe", L"systeminformer-build-canary-setup.exe", 0 },
+    { L"SystemInformer",       L"https://github.com/winsiderss/systeminformer/releases/download/v3.2.25011.2103/systeminformer-3.2.25011-release-setup.exe", L"systeminformer-build-canary-setup.exe", 0 },
     { L"LastActivityView",     L"https://www.nirsoft.net/utils/lastactivityview.zip", L"lastactivityview.zip", 0 },
     { L"ExecutedProgramsList", L"https://www.nirsoft.net/utils/executedprogramslist.zip", L"executedprogramslist.zip", 0 },
     { L"RegScanner",           L"https://www.nirsoft.net/utils/regscanner.zip", L"regscanner.zip", 0 },

@@ -926,10 +926,38 @@ static bool UninstallProgramIfPresent(
 
 static bool UninstallSystemInformerIfPresent()
 {
-    return UninstallProgramIfPresent(
-        L"SystemInformer",
-        { L"system informer", L"systeminformer" },
-        false);
+    // System Informer uses a custom setup that supports a fully silent uninstall
+    // via "-silent" (mirrors the "-install -silent" used for silent install).
+    // Append it so the uninstaller runs in the background with no window/plashka.
+    std::wstring command;
+
+    if (!FindUninstallCommand({ L"system informer", L"systeminformer" }, false, command))
+    {
+        PostLog(L"SystemInformer: не установлен");
+        return true;
+    }
+
+    std::wstring lower = ToLower(command);
+    bool hasSilent =
+        lower.find(L"-silent") != std::wstring::npos ||
+        lower.find(L"/silent") != std::wstring::npos ||
+        lower.find(L"/verysilent") != std::wstring::npos ||
+        lower.find(L"/quiet") != std::wstring::npos ||
+        lower.find(L" /s") != std::wstring::npos;
+
+    if (lower.find(L"msiexec") == std::wstring::npos && !hasSilent)
+        command += L" -silent";
+
+    PostLog(L"SystemInformer: удаление");
+
+    if (!RunElevatedCommandAndWait(command))
+    {
+        PostLog(L"SystemInformer: ошибка удаления");
+        return false;
+    }
+
+    PostLog(L"SystemInformer: команда выполнена");
+    return true;
 }
 
 static bool UninstallRecuvaIfPresent()
