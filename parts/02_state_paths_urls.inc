@@ -5923,66 +5923,6 @@ if($count -eq 0){'не найдено'}
     return lines;
 }
 
-// В checkmods показываем только те строки, которые чем-то подсвечиваются:
-// запрещённые (\xE002), переименованные (\xE003), удалённые (\xE000)
-// и архивные (\xE001). Обычные моды без маркера в вывод не попадают.
-//
-// Важно: длинные строки уже разбиты AppendWrappedAutomationLine на несколько
-// физических строк: продолжение начинается с двух пробелов, маркера в нём нет,
-// а разрыв часто приходится на "\" в пути. Поэтому продолжение наследует решение
-// своей головной строки — иначе от отфильтрованного мода остаётся хвост с именем
-// файла, висящий вне колонок.
-static std::vector<std::wstring> KeepOnlyHighlightedPage4Lines(const std::vector<std::wstring>& lines)
-{
-    std::vector<std::wstring> out;
-    out.reserve(lines.size());
-
-    bool sawPlainModRow = false;
-    bool keepingCurrentRow = false;
-    size_t headerCount = 0;
-
-    for (const std::wstring& line : lines)
-    {
-        // Продолжение перенесённой строки.
-        if (line.rfind(L"  ", 0) == 0)
-        {
-            if (keepingCurrentRow)
-                out.push_back(line);
-            continue;
-        }
-
-        bool hasMarker =
-            AutomationLineHasForbiddenMarker(line) ||
-            AutomationLineHasRenamedMarker(line) ||
-            AutomationLineHasDeletedMarker(line) ||
-            AutomationLineHasArchiveMarker(line);
-
-        bool isHeader = (line == L"название | путь");
-        bool isStatus =
-            (line == L"не найдено") ||
-            (line == L"не удалось запустить checkmods") ||
-            (line == L"не удалось запустить checkmods fullscan");
-
-        keepingCurrentRow = (hasMarker || isHeader || isStatus);
-
-        if (keepingCurrentRow)
-        {
-            if (isHeader)
-                ++headerCount;
-            out.push_back(line);
-        }
-        else
-        {
-            sawPlainModRow = true;
-        }
-    }
-
-    if (out.size() == headerCount && sawPlainModRow)
-        out.push_back(L"не найдено");
-
-    return out;
-}
-
 static std::vector<std::wstring> ScanPage4ByMode(int mode)
 {
     return ScanModrinthHashes(mode == 1 ? 1 : 0);
@@ -6319,7 +6259,7 @@ static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool un
     else if (target == AUTOMATION_OUTPUT_MC_LOGS)
         lines = ScanExeDeletedFromUsnDeleteClose();
     else if (target == AUTOMATION_OUTPUT_PAGE4)
-        lines = KeepOnlyHighlightedPage4Lines(ScanPage4ByMode(page4Mode));
+        lines = ScanPage4ByMode(page4Mode);
     else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         lines = ScanUnsignedDlls();
     else if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY)
