@@ -287,7 +287,6 @@ static bool AutomationPanelAtPointForContext(HWND hwnd, POINT pt, RECT& outPanel
     {
         panels.push_back({ GetJarActivityPanelRect(rc), AUTOMATION_OUTPUT_JAR_ACTIVITY });
         panels.push_back({ GetDllActivityPanelRect(rc), AUTOMATION_OUTPUT_DLL_ACTIVITY });
-        panels.push_back({ GetDllUnsignedPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED });
     }
     else if (g_currentPage == 3)
     {
@@ -297,6 +296,11 @@ static bool AutomationPanelAtPointForContext(HWND hwnd, POINT pt, RECT& outPanel
     {
         panels.push_back({ GetPage4PanelRect(rc), AUTOMATION_OUTPUT_PAGE4 });
         panels.push_back({ GetPage4DllPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED });
+    }
+    else if (g_currentPage == 5)
+    {
+        panels.push_back({ GetFileCheckPanelRect(rc), AUTOMATION_OUTPUT_FILECHECK });
+        panels.push_back({ GetDllUnsignedPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED });
     }
 
     for (const PanelHit& p : panels)
@@ -788,6 +792,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(g_hInjGenCheck, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
         MakeButtonNoErase(g_hInjGenCheck);
 
+        // --- Кнопки вкладки "file check" (page 5) ---
+        g_hFileCheckScan = CreateWindowExW(0, L"BUTTON", L"scan", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FILECHECK_SCAN), g_hInst, nullptr);
+        SendMessageW(g_hFileCheckScan, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+        MakeButtonNoErase(g_hFileCheckScan);
+
+        g_hClipShow = CreateWindowExW(0, L"BUTTON", L"буфер: текст", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CLIP_SHOW), g_hInst, nullptr);
+        SendMessageW(g_hClipShow, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+        MakeButtonNoErase(g_hClipShow);
+
+        g_hClipProc = CreateWindowExW(0, L"BUTTON", L"cbdhsvc", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CLIP_PROC), g_hInst, nullptr);
+        SendMessageW(g_hClipProc, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+        MakeButtonNoErase(g_hClipProc);
+
         for (int i = 0; i < static_cast<int>(g_items.size()); ++i)
         {
             HWND tile = CreateWindowExW(
@@ -1096,8 +1113,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             struct WheelPanel { RECT rc; int target; };
             WheelPanel panels[] = {
                 { GetJarActivityPanelRect(rc), AUTOMATION_OUTPUT_JAR_ACTIVITY },
-                { GetDllActivityPanelRect(rc), AUTOMATION_OUTPUT_DLL_ACTIVITY },
-                { GetDllUnsignedPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED }
+                { GetDllActivityPanelRect(rc), AUTOMATION_OUTPUT_DLL_ACTIVITY }
             };
             for (const WheelPanel& p : panels)
             {
@@ -1116,6 +1132,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             struct WheelPanel { RECT rc; int target; };
             WheelPanel panels[] = {
                 { GetFullAutomationPanelRect(rc), AUTOMATION_OUTPUT_PAGE4 }
+            };
+            for (const WheelPanel& p : panels)
+            {
+                if (PointInRect(p.rc, pt) && ScrollAutomationOutput(p.target, GET_WHEEL_DELTA_WPARAM(wParam)))
+                {
+                    SyncAutomationEditScrollToState(p.target);
+                    InvalidateAutomationPanel(p.target);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+
+        if (g_currentPage == 5)
+        {
+            struct WheelPanel { RECT rc; int target; };
+            WheelPanel panels[] = {
+                { GetFileCheckPanelRect(rc), AUTOMATION_OUTPUT_FILECHECK },
+                { GetDllUnsignedPanelRect(rc), AUTOMATION_OUTPUT_DLL_UNSIGNED }
             };
             for (const WheelPanel& p : panels)
             {
@@ -1186,7 +1221,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_AUTOMATION_NAV)
         {
-            g_currentPage = 1;
+            // From the main screen this button opens the "file check" tab.
+            // Inside the check section the same button leads to "checkmods".
+            g_currentPage = (g_currentPage == 0) ? 5 : 1;
             ResizeMainWindowForPage(g_currentPage);
             LayoutControls(hwnd);
             UpdateHistoryEditWindow();
@@ -1213,6 +1250,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_PAGE5_NAV)
         {
+            g_currentPage = 5;
+            ResizeMainWindowForPage(g_currentPage);
+            LayoutControls(hwnd);
+            UpdateHistoryEditWindow();
+            return 0;
+        }
+
+        // Кнопки вкладки file check.
+        if (id == IDC_FILECHECK_SCAN)
+        {
+            // One button starts both the file-type check and the unsigned dll check.
+            StartFileCheckScan();
+            StartAutomationScan(AUTOMATION_OUTPUT_DLL_UNSIGNED);
             return 0;
         }
 
@@ -1273,15 +1323,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_MOD_HASH)
         {
+            // The regular check scan runs checkmods and eventvwr together.
+            // They execute in parallel, so the event-log query does not slow
+            // down the Modrinth/hash scan.
             g_page4ScanMode.store(0);
-            StartAutomationBatchScan({ AUTOMATION_OUTPUT_PAGE4, AUTOMATION_OUTPUT_EVENTVWR });
+            StartAutomationBatchScan({
+                AUTOMATION_OUTPUT_PAGE4,
+                AUTOMATION_OUTPUT_EVENTVWR
+            });
             return 0;
         }
 
         if (id == IDC_MOD_FULLSCAN)
         {
             g_page4ScanMode.store(1);
-            StartAutomationScan(AUTOMATION_OUTPUT_EVENTVWR);
             StartAutomationScan(AUTOMATION_OUTPUT_PAGE4);
             return 0;
         }
@@ -1516,9 +1571,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_ITEM_DONE:
     {
         int index = static_cast<int>(wParam);
-        SetItemBusyIndex(index, false);
 
-        if (!g_deleteInProgress.load())
+        // The System Informer tile stays locked until the background install
+        // finishes; that worker re-enables it itself.
+        bool systemInformerBusy =
+            g_systemInformerInstalling.load() && g_systemInformerTileIndex.load() == index;
+
+        if (!systemInformerBusy)
+            SetItemBusyIndex(index, false);
+
+        if (!g_deleteInProgress.load() && !systemInformerBusy)
             SetTileEnabledByIndex(index, true);
 
         InvalidateBottomPanel();
@@ -1607,7 +1669,7 @@ static void ResizeMainWindowForPage(int page)
 
     int wantedW = 1120;
     int wantedH = 760;
-    if (page == 2)
+    if (page == 2 || page == 5)
     {
         wantedW = 1400;
         wantedH = 900;
@@ -1632,12 +1694,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 {
     g_hInst = hInstance;
 
+    DebugLogSeparator(L"HolyCheck program start");
+    DebugLogLine(L"app", L"pid=" + std::to_wstring(GetCurrentProcessId()) +
+        L" build_bits=" + std::to_wstring(sizeof(void*) * 8));
+    wchar_t exePathForLog[32768] = {};
+    GetModuleFileNameW(nullptr, exePathForLog, static_cast<DWORD>(sizeof(exePathForLog) / sizeof(exePathForLog[0])));
+    DebugLogLine(L"app", L"exe=" + std::wstring(exePathForLog));
+    StartGistLogUploader();
+
     if (!IsRunningAsAdministrator())
     {
         if (RelaunchAsAdministrator())
             return 0;
 
-        MessageBoxW(nullptr, L"Программу нужно запускать от имени администратора.", L"Требуются права администратора", MB_ICONERROR | MB_OK);
+        MessageBoxW(nullptr, L"Программу нужно запускать от име��и администратора.", L"Требуются права администратора", MB_ICONERROR | MB_OK);
         return 1;
     }
 
@@ -1709,6 +1779,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    StopGistLogUploaderAndFlush();
 
     if (g_gdiplusToken)
         GdiplusShutdown(g_gdiplusToken);

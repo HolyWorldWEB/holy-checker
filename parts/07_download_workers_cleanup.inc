@@ -314,7 +314,7 @@ static unsigned long long GetEstimatedDownloadOrderBytes(const DownloadItem& ite
 static void DownloadWorker(std::vector<DownloadItem> items)
 {
     DebugLogSeparator(L"download batch worker start");
-    DebugLogLine(L"download", L"worker start items=" + std::to_wstring(items.size()) + L" log=" + GetHolyCheckDebugLogPath());
+    DebugLogLine(L"download", L"worker start items=" + std::to_wstring(items.size()));
     g_working = true;
 
     std::stable_sort(items.begin(), items.end(), [](const DownloadItem& a, const DownloadItem& b)
@@ -533,7 +533,7 @@ static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, c
 static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
 {
     DebugLogSeparator(L"single download worker start");
-    DebugLogLine(L"download", L"single worker start index=" + std::to_wstring(itemIndex) + L" item=" + item.name + L" log=" + GetHolyCheckDebugLogPath());
+    DebugLogLine(L"download", L"single worker start index=" + std::to_wstring(itemIndex) + L" item=" + item.name);
     std::wstring folder = GetHolyCheckFolder();
     bool foldersOk = EnsureDirectory(folder);
 
@@ -621,6 +621,25 @@ static void OpenOrDownloadSingleById(int id)
         if (item.tab == 0)
             CleanupOldJuniorTextFiles(tabFolder);
 
+        if (IsSystemInformerItem(item))
+        {
+            // The tile must stay dead while the setup runs in the background.
+            g_systemInformerTileIndex.store(index);
+            SetItemBusyIndex(index, true);
+            SetTileEnabledByIndex(index, false);
+
+            OpenItemPath(item, quickLaunchPath);
+
+            if (!g_systemInformerInstalling.load())
+            {
+                g_systemInformerTileIndex.store(-1);
+                SetItemBusyIndex(index, false);
+                SetTileEnabledByIndex(index, true);
+            }
+
+            return;
+        }
+
         OpenItemPath(item, quickLaunchPath);
         return;
     }
@@ -639,6 +658,10 @@ static void OpenOrDownloadSingleById(int id)
     }
 
     g_singleTotal.fetch_add(1);
+
+    if (IsSystemInformerItem(item))
+        g_systemInformerTileIndex.store(index);
+
     SetItemBusyIndex(index, true);
     SetTileEnabledByIndex(index, false);
 
@@ -816,7 +839,9 @@ static std::wstring MakeUninstallCommand(std::wstring command, bool addNsisSilen
             updatedLower.find(L"/verysilent") == std::wstring::npos &&
             updatedLower.find(L"/quiet") == std::wstring::npos)
         {
-            command += L" /S";
+            // /S — NSIS, /VERYSILENT /SUPPRESSMSGBOXES — Inno Setup.
+            // Вместе они гасят и окно удаления, и подтверждающие диалоги.
+            command += L" /S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
         }
     }
 
@@ -924,40 +949,94 @@ static bool UninstallProgramIfPresent(
     return true;
 }
 
+static void SplitCommandLineExeAndArgs(const std::wstring& command, std::wstring& exe, std::wstring& args)
+{
+    exe.clear();
+    args.clear();
+
+    size_t start = command.find_first_not_of(L" \t");
+
+    if (start == std::wstring::npos)
+        return;
+
+    if (command[start] == L'"')
+    {
+        size_t end = command.find(L'"', start + 1);
+
+        if (end == std::wstring::npos)
+        {
+            exe = command.substr(start + 1);
+            return;
+        }
+
+        exe = command.substr(start + 1, end - start - 1);
+        start = end + 1;
+    }
+    else
+    {
+        size_t end = command.find(L' ', start);
+
+        if (end == std::wstring::npos)
+        {
+            exe = command.substr(start);
+            return;
+        }
+
+        exe = command.substr(start, end - start);
+        start = end;
+    }
+
+    size_t argsStart = command.find_first_not_of(L" \t", start);
+
+    if (argsStart != std::wstring::npos)
+        args = command.substr(argsStart);
+}
+
 static bool UninstallSystemInformerIfPresent()
 {
-    // System Informer uses a custom setup that supports a fully silent uninstall
-    // via "-silent" (mirrors the "-install -silent" used for silent install).
-    // Append it so the uninstaller runs in the background with no window/plashka.
     std::wstring command;
 
+    // addNsisSilent=false: this uninstaller ignores /S and /VERYSILENT and still
+    // shows the confirmation dialog, so the wizard is clicked through instead.
     if (!FindUninstallCommand({ L"system informer", L"systeminformer" }, false, command))
     {
-        PostLog(L"SystemInformer: не установлен");
+        PostLog(L"SystemInformer: \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d");
         return true;
     }
 
-    std::wstring lower = ToLower(command);
-    bool hasSilent =
-        lower.find(L"-silent") != std::wstring::npos ||
-        lower.find(L"/silent") != std::wstring::npos ||
-        lower.find(L"/verysilent") != std::wstring::npos ||
-        lower.find(L"/quiet") != std::wstring::npos ||
-        lower.find(L" /s") != std::wstring::npos;
+    std::wstring exe;
+    std::wstring args;
+    SplitCommandLineExeAndArgs(command, exe, args);
 
-    if (lower.find(L"msiexec") == std::wstring::npos && !hasSilent)
-        command += L" -silent";
-
-    PostLog(L"SystemInformer: удаление");
-
-    if (!RunElevatedCommandAndWait(command))
+    if (exe.empty())
     {
-        PostLog(L"SystemInformer: ошибка удаления");
+        PostLog(L"SystemInformer: \u043e\u0448\u0438\u0431\u043a\u0430 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f");
         return false;
     }
 
-    PostLog(L"SystemInformer: команда выполнена");
-    return true;
+    PostLog(L"SystemInformer: \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435");
+
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+
+    if (!StartElevatedProcessHidden(exe, args, process, pid))
+    {
+        PostLog(L"SystemInformer: \u043e\u0448\u0438\u0431\u043a\u0430 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f");
+        return false;
+    }
+
+    bool ok = DriveSystemInformerUninstallWizard(pid, 180000);
+
+    if (process)
+    {
+        WaitForSingleObject(process, ok ? 10000 : 0);
+        CloseHandle(process);
+    }
+
+    PostLog(ok
+        ? L"SystemInformer: \u0443\u0434\u0430\u043b\u0451\u043d"
+        : L"SystemInformer: \u043e\u0448\u0438\u0431\u043a\u0430 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u044f");
+    return ok;
 }
 
 static bool UninstallRecuvaIfPresent()
@@ -1180,6 +1259,41 @@ static void DeleteCheckOutputFilesInFolder(const std::wstring& folder, int& dele
     }
 }
 
+// check.txt / checktwinks.txt are written into the working directory of every
+// scanned game folder, so under .lunarclient they end up spread across many
+// profile subfolders. Walk the tree (bounded depth) and delete them all.
+static void DeleteCheckOutputFilesRecursive(const std::wstring& folder, int depth, int& deletedCount)
+{
+    if (depth < 0 || !DirectoryExists(folder))
+        return;
+
+    DeleteCheckOutputFilesInFolder(folder, deletedCount);
+
+    WIN32_FIND_DATAW data = {};
+    std::wstring mask = CombinePath(folder, L"*");
+    HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
+
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do
+    {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+            continue;
+
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            continue;
+
+        DeleteCheckOutputFilesRecursive(CombinePath(folder, data.cFileName), depth - 1, deletedCount);
+    }
+    while (FindNextFileW(hFind, &data));
+
+    FindClose(hFind);
+}
+
 static void DeletePowerShellCheckOutputFiles()
 {
     std::vector<std::wstring> folders;
@@ -1208,6 +1322,14 @@ static void DeletePowerShellCheckOutputFiles()
     int deletedCount = 0;
     for (const std::wstring& folder : folders)
         DeleteCheckOutputFilesInFolder(folder, deletedCount);
+
+    // .lunarclient keeps per-profile working dirs, so recurse a bounded depth.
+    if (!profile.empty())
+    {
+        DeleteCheckOutputFilesRecursive(CombinePath(profile, L".lunarclient"), 6, deletedCount);
+        DeleteCheckOutputFilesRecursive(
+            CombinePath(CombinePath(profile, L"AppData\\Roaming"), L".minecraft"), 6, deletedCount);
+    }
 
     if (!marker.empty())
         DeleteFileW(marker.c_str());
@@ -1390,7 +1512,7 @@ function GetScanRoots(){
 $deleted=0
 foreach($root in @(GetScanRoots)){
   try{
-    foreach($f in @(Get-ChildItem -LiteralPath $root -Filter 'holycheck.exe' -File -Recurse -Force -ErrorAction SilentlyContinue)){
+    foreach($f in @(Get-ChildItem -LiteralPath $root -Filter 'holycheck.exe' -File -Recurse -Depth 6 -Force -ErrorAction SilentlyContinue)){
       $deleted += (DeleteHolyExeFile $f.FullName)
     }
   }catch{}
@@ -1399,7 +1521,7 @@ Out ('deleted-exe-count: ' + $deleted)
 )HCPS";
 
     std::wstring output;
-    if (RunHiddenPowerShellScriptCapture(script, output, 600000))
+    if (RunHiddenPowerShellScriptCapture(script, output, 120000))
     {
         DebugLogLine(L"delete", L"holycheck.exe cleanup output=" + output);
         PostLog(L"Удаление holycheck.exe завершено");

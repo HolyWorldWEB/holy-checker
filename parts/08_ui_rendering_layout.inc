@@ -785,7 +785,8 @@ static bool IsAutomationResizableColumnTarget(int target)
     return target == AUTOMATION_OUTPUT_JAR_ACTIVITY ||
         target == AUTOMATION_OUTPUT_DLL_ACTIVITY ||
         target == AUTOMATION_OUTPUT_DLL_UNSIGNED ||
-        target == AUTOMATION_OUTPUT_PAGE4;
+        target == AUTOMATION_OUTPUT_PAGE4 ||
+        target == AUTOMATION_OUTPUT_FILECHECK;
 }
 
 static void ApplyAutomationColumnWidthOverrides(int target, std::vector<float>& widths)
@@ -809,7 +810,9 @@ static std::vector<int> GetAutomationResizeTargetsForCurrentPage()
     if (g_currentPage == 1)
         return { AUTOMATION_OUTPUT_PAGE4 };
     if (g_currentPage == 2)
-        return { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_DLL_ACTIVITY, AUTOMATION_OUTPUT_DLL_UNSIGNED };
+        return { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_DLL_ACTIVITY };
+    if (g_currentPage == 5)
+        return { AUTOMATION_OUTPUT_FILECHECK, AUTOMATION_OUTPUT_DLL_UNSIGNED };
     return {};
 }
 
@@ -889,11 +892,19 @@ static void DrawAutomationPipeSeparatedRow(Graphics& g, const std::wstring& line
     SolidBrush textBrush(Color(255, 235, 235, 240));
     SolidBrush deletedNameBrush(Color(255, 255, 76, 76));
     SolidBrush forbiddenNameBrush(Color(255, 255, 76, 76));
+    SolidBrush renamedNameBrush(Color(255, 255, 165, 0));
     SolidBrush archiveNameBrush(Color(255, 255, 214, 82));
     SolidBrush sepBrush(Color(180, 150, 150, 158));
     StringFormat fmt;
     fmt.SetTrimming(StringTrimmingEllipsisCharacter);
     fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsLineLimit);
+
+    StringFormat fmtPath;
+    fmtPath.SetTrimming(StringTrimmingNone);
+    fmtPath.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsLineLimit);
+
+    StringFormat measurePathFmt;
+    measurePathFmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
 
     const float left = x + 10.0f;
     const float sepW = 6.0f;
@@ -905,6 +916,18 @@ static void DrawAutomationPipeSeparatedRow(Graphics& g, const std::wstring& line
         widths = *sharedWidths;
     else
         widths = ComputeAutomationColumnWidths(g, std::vector<std::wstring>{ line }, 0, 1, target, lineFont, panelW);
+
+    // file check: если реальный тип файла — исполняемый (EXE/DLL), подсвечиваем
+    // всю строку жёлтым — это самый опасный случай маскировки.
+    bool execRealType = (target == AUTOMATION_OUTPUT_FILECHECK) &&
+        (line.find(L"EXE(PE)") != std::wstring::npos ||
+         line.find(L"DLL(PE)") != std::wstring::npos);
+    if (execRealType)
+    {
+        float execRowW = std::max(20.0f, panelW - 24.0f);
+        SolidBrush execBrush(Color(45, 255, 214, 82)); // едва заметный прозрачный жёлтый
+        g.FillRectangle(&execBrush, RectF(left - 4.0f, y - 1.0f, execRowW, lineH + 1.0f));
+    }
 
     bool highlightRow = (target == g_automationCopyHighlightTarget && rowIndex == g_automationCopyHighlightIndex);
     SolidBrush highlightBrush(Color(38, 92, 155, 255));
@@ -924,12 +947,30 @@ static void DrawAutomationPipeSeparatedRow(Graphics& g, const std::wstring& line
         bool deletedRow = AutomationLineHasDeletedMarker(line);
         bool archiveRow = AutomationLineHasArchiveMarker(line);
         bool forbiddenRow = AutomationLineHasForbiddenMarker(line);
+        bool renamedRow = AutomationLineHasRenamedMarker(line);
         Brush* cellBrush = (deletedRow && i > 0) ? static_cast<Brush*>(&deletedNameBrush) : static_cast<Brush*>(&textBrush);
         if (forbiddenRow && target == AUTOMATION_OUTPUT_PAGE4 && i == 0)
             cellBrush = static_cast<Brush*>(&forbiddenNameBrush);
+        else if (renamedRow && target == AUTOMATION_OUTPUT_PAGE4 && i == 0)
+            cellBrush = static_cast<Brush*>(&renamedNameBrush);
         else if (archiveRow && i == 0)
             cellBrush = static_cast<Brush*>(&archiveNameBrush);
-        g.DrawString(cols[i].c_str(), -1, &lineFont, RectF(cur, y, colW, lineH + 2.0f), &fmt, cellBrush);
+        bool isLastCol = (i + 1 == cols.size());
+        if (i == pathCol && isLastCol)
+        {
+            // Clip the path to the panel's right edge so text never spills
+            // outside the frame; ellipsize when the full path does not fit.
+            (void)measurePathFmt;
+            (void)fmtPath;
+            float availW = (x + panelW - 22.0f) - cur;
+            if (availW < 20.0f)
+                availW = 20.0f;
+            g.DrawString(cols[i].c_str(), -1, &lineFont, RectF(cur, y, availW, lineH + 2.0f), &fmt, cellBrush);
+        }
+        else
+        {
+            g.DrawString(cols[i].c_str(), -1, &lineFont, RectF(cur, y, colW, lineH + 2.0f), &fmt, cellBrush);
+        }
         cur += colW;
 
         if (i + 1 < cols.size())
@@ -1311,7 +1352,6 @@ static void DrawJarActivityScreen(Graphics& g, RECT rc)
     g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
     DrawAutomationOutputPanel(g, GetJarActivityPanelRect(rc), L".jar activity", AUTOMATION_OUTPUT_JAR_ACTIVITY);
     DrawAutomationOutputPanel(g, GetDllActivityPanelRect(rc), L".dll activity", AUTOMATION_OUTPUT_DLL_ACTIVITY);
-    DrawAutomationOutputPanel(g, GetDllUnsignedPanelRect(rc), L"unsigned dll", AUTOMATION_OUTPUT_DLL_UNSIGNED);
 }
 
 static void DrawPage4Screen(Graphics& g, RECT rc)
@@ -1325,13 +1365,17 @@ static void DrawPage4Screen(Graphics& g, RECT rc)
     SolidBrush brush(Color(230, 236, 238, 245));
     StringFormat fmt;
     fmt.SetTrimming(StringTrimmingEllipsisCharacter);
-    g.DrawString(L"checkmods перенесён во вкладку check, unsigned dll перенесён во вкладку dll | jar.", -1, &font, textRect, &fmt, &brush);
+    g.DrawString(L"checkmods перенесён во вкладку check, unsigned dll перенесён во вкладку file check.", -1, &font, textRect, &fmt, &brush);
 }
 
 static void DrawPage5Screen(Graphics& g, RECT rc)
 {
-    UNREFERENCED_PARAMETER(g);
-    UNREFERENCED_PARAMETER(rc);
+    // Вкладка "file check": верхняя панель — проверка совпадения
+    // фактического типа с расширением, нижняя — unsigned dll.
+    DrawAutomationOutputPanel(g, GetFileCheckPanelRect(rc),
+        L"file check — тип файла не совпадает с расширением", AUTOMATION_OUTPUT_FILECHECK);
+    DrawAutomationOutputPanel(g, GetDllUnsignedPanelRect(rc),
+        L"unsigned dll", AUTOMATION_OUTPUT_DLL_UNSIGNED);
 }
 
 
@@ -1378,6 +1422,10 @@ static void DrawScene(HWND hwnd, HDC targetHdc)
     else if (g_currentPage == 3)
     {
         DrawPage4Screen(g, rc);
+    }
+    else if (g_currentPage == 5)
+    {
+        DrawPage5Screen(g, rc);
     }
     else
     {
@@ -1451,7 +1499,7 @@ static void LayoutControls(HWND hwnd)
     SetWindowTextW(g_hAutomationNav, L"check");
     ShowWindow(g_hHomeNav, SW_HIDE);
 
-    if (g_currentPage >= 1 && g_currentPage <= 3)
+    if ((g_currentPage >= 1 && g_currentPage <= 3) || g_currentPage == 5)
     {
         ShowWindow(g_hDeleteHolyCheck, SW_HIDE);
         ShowWindow(g_hEnableServices, SW_HIDE);
@@ -1492,6 +1540,9 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_hExeEdit, SW_HIDE);
             ShowWindow(g_hPfEdit, SW_HIDE);
             ShowWindow(g_hMcEdit, SW_HIDE);
+            ShowWindow(g_hFileCheckScan, SW_HIDE);
+            ShowWindow(g_hClipShow, SW_HIDE);
+            ShowWindow(g_hClipProc, SW_HIDE);
         };
 
         hidePageButtons();
@@ -1523,7 +1574,7 @@ static void LayoutControls(HWND hwnd)
 
             ShowWindow(g_hAutomationBam, SW_HIDE);
             ShowWindow(g_hModHash, SW_SHOWNA);
-            ShowWindow(g_hModFullScan, SW_SHOWNA);
+            ShowWindow(g_hModFullScan, SW_HIDE);
             ShowWindow(g_hAutomationBamUnsignedOnly, SW_HIDE);
             ShowWindow(g_hAutomationEventVwr, SW_HIDE);
             ShowWindow(g_hAutomationJarPage, SW_SHOWNA);
@@ -1554,6 +1605,16 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_hModFullScan, SW_HIDE);
             ShowWindow(g_hDllUnsigned, SW_HIDE);
         }
+        else if (g_currentPage == 5)
+        {
+            // Только кнопка scan; кнопки буфера обмена скрыты.
+            RECT scanBtn = GetFileCheckButtonRect(rc);
+            MoveChildWindow(g_hFileCheckScan, scanBtn.left, scanBtn.top, scanBtn.right - scanBtn.left, scanBtn.bottom - scanBtn.top, TRUE);
+            SetWindowTextW(g_hFileCheckScan, L"scan");
+            ShowWindow(g_hFileCheckScan, SW_SHOWNA);
+            ShowWindow(g_hClipShow, SW_HIDE);
+            ShowWindow(g_hClipProc, SW_HIDE);
+        }
         auto showTopNavAll = [&]()
         {
             int x = navX;
@@ -1566,10 +1627,10 @@ static void LayoutControls(HWND hwnd)
                 x -= navButtonW + topGap;
             };
             place(g_hHomeNav, L"Главная");
-            ShowWindow(g_hPage5Nav, SW_HIDE);
             ShowWindow(g_hPage4Nav, SW_HIDE);
             place(g_hAutomationJarPage, L"dll | jar");
             place(g_hAutomationNav, L"check");
+            place(g_hPage5Nav, L"file check");
         };
         showTopNavAll();
 
@@ -1590,6 +1651,9 @@ static void LayoutControls(HWND hwnd)
         InvalidateRect(g_hDllActivity, nullptr, TRUE);
         InvalidateRect(g_hPage5Nav, nullptr, TRUE);
         InvalidateRect(g_hInjGenCheck, nullptr, TRUE);
+        InvalidateRect(g_hFileCheckScan, nullptr, TRUE);
+        InvalidateRect(g_hClipShow, nullptr, TRUE);
+        InvalidateRect(g_hClipProc, nullptr, TRUE);
 
         RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_UPDATENOW);
         return;
@@ -1616,6 +1680,10 @@ static void LayoutControls(HWND hwnd)
     ShowWindow(g_hExeEdit, SW_HIDE);
     ShowWindow(g_hPfEdit, SW_HIDE);
     ShowWindow(g_hMcEdit, SW_HIDE);
+    // Кнопки вкладки file check тоже прячем на главном экране (иначе они «застревают»).
+    ShowWindow(g_hFileCheckScan, SW_HIDE);
+    ShowWindow(g_hClipShow, SW_HIDE);
+    ShowWindow(g_hClipProc, SW_HIDE);
 
     MoveChildWindow(g_hDeleteHolyCheck, 28, 22, 118, 34, TRUE);
     ShowWindow(g_hDeleteHolyCheck, SW_SHOWNA);
@@ -1840,6 +1908,8 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         selected = true;
     if (id == IDC_PAGE4_NAV && g_currentPage == 3)
         selected = true;
+    if (id == IDC_PAGE5_NAV && g_currentPage == 5)
+        selected = true;
 
     bool copyButton = id == IDC_COPY_EVERYTHING_1 ||
         id == IDC_COPY_EVERYTHING_2 ||
@@ -1876,7 +1946,8 @@ static void DrawRoundButton(DRAWITEMSTRUCT* d)
         id == IDC_AUTOMATION_NAV || id == IDC_AUTOMATION_BAM || id == IDC_AUTOMATION_EVENTVWR ||
 id == IDC_AUTOMATION_JAR_PAGE || id == IDC_JAR_ACTIV ||
         id == IDC_EXE_DELETED || id == IDC_PF_DELETED || id == IDC_PAGE4_NAV ||
-        id == IDC_MOD_HASH || id == IDC_MOD_FULLSCAN || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY))
+        id == IDC_MOD_HASH || id == IDC_MOD_FULLSCAN || id == IDC_DLL_UNSIGNED || id == IDC_DLL_ACTIVITY ||
+        id == IDC_PAGE5_NAV || id == IDC_FILECHECK_SCAN))
     {
         if (selected)
         {

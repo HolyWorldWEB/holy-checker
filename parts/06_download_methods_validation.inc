@@ -1284,150 +1284,6 @@ static std::wstring QuotePowerShellSingleArgLocal(std::wstring value)
     return out;
 }
 
-static bool ReadWholeFileNarrowLocal(const std::wstring& path, std::string& out)
-{
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 8 * 1024 * 1024)
-    {
-        CloseHandle(h);
-        return false;
-    }
-
-    out.resize(static_cast<size_t>(size.QuadPart));
-    DWORD read = 0;
-    bool ok = ReadFile(h, &out[0], static_cast<DWORD>(out.size()), &read, nullptr) != 0;
-    CloseHandle(h);
-    if (!ok)
-        return false;
-
-    out.resize(read);
-    return true;
-}
-
-static int ParseRegistryExplorerDesktopMajor(const std::wstring& exeDir)
-{
-    int major = 8;
-
-    std::wstring mask = CombinePath(exeDir, L"*.runtimeconfig.json");
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW(mask.c_str(), &fd);
-    std::wstring chosen;
-    if (h != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                continue;
-
-            std::wstring name = ToLower(fd.cFileName);
-            if (name.find(L"registryexplorer") != std::wstring::npos)
-            {
-                chosen = fd.cFileName;
-                break;
-            }
-
-            if (chosen.empty())
-                chosen = fd.cFileName;
-        } while (FindNextFileW(h, &fd));
-
-        FindClose(h);
-    }
-
-    if (chosen.empty())
-        return major;
-
-    std::string json;
-    if (!ReadWholeFileNarrowLocal(CombinePath(exeDir, chosen), json))
-        return major;
-
-    size_t pos = json.find("Microsoft.WindowsDesktop.App");
-    if (pos == std::string::npos)
-        return major;
-
-    size_t vpos = json.find("version", pos);
-    if (vpos == std::string::npos)
-        return major;
-
-    size_t i = vpos + 7;
-    while (i < json.size() && (json[i] < '0' || json[i] > '9'))
-        ++i;
-
-    int parsed = 0;
-    bool any = false;
-    while (i < json.size() && json[i] >= '0' && json[i] <= '9')
-    {
-        parsed = parsed * 10 + (json[i] - '0');
-        any = true;
-        ++i;
-    }
-
-    if (any && parsed > 0)
-        major = parsed;
-
-    return major;
-}
-
-static bool DesktopRuntimeDirHasMajor(const std::wstring& sharedDir, int major)
-{
-    std::wstring mask = CombinePath(sharedDir, L"*");
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW(mask.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-
-    bool found = false;
-    do
-    {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-            continue;
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
-            continue;
-        if (_wtoi(fd.cFileName) == major)
-        {
-            found = true;
-            break;
-        }
-    } while (FindNextFileW(h, &fd));
-
-    FindClose(h);
-    return found;
-}
-
-static bool IsWindowsDesktopRuntimeInstalledNative(int major)
-{
-    if (major <= 0)
-        return false;
-
-    std::vector<std::wstring> roots;
-
-    auto addEnvRoot = [&](const wchar_t* env, const wchar_t* rel)
-    {
-        wchar_t base[MAX_PATH * 4]{};
-        DWORD len = GetEnvironmentVariableW(env, base, ARRAYSIZE(base));
-        if (len > 0 && len < ARRAYSIZE(base))
-            roots.push_back(CombinePath(base, rel));
-    };
-
-    addEnvRoot(L"ProgramW6432", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
-    addEnvRoot(L"ProgramFiles", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
-    addEnvRoot(L"ProgramFiles(x86)", L"dotnet\\shared\\Microsoft.WindowsDesktop.App");
-    addEnvRoot(L"DOTNET_ROOT", L"shared\\Microsoft.WindowsDesktop.App");
-    roots.push_back(L"C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App");
-
-    for (const std::wstring& root : roots)
-    {
-        if (DesktopRuntimeDirHasMajor(root, major))
-            return true;
-    }
-
-    return false;
-}
-
 static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExplorerExe)
 {
     if (registryExplorerExe.empty())
@@ -1437,12 +1293,6 @@ static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExpl
     size_t slash = registryExplorerExe.find_last_of(L"\\/");
     if (slash != std::wstring::npos)
         exeDir = registryExplorerExe.substr(0, slash);
-
-    // Fast path: if the required .NET Desktop Runtime is already installed, skip the
-    // slow PowerShell probe and let Registry Explorer open immediately.
-    int requiredMajor = ParseRegistryExplorerDesktopMajor(exeDir);
-    if (IsWindowsDesktopRuntimeInstalledNative(requiredMajor))
-        return true;
 
     std::wstring script;
     script.reserve(8192);
@@ -1499,27 +1349,10 @@ Out 'runtime-installed'
     return false;
 }
 
+// Everything открывается как обычная программа: без параметров командной строки.
 static bool OpenEverythingPath(const std::wstring& path)
 {
-    if (path.empty())
-        return false;
-
-    std::wstring params = L"-search ";
-    params += QuoteProcessArgument(GetEverythingCheatsQuery());
-
-    HINSTANCE result = ShellExecuteW(
-        g_hMain,
-        L"open",
-        path.c_str(),
-        params.c_str(),
-        nullptr,
-        SW_SHOWNORMAL
-    );
-
-    bool ok = reinterpret_cast<INT_PTR>(result) > 32;
-    if (ok)
-        PostLog(L"Everything открыт с заполненным поиском");
-    return ok;
+    return OpenPath(path);
 }
 
 static bool ShouldOpenItemElevated(const DownloadItem& item)
@@ -1531,80 +1364,468 @@ static bool ShouldOpenItemElevated(const DownloadItem& item)
         name.find(L"recuva") != std::wstring::npos;
 }
 
-static bool InstallSystemInformerSilent(const std::wstring& setupPath)
+// Setup wizard automation. The System Informer installer has no working silent
+// switch, so its dialog is driven directly through window messages. HolyCheck
+// always runs elevated, so UIPI does not block messages to the setup.
+static std::wstring NormalizeSetupButtonText(const std::wstring& raw)
 {
-    if (setupPath.empty())
+    std::wstring text;
+    text.reserve(raw.size());
+
+    for (wchar_t ch : raw)
+    {
+        if (ch == L'&')
+            continue;
+
+        text.push_back(ch);
+    }
+
+    while (!text.empty() && (text.front() == L' ' || text.front() == L'\t'))
+        text.erase(text.begin());
+
+    while (!text.empty() && (text.back() == L' ' || text.back() == L'\t' || text.back() == L'.'))
+        text.pop_back();
+
+    if (!text.empty())
+        CharLowerBuffW(&text[0], static_cast<DWORD>(text.size()));
+
+    return text;
+}
+
+struct SetupButtonInfo
+{
+    HWND hwnd;
+    std::wstring text;
+};
+
+static BOOL CALLBACK CollectSetupButtonsProc(HWND hwnd, LPARAM lParam)
+{
+    auto* buttons = reinterpret_cast<std::vector<SetupButtonInfo>*>(lParam);
+
+    if (!buttons)
+        return FALSE;
+
+    wchar_t className[64] = {};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+
+    if (_wcsicmp(className, L"Button") != 0)
+        return TRUE;
+
+    if (!IsWindowEnabled(hwnd))
+        return TRUE;
+
+    wchar_t caption[256] = {};
+    GetWindowTextW(hwnd, caption, ARRAYSIZE(caption));
+
+    SetupButtonInfo info;
+    info.hwnd = hwnd;
+    info.text = NormalizeSetupButtonText(caption);
+    buttons->push_back(info);
+    return TRUE;
+}
+
+struct SetupWindowSearch
+{
+    DWORD pid;
+    std::vector<HWND> windows;
+};
+
+static BOOL CALLBACK CollectSetupWindowsProc(HWND hwnd, LPARAM lParam)
+{
+    auto* search = reinterpret_cast<SetupWindowSearch*>(lParam);
+
+    if (!search)
+        return FALSE;
+
+    DWORD windowPid = 0;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+
+    if (windowPid == search->pid)
+        search->windows.push_back(hwnd);
+
+    return TRUE;
+}
+
+static std::vector<HWND> CollectProcessWindows(DWORD pid)
+{
+    SetupWindowSearch search;
+    search.pid = pid;
+    EnumWindows(CollectSetupWindowsProc, reinterpret_cast<LPARAM>(&search));
+    return search.windows;
+}
+
+static HWND FindSetupButton(const std::vector<SetupButtonInfo>& buttons, const std::vector<std::wstring>& names)
+{
+    for (const auto& button : buttons)
+    {
+        for (const auto& name : names)
+        {
+            if (button.text == name)
+                return button.hwnd;
+        }
+    }
+
+    return nullptr;
+}
+
+static HWND FindSetupButtonContaining(const std::vector<SetupButtonInfo>& buttons, const std::vector<std::wstring>& parts)
+{
+    for (const auto& button : buttons)
+    {
+        for (const auto& part : parts)
+        {
+            if (button.text.find(part) != std::wstring::npos)
+                return button.hwnd;
+        }
+    }
+
+    return nullptr;
+}
+
+static void ClickSetupButton(HWND button)
+{
+    if (button && IsWindow(button))
+        SendMessageW(button, BM_CLICK, 0, 0);
+}
+
+static bool StartElevatedProcessHidden(const std::wstring& file, const std::wstring& params, HANDLE& processOut, DWORD& pidOut)
+{
+    processOut = nullptr;
+    pidOut = 0;
+
+    if (file.empty())
         return false;
 
-    // System Informer's setup executable supports silent command-line switches,
-    // so no installer window ever appears.
-    std::wstring params = L"-install -silent";
-
-    SHELLEXECUTEINFOW sei{};
+    SHELLEXECUTEINFOW sei = {};
     sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.hwnd = g_hMain;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.hwnd = nullptr;
     sei.lpVerb = L"runas";
-    sei.lpFile = setupPath.c_str();
-    sei.lpParameters = params.c_str();
+    sei.lpFile = file.c_str();
+    sei.lpParameters = params.empty() ? nullptr : params.c_str();
     sei.nShow = SW_HIDE;
 
     if (!ShellExecuteExW(&sei))
-        return false;
-
-    bool ok = true;
-    if (sei.hProcess)
     {
-        WaitForSingleObject(sei.hProcess, 300000);
-        DWORD code = 0;
-        if (GetExitCodeProcess(sei.hProcess, &code))
-            ok = (code == 0 || code == 3010);
-        CloseHandle(sei.hProcess);
+        DebugLogLine(L"systeminformer", L"elevated start failed error=" + FormatWin32ErrorForLog(GetLastError()));
+        return false;
     }
 
+    processOut = sei.hProcess;
+
+    if (processOut)
+        pidOut = GetProcessId(processOut);
+
+    return true;
+}
+
+// Install -> Next -> Close, exactly the sequence of the visible wizard.
+static bool DriveSystemInformerSetupWizard(DWORD pid, DWORD timeoutMs)
+{
+    if (pid == 0)
+        return false;
+
+    const std::vector<std::wstring> installNames = { L"install", L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c" };
+    const std::vector<std::wstring> nextNames = { L"next", L"\u0434\u0430\u043b\u0435\u0435", L"\u0434\u0430\u043b\u044c\u0448\u0435" };
+    const std::vector<std::wstring> closeNames = { L"close", L"finish", L"\u0437\u0430\u043a\u0440\u044b\u0442\u044c", L"\u0433\u043e\u0442\u043e\u0432\u043e" };
+    const std::vector<std::wstring> autoStartParts = { L"start program", L"\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c" };
+
+    DWORD startTick = GetTickCount();
+    bool clickedInstall = false;
+    bool clickedNext = false;
+    std::vector<HWND> lastWindows;
+
+    while (GetTickCount() - startTick < timeoutMs)
+    {
+        std::vector<HWND> windows = CollectProcessWindows(pid);
+
+        if (!windows.empty())
+            lastWindows = windows;
+
+        for (HWND window : windows)
+        {
+            if (IsWindowVisible(window))
+                ShowWindow(window, SW_HIDE);
+
+            std::vector<SetupButtonInfo> buttons;
+            EnumChildWindows(window, CollectSetupButtonsProc, reinterpret_cast<LPARAM>(&buttons));
+
+            if (buttons.empty())
+                continue;
+
+            HWND installButton = FindSetupButton(buttons, installNames);
+
+            if (installButton && !clickedInstall)
+            {
+                DebugLogLine(L"systeminformer", L"setup wizard: click Install");
+                ClickSetupButton(installButton);
+                clickedInstall = true;
+                Sleep(200);
+                continue;
+            }
+
+            HWND nextButton = FindSetupButton(buttons, nextNames);
+
+            if (nextButton)
+            {
+                DebugLogLine(L"systeminformer", L"setup wizard: click Next");
+                ClickSetupButton(nextButton);
+                clickedNext = true;
+                Sleep(200);
+                continue;
+            }
+
+            // Closing the first page would cancel the install, so the close
+            // button is only used after Install or Next was pressed.
+            if (!clickedInstall && !clickedNext)
+                continue;
+
+            HWND autoStart = FindSetupButtonContaining(buttons, autoStartParts);
+
+            if (autoStart && SendMessageW(autoStart, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                ClickSetupButton(autoStart);
+
+            HWND closeButton = FindSetupButton(buttons, closeNames);
+
+            if (closeButton)
+            {
+                DebugLogLine(L"systeminformer", L"setup wizard: click Close");
+                ClickSetupButton(closeButton);
+                Sleep(200);
+            }
+        }
+
+        if (!FindInstalledSystemInformerPath().empty() && CollectProcessWindows(pid).empty())
+            return true;
+
+        Sleep(120);
+    }
+
+    // Do not leave an invisible stuck setup behind.
+    for (HWND window : lastWindows)
+    {
+        if (IsWindow(window))
+            ShowWindow(window, SW_SHOWNORMAL);
+    }
+
+    return !FindInstalledSystemInformerPath().empty();
+}
+
+// The uninstaller has the same problem as the setup: no silent switch, so it
+// pops the "Are you sure you want to uninstall" dialog. Drive it directly:
+// Uninstall -> Close. "Cancel" is never in the lists, so it cannot be clicked.
+static bool DriveSystemInformerUninstallWizard(DWORD pid, DWORD timeoutMs)
+{
+    if (pid == 0)
+        return false;
+
+    const std::vector<std::wstring> uninstallNames = { L"uninstall", L"\u0443\u0434\u0430\u043b\u0438\u0442\u044c" };
+    const std::vector<std::wstring> closeNames = { L"close", L"finish", L"\u0437\u0430\u043a\u0440\u044b\u0442\u044c", L"\u0433\u043e\u0442\u043e\u0432\u043e" };
+
+    DWORD startTick = GetTickCount();
+    bool clickedUninstall = false;
+    std::vector<HWND> lastWindows;
+
+    while (GetTickCount() - startTick < timeoutMs)
+    {
+        std::vector<HWND> windows = CollectProcessWindows(pid);
+
+        if (!windows.empty())
+            lastWindows = windows;
+
+        for (HWND window : windows)
+        {
+            if (IsWindowVisible(window))
+                ShowWindow(window, SW_HIDE);
+
+            std::vector<SetupButtonInfo> buttons;
+            EnumChildWindows(window, CollectSetupButtonsProc, reinterpret_cast<LPARAM>(&buttons));
+
+            if (buttons.empty())
+                continue;
+
+            HWND uninstallButton = FindSetupButton(buttons, uninstallNames);
+
+            if (uninstallButton && !clickedUninstall)
+            {
+                DebugLogLine(L"systeminformer", L"uninstall wizard: click Uninstall");
+                ClickSetupButton(uninstallButton);
+                clickedUninstall = true;
+                Sleep(200);
+                continue;
+            }
+
+            if (!clickedUninstall)
+                continue;
+
+            HWND closeButton = FindSetupButton(buttons, closeNames);
+
+            if (closeButton)
+            {
+                DebugLogLine(L"systeminformer", L"uninstall wizard: click Close");
+                ClickSetupButton(closeButton);
+                Sleep(200);
+            }
+        }
+
+        if (FindInstalledSystemInformerPath().empty() && CollectProcessWindows(pid).empty())
+            return true;
+
+        Sleep(120);
+    }
+
+    if (!FindInstalledSystemInformerPath().empty())
+    {
+        for (HWND window : lastWindows)
+        {
+            if (IsWindow(window))
+                ShowWindow(window, SW_SHOWNORMAL);
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+static bool InstallSystemInformerSilently(const std::wstring& setupPath)
+{
+    std::wstring installed = FindInstalledSystemInformerPath();
+
+    if (!installed.empty())
+    {
+        DebugLogLine(L"systeminformer", L"install skipped: already installed " + installed);
+        return true;
+    }
+
+    if (setupPath.empty() || !FileExists(setupPath))
+    {
+        DebugLogLine(L"systeminformer", L"install skipped: setup missing " + setupPath);
+        return false;
+    }
+
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+
+    if (!StartElevatedProcessHidden(setupPath, L"", process, pid))
+        return false;
+
+    DebugLogLine(L"systeminformer", L"setup started pid=" + std::to_wstring(pid));
+
+    bool ok = DriveSystemInformerSetupWizard(pid, 240000);
+
+    if (process)
+    {
+        WaitForSingleObject(process, ok ? 10000 : 0);
+        CloseHandle(process);
+    }
+
+    ok = ok && !FindInstalledSystemInformerPath().empty();
+    DebugLogLine(L"systeminformer", ok ? L"install ok" : L"install failed");
     return ok;
 }
 
-static bool OpenSystemInformerItem(const std::wstring& path)
+static void SystemInformerInstallWorker(std::wstring setupPath)
 {
-    // If System Informer is already installed, just launch it.
-    std::wstring installed = FindInstalledSystemInformerPath();
-    if (!installed.empty())
-        return OpenPath(installed);
+    HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    std::wstring lower = ToLower(path);
-    bool looksLikeInstaller = lower.find(L"setup") != std::wstring::npos ||
-        lower.find(L"install") != std::wstring::npos;
-
-    if (looksLikeInstaller)
+    try
     {
-        PostLog(L"System Informer: тихая установка...");
-        if (InstallSystemInformerSilent(path))
+        bool launched = false;
+
+        if (InstallSystemInformerSilently(setupPath))
         {
-            installed = FindInstalledSystemInformerPath();
+            std::wstring installed = FindInstalledSystemInformerPath();
+
             if (!installed.empty())
             {
-                PostLog(L"System Informer установлен, запускаю");
-                return OpenPath(installed);
+                PostLog(L"System Informer: \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d");
+                launched = OpenPathElevated(installed) || OpenPath(installed);
             }
-
-            PostLog(L"System Informer установлен");
-            return true;
         }
 
-        PostLog(L"System Informer: тихая установка не удалась, открываю установщик");
+        if (!launched)
+        {
+            // Silent install did not go through (for example the elevation
+            // prompt was declined). Fall back to opening the setup normally so
+            // the button always produces a visible result.
+            PostLog(L"System Informer: \u043e\u0442\u043a\u0440\u044b\u0432\u0430\u044e \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0449\u0438\u043a");
+
+            if (!setupPath.empty() && FileExists(setupPath))
+                OpenPathElevated(setupPath);
+        }
+    }
+    catch (...)
+    {
+        DebugLogLine(L"systeminformer", L"background install failed with exception");
     }
 
-    return OpenPath(path);
+    if (SUCCEEDED(comInit))
+        CoUninitialize();
+
+    g_systemInformerInstalling.store(false);
+
+    // Re-enable the tile that was locked for the duration of the install.
+    int tileIndex = g_systemInformerTileIndex.exchange(-1);
+
+    if (tileIndex >= 0)
+    {
+        SetItemBusyIndex(tileIndex, false);
+        SetTileEnabledByIndex(tileIndex, true);
+    }
 }
 
 static bool OpenItemPath(const DownloadItem& item, const std::wstring& path)
 {
-    if (IsSystemInformerItem(item))
-        return OpenSystemInformerItem(path);
-
     if (IsEverythingItem(item))
         return OpenEverythingPath(path);
+
+    if (IsSystemInformerItem(item))
+    {
+        std::wstring installed = FindInstalledSystemInformerPath();
+
+        if (installed.empty() && !EndsWithI(path, L"setup.exe") && FileExists(path))
+            installed = path;
+
+        // Already installed: just launch it.
+        if (!installed.empty())
+        {
+            DebugLogLine(L"systeminformer", L"launch installed copy: " + installed);
+            return OpenPathElevated(installed) || OpenPath(installed);
+        }
+
+        if (path.empty() || !FileExists(path))
+        {
+            DebugLogLine(L"systeminformer", L"setup not found, nothing to install: " + path);
+            return false;
+        }
+
+        bool expected = false;
+
+        if (!g_systemInformerInstalling.compare_exchange_strong(expected, true))
+        {
+            DebugLogLine(L"systeminformer", L"install already running");
+            return true;
+        }
+
+        // The install runs on its own thread. Previously it ran synchronously,
+        // including from the click handler, which froze the window for the
+        // whole duration of the setup.
+        DebugLogLine(L"systeminformer", L"start background install: " + path);
+
+        try
+        {
+            std::thread(SystemInformerInstallWorker, path).detach();
+        }
+        catch (...)
+        {
+            g_systemInformerInstalling.store(false);
+            DebugLogLine(L"systeminformer", L"failed to start background install thread");
+            return false;
+        }
+
+        return true;
+    }
 
     if (IsRegistryExplorerItem(item) && !EnsureRegistryExplorerDotNetRuntime(path))
         return false;
@@ -2410,179 +2631,68 @@ static std::vector<DownloadMethodChoice> GetOptimizedProblemMethods(const Downlo
     return uniqueMethods;
 }
 
-// ---------------------------------------------------------------------------
-// Program downloads now run "like a browser" in the background using the URLMon
-// engine (the same download stack Internet Explorer / Edge legacy use). This
-// removes the PowerShell / curl / BITS code paths that produced errors and
-// keeps everything silent and window-less.
-// ---------------------------------------------------------------------------
-class BrowserDownloadCallback : public IBindStatusCallback
-{
-public:
-    BrowserDownloadCallback(std::wstring name, size_t linkIndex, size_t linkTotal)
-        : m_name(std::move(name)), m_linkIndex(linkIndex), m_linkTotal(linkTotal)
-    {
-    }
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
-    {
-        if (!ppv)
-            return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback)
-        {
-            *ppv = static_cast<IBindStatusCallback*>(this);
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
-
-    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPriority(LONG*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
-
-    HRESULT STDMETHODCALLTYPE OnProgress(ULONG ulProgress, ULONG ulProgressMax, ULONG, LPCWSTR) override
-    {
-        UNREFERENCED_PARAMETER(ulProgressMax);
-        if (IsCancelRequested())
-            return E_ABORT;
-
-        ULONGLONG nowTick = GetTickCount64();
-        if (m_startTick == 0)
-        {
-            m_startTick = nowTick;
-            m_lastTick = nowTick;
-            m_lastBytes = static_cast<unsigned long long>(ulProgress);
-        }
-        ULONGLONG dtTick = nowTick - m_lastTick;
-        if (dtTick >= 150)
-        {
-            unsigned long long cur = static_cast<unsigned long long>(ulProgress);
-            unsigned long long deltaBytes = (cur >= m_lastBytes) ? (cur - m_lastBytes) : 0ull;
-            m_lastSpeedBps = deltaBytes * 1000ull / dtTick;
-            m_lastTick = nowTick;
-            m_lastBytes = cur;
-        }
-
-        UpdateActiveDownloadStatus(m_name, L"браузер", m_linkIndex, m_linkTotal,
-            static_cast<unsigned long long>(ulProgress), m_lastSpeedBps);
-        return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
-
-    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD* grfBINDF, BINDINFO* pbindinfo) override
-    {
-        if (grfBINDF)
-            *grfBINDF = BINDF_GETNEWESTVERSION | BINDF_NOWRITECACHE | BINDF_PRAGMA_NO_CACHE;
-        if (pbindinfo)
-            pbindinfo->cbSize = sizeof(BINDINFO);
-        return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return S_OK; }
-
-private:
-    std::wstring m_name;
-    size_t m_linkIndex;
-    size_t m_linkTotal;
-    ULONGLONG m_startTick = 0;
-    ULONGLONG m_lastTick = 0;
-    unsigned long long m_lastBytes = 0;
-    unsigned long long m_lastSpeedBps = 0;
-};
-
-static bool DownloadViaBrowserBackground(
-    const DownloadItem& item,
-    const std::wstring& url,
-    const std::wstring& targetPath,
-    size_t linkIndex,
-    size_t linkTotal)
-{
-    if (IsCancelRequested())
-        return false;
-
-    if (url.empty())
-        return false;
-
-    std::wstring tempPath = targetPath + L".part";
-
-    // Always start from a clean slate so a stale/partial file never causes errors.
-    DeleteFileW(targetPath.c_str());
-    DeleteFileW(tempPath.c_str());
-
-    g_lastDownloadMethod.clear();
-    UpdateActiveDownloadStatus(item.name, L"браузер", linkIndex, linkTotal, 0, 0);
-    DebugLogLine(L"download", L"browser download start item=" + item.name + L" url=" + url + L" target=" + targetPath);
-
-    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    BrowserDownloadCallback cb(item.name, linkIndex, linkTotal);
-    HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), tempPath.c_str(), 0, &cb);
-
-    if (SUCCEEDED(hrInit))
-        CoUninitialize();
-
-    if (IsCancelRequested())
-    {
-        DeleteFileW(tempPath.c_str());
-        return false;
-    }
-
-    if (FAILED(hr))
-    {
-        DebugLogLine(L"download", L"browser download failed item=" + item.name + L" url=" + url +
-            L" hr=" + FormatWin32ErrorForLog(static_cast<DWORD>(hr)));
-        DeleteFileW(tempPath.c_str());
-        return false;
-    }
-
-    DeleteFileW(targetPath.c_str());
-    if (!MoveFileExW(tempPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING))
-    {
-        DebugLogLine(L"download", L"browser download move failed item=" + item.name +
-            L" error=" + FormatWin32ErrorForLog(GetLastError()));
-        DeleteFileW(tempPath.c_str());
-        return false;
-    }
-
-    g_lastDownloadMethod = L"браузер";
-    UpdateActiveDownloadStatus(item.name, L"готово", linkIndex, linkTotal,
-        GetFileSizeBytesOrZero(targetPath), 0);
-    DebugLogLine(L"download", L"browser download ok item=" + item.name +
-        L" bytes=" + std::to_wstring(GetFileSizeBytesOrZero(targetPath)));
-    return true;
-}
-
 static bool DownloadPrimaryUrlOnlyValidated(const DownloadItem& item, const std::wstring& targetPath)
 {
     if (IsCancelRequested())
         return false;
 
+    DWORD timeoutMs = GetPrimaryUrlOnlyTimeoutMs(item);
     std::vector<std::wstring> urls = GetDirectDownloadUrls(item);
-    DebugLogLine(L"download", L"browser download begin item=" + item.name + L" target=" + targetPath +
-        L" urls=" + std::to_wstring(urls.size()));
+    DebugLogLine(L"download", L"direct download start item=" + item.name + L" target=" + targetPath +
+        L" urls=" + std::to_wstring(urls.size()) + L" timeout=" + std::to_wstring(timeoutMs));
 
-    for (size_t i = 0; i < urls.size(); ++i)
+    auto tryOne = [&](size_t i, DownloadMethodChoice method, bool relaxedSpeedGuard = false) -> bool
     {
         if (IsCancelRequested())
             return false;
 
-        if (!DownloadViaBrowserBackground(item, urls[i], targetPath, i + 1, urls.size()))
-            continue;
+        return TryDirectDownloadCandidate(item, urls[i], targetPath, timeoutMs, i + 1, urls.size(), method, relaxedSpeedGuard);
+    };
 
-        if (ValidateDownloadedFileOrDelete(item, targetPath))
-            return true;
+    if (IsProblemDownloadItem(item))
+    {
+        for (size_t i = 0; i < urls.size(); ++i)
+        {
+            std::vector<DownloadMethodChoice> methods = GetOptimizedProblemMethods(item, urls[i]);
 
-        DebugLogLine(L"download", L"browser download payload invalid item=" + item.name + L" url=" + urls[i]);
+            for (DownloadMethodChoice method : methods)
+            {
+                if (tryOne(i, method, false))
+                    return true;
+
+                if (IsCancelRequested())
+                    return false;
+            }
+        }
+
+        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all problem methods exhausted");
+        return false;
     }
 
-    DebugLogLine(L"download", L"browser download failed item=" + item.name + L" all urls exhausted");
-    return false;
+    auto tryAllLinksWithMethod = [&](DownloadMethodChoice method) -> bool
+    {
+        for (size_t i = 0; i < urls.size(); ++i)
+        {
+            if (IsCancelRequested())
+                return false;
+
+            if (tryOne(i, method, false))
+                return true;
+        }
+
+        return false;
+    };
+
+    if (tryAllLinksWithMethod(DownloadMethodChoice::Curl))
+        return true;
+
+    if (tryAllLinksWithMethod(DownloadMethodChoice::WinInet))
+        return true;
+
+    bool ok = tryAllLinksWithMethod(DownloadMethodChoice::PowerShell);
+    if (!ok)
+        DebugLogLine(L"download", L"direct download failed item=" + item.name + L" all methods exhausted");
+    return ok;
 }
 
 static void AddEricZimmermanKnownUrls(const DownloadItem& item, std::vector<std::wstring>& urls)

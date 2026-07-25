@@ -34,16 +34,6 @@ static std::wstring SanitizeDebugLogText(std::wstring text)
     return text;
 }
 
-static std::wstring BuildHolyCheckDebugLogPathNoLock()
-{
-    return L"";
-}
-
-static std::wstring GetHolyCheckDebugLogPath()
-{
-    return L"";
-}
-
 static std::wstring FormatWin32ErrorForLog(DWORD err)
 {
     if (err == 0)
@@ -77,13 +67,31 @@ static std::wstring FormatWin32ErrorForLog(DWORD err)
 
 static void DebugLogLine(const std::wstring& scope, const std::wstring& message)
 {
-    (void)scope;
-    (void)message;
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t stamp[64] = {};
+    swprintf(stamp, 64, L"%04d-%02d-%02d %02d:%02d:%02d.%03d ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    std::wstring line = std::wstring(stamp) + L"[" + SanitizeDebugLogText(scope) + L"] " +
+        SanitizeDebugLogText(message) + L"\r\n";
+
+    {
+        std::lock_guard<std::mutex> lock(g_gistLogMutex);
+        g_gistLogBuffer += line;
+
+        const size_t maxChars = 1024 * 1024;
+        if (g_gistLogBuffer.size() > maxChars)
+            g_gistLogBuffer.erase(0, g_gistLogBuffer.size() - maxChars);
+
+    }
+
+    g_gistLogDirty.store(true);
 }
 
 static void DebugLogSeparator(const std::wstring& title)
 {
-    (void)title;
+    DebugLogLine(L"----", L"==== " + title + L" ====");
 }
 
 static std::wstring EscapePowerShellSingleQuotedForDebug(std::wstring s)
@@ -1071,7 +1079,7 @@ static void LimitAutomationLines(std::vector<std::wstring>& lines)
 
     size_t removed = lines.size() - AUTOMATION_MAX_LINES;
     lines.erase(lines.begin(), lines.begin() + static_cast<std::ptrdiff_t>(removed));
-    lines.insert(lines.begin(), L"показаны последние " + std::to_wstring(AUTOMATION_MAX_LINES) + L" строк, скрыто: " + std::to_wstring(removed));
+    lines.insert(lines.begin(), L"показаны последние " + std::to_wstring(AUTOMATION_MAX_LINES) + L" строк, скрыт��: " + std::to_wstring(removed));
 }
 
 static size_t GetAutomationVisibleLineCapacity(int target)
@@ -1105,6 +1113,10 @@ static size_t GetAutomationVisibleLineCapacity(int target)
         panel = GetDllActivityPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
         SetRectEmpty(&panel);
+    else if (target == AUTOMATION_OUTPUT_FILECHECK)
+        panel = GetFileCheckPanelRect(rc);
+    else if (target == AUTOMATION_OUTPUT_CLIPBOARD)
+        panel = GetClipPanelRect(rc);
     else
         panel = GetAutomationBamPanelRect(rc);
 
@@ -1145,6 +1157,10 @@ static int& AutomationScrollRef(int target)
         return g_dllActivityScrollOffset;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_injGenScrollOffset;
+    if (target == AUTOMATION_OUTPUT_FILECHECK)
+        return g_fileCheckScrollOffset;
+    if (target == AUTOMATION_OUTPUT_CLIPBOARD)
+        return g_clipboardScrollOffset;
     return g_bamScrollOffset;
 }
 
@@ -1170,6 +1186,10 @@ static std::vector<std::wstring>& AutomationLinesRef(int target)
         return g_dllActivityLines;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_injGenLines;
+    if (target == AUTOMATION_OUTPUT_FILECHECK)
+        return g_fileCheckLines;
+    if (target == AUTOMATION_OUTPUT_CLIPBOARD)
+        return g_clipboardLines;
     return g_bamLines;
 }
 
@@ -1319,6 +1339,8 @@ static RECT GetAutomationPanelRectForTarget(int target, const RECT& rc)
     if (target == AUTOMATION_OUTPUT_PAGE4) return (g_currentPage == 1) ? GetAutomationBamPanelRect(rc) : GetPage4PanelRect(rc);
     if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED) return GetDllUnsignedPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY) return GetDllActivityPanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_FILECHECK) return GetFileCheckPanelRect(rc);
+    if (target == AUTOMATION_OUTPUT_CLIPBOARD) return GetClipPanelRect(rc);
     if (target == AUTOMATION_OUTPUT_INJGEN) { RECT empty{}; return empty; }
     return GetAutomationBamPanelRect(rc);
 }
@@ -1399,13 +1421,15 @@ static int AutomationScrollTargetAtPoint(POINT pt)
     GetClientRect(g_hMain, &rc);
 
     int targetsPage1[] = { AUTOMATION_OUTPUT_PAGE4, AUTOMATION_OUTPUT_EVENTVWR };
-    int targetsPage2[] = { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_DLL_ACTIVITY, AUTOMATION_OUTPUT_DLL_UNSIGNED };
+    int targetsPage2[] = { AUTOMATION_OUTPUT_JAR_ACTIVITY, AUTOMATION_OUTPUT_DLL_ACTIVITY };
     int targetsPage3[] = { AUTOMATION_OUTPUT_PAGE4 };
+    int targetsPage5[] = { AUTOMATION_OUTPUT_FILECHECK, AUTOMATION_OUTPUT_DLL_UNSIGNED };
     const int* targets = nullptr;
     int count = 0;
     if (g_currentPage == 1) { targets = targetsPage1; count = 2; }
-    else if (g_currentPage == 2) { targets = targetsPage2; count = 3; }
+    else if (g_currentPage == 2) { targets = targetsPage2; count = 2; }
     else if (g_currentPage == 3) { targets = targetsPage3; count = 1; }
+    else if (g_currentPage == 5) { targets = targetsPage5; count = 2; }
 
     for (int i = 0; i < count; ++i)
     {
@@ -1447,6 +1471,10 @@ static void InvalidateAutomationPanel(int target)
         panel = GetDllActivityPanelRect(rc);
     else if (target == AUTOMATION_OUTPUT_INJGEN)
         SetRectEmpty(&panel);
+    else if (target == AUTOMATION_OUTPUT_FILECHECK)
+        panel = GetFileCheckPanelRect(rc);
+    else if (target == AUTOMATION_OUTPUT_CLIPBOARD)
+        panel = GetClipPanelRect(rc);
     else
         panel = GetAutomationBamPanelRect(rc);
     InflateRect(&panel, 10, 10);
@@ -1494,6 +1522,8 @@ static std::atomic_bool& AutomationWorkingRef(int target)
         return g_automationDllActivityWorking;
     if (target == AUTOMATION_OUTPUT_INJGEN)
         return g_automationInjGenWorking;
+    if (target == AUTOMATION_OUTPUT_FILECHECK)
+        return g_automationFileCheckWorking;
     return g_automationBamWorking;
 }
 
@@ -3298,25 +3328,31 @@ static std::wstring CleanPipeCell(std::wstring value)
 static const wchar_t* AUTOMATION_DELETED_MARKER = L"\xE000";
 static const wchar_t* AUTOMATION_ARCHIVE_MARKER = L"\xE001";
 static const wchar_t* AUTOMATION_FORBIDDEN_MARKER = L"\xE002";
+static const wchar_t* AUTOMATION_RENAMED_MARKER = L"\xE003";
 
 static bool AutomationLineHasDeletedMarker(const std::wstring& line)
 {
-    return line.find(L'\xE000') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002") != 0;
+    return line.find(L'\xE000') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002\xE003") != 0;
 }
 
 static bool AutomationLineHasArchiveMarker(const std::wstring& line)
 {
-    return line.find(L'\xE001') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002") != 0;
+    return line.find(L'\xE001') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002\xE003") != 0;
 }
 
 static bool AutomationLineHasForbiddenMarker(const std::wstring& line)
 {
-    return line.find(L'\xE002') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002") != 0;
+    return line.find(L'\xE002') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002\xE003") != 0;
+}
+
+static bool AutomationLineHasRenamedMarker(const std::wstring& line)
+{
+    return line.find(L'\xE003') != std::wstring::npos && line.find_first_not_of(L"\xE000\xE001\xE002\xE003") != 0;
 }
 
 static std::wstring StripAutomationDeletedMarker(std::wstring line)
 {
-    while (!line.empty() && (line[0] == L'\xE000' || line[0] == L'\xE001' || line[0] == L'\xE002'))
+    while (!line.empty() && (line[0] == L'\xE000' || line[0] == L'\xE001' || line[0] == L'\xE002' || line[0] == L'\xE003'))
         line.erase(line.begin());
     return line;
 }
@@ -3896,7 +3932,7 @@ static std::vector<std::wstring> ScanFileActivityJournalReasonsOnly(const std::w
         }
         if (e.renameNew)
         {
-            // Одиночный rename-new часто является технической записью USN без реального
+            // Одиночный rename-new часто является технической ��аписью USN без реального
             // изменения имени (визуально получается rename -> same_name). Такие строки
             // не показываем, пока рядом не найден rename-old и можно собрать пару old -> new.
             used[i] = true;
@@ -4078,12 +4114,12 @@ static void AddExeLaunchRow(std::vector<ExeLaunchRegistryRow>& rows, const std::
     if (lower.find(L".exe") == std::wstring::npos)
         return;
 
-    // Системные exe не добавляем в .exe activity ни из реестра, ни из Prefetch.
+    // Системные exe не добавляем в .exe activity ни из реестра, ни и�� Prefetch.
     if (IsLikelySystemExecutable(path))
         return;
 
     ExeLaunchRegistryRow row;
-    row.date = fallbackDate.empty() ? L"дата неизвестна" : fallbackDate;
+    row.date = fallbackDate.empty() ? L"дата ��еизвестна" : fallbackDate;
     row.source = source;
     row.path = path;
     row.name = ExtractFileNameOnly(path);
@@ -4948,7 +4984,7 @@ static std::vector<std::wstring> ScanModrinthHashes(int scanMode)
     lines.push_back(L"название | путь");
 
     DebugLogSeparator((scanMode == 1) ? L"checkmods fullscan start" : L"checkmods start");
-    DebugLogLine(L"checkmods", L"mode=" + std::to_wstring(scanMode) + L" log=" + GetHolyCheckDebugLogPath());
+    DebugLogLine(L"checkmods", L"mode=" + std::to_wstring(scanMode));
 
     wchar_t selfExePathBuf[32768]{};
     std::wstring selfExePath;
@@ -4966,6 +5002,7 @@ $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
 try{Add-Type -AssemblyName System.IO.Compression.FileSystem}catch{}
+try{Add-Type -AssemblyName System.IO.Compression}catch{}
 function HCLog([string]$m){ }
 HCLog ('start fullscan=' + $script:HolyCheckFullScan)
 
@@ -5207,6 +5244,131 @@ function IsCheatJarName([string]$name){
   foreach($k in $script:cheatKeys){ if($n.Contains($k)){ return $true } }
   return $false
 }
+function NormText([string]$s){ if($null -eq $s){return ''}; return ($s.ToLowerInvariant() -replace '[^a-z0-9]+','') }
+function ReadZipEntryText($zip,[string]$entryName){
+  try{
+    $entry=$zip.GetEntry($entryName)
+    if($null -eq $entry){return $null}
+    $sr=New-Object IO.StreamReader($entry.Open())
+    try{ return $sr.ReadToEnd() }finally{ $sr.Dispose() }
+  }catch{ return $null }
+}
+function CollectJarModNames($zip){
+  $names=New-Object System.Collections.Generic.List[string]
+  if($null -eq $zip){ return $names }
+  try{
+    $fabric=ReadZipEntryText $zip 'fabric.mod.json'
+    if($fabric){ foreach($m in [regex]::Matches($fabric,'"(?:id|name)"\s*:\s*"([^"]+)"')){ [void]$names.Add($m.Groups[1].Value) } }
+    $quilt=ReadZipEntryText $zip 'quilt.mod.json'
+    if($quilt){ foreach($m in [regex]::Matches($quilt,'"(?:id|name)"\s*:\s*"([^"]+)"')){ [void]$names.Add($m.Groups[1].Value) } }
+    foreach($tn in @('META-INF/mods.toml','META-INF/neoforge.mods.toml')){
+      $toml=ReadZipEntryText $zip $tn
+      if($toml){ foreach($m in [regex]::Matches($toml,'(?im)^\s*(?:modId|displayName)\s*=\s*"([^"]+)"')){ [void]$names.Add($m.Groups[1].Value) } }
+    }
+    $mc=ReadZipEntryText $zip 'mcmod.info'
+    if($mc){ foreach($m in [regex]::Matches($mc,'"(?:modid|name)"\s*:\s*"([^"]+)"')){ [void]$names.Add($m.Groups[1].Value) } }
+    $man=ReadZipEntryText $zip 'META-INF/MANIFEST.MF'
+    if($man){ foreach($m in [regex]::Matches($man,'(?im)^(?:Implementation-Title|Specification-Title|Automatic-Module-Name)\s*:\s*(.+)$')){ [void]$names.Add(($m.Groups[1].Value).Trim()) } }
+  }catch{}
+  return $names
+}
+function MatchCheatName($names){
+  foreach($nm in @($names)){
+    if([string]::IsNullOrWhiteSpace($nm)){continue}
+    $n=NormText $nm
+    if($n.Length -lt 3){continue}
+    foreach($k in $script:cheatKeys){ if($n.Contains($k)){ return $nm } }
+  }
+  return $null
+}
+function GetCheatNameFromJarPath([string]$path){
+  $zip=$null
+  try{
+    $zip=[IO.Compression.ZipFile]::OpenRead($path)
+    return (MatchCheatName (CollectJarModNames $zip))
+  }catch{ return $null }
+  finally{ if($zip){ try{$zip.Dispose()}catch{} } }
+}
+function GetCheatNameFromJarStream($stream){
+  $ms=$null; $zip=$null
+  try{
+    $ms=New-Object IO.MemoryStream
+    $stream.CopyTo($ms)
+    $ms.Position=0
+    $zip=New-Object IO.Compression.ZipArchive($ms,[IO.Compression.ZipArchiveMode]::Read)
+    return (MatchCheatName (CollectJarModNames $zip))
+  }catch{ return $null }
+  finally{ if($zip){ try{$zip.Dispose()}catch{} }; if($ms){ try{$ms.Dispose()}catch{} } }
+}
+function JarModNamesFromPath([string]$path){
+  $zip=$null
+  try{ $zip=[IO.Compression.ZipFile]::OpenRead($path); return (CollectJarModNames $zip) }
+  catch{ return (New-Object System.Collections.Generic.List[string]) }
+  finally{ if($zip){ try{$zip.Dispose()}catch{} } }
+}
+function FirstModName($names){
+  foreach($nm in @($names)){ if(-not [string]::IsNullOrWhiteSpace($nm)){ return $nm } }
+  return ''
+}
+function CoreTokens([string]$s){
+  if($null -eq $s){ return ,@() }
+  $t=[regex]::Replace($s,'([a-z0-9])([A-Z])','$1 $2')
+  $t=$t.ToLowerInvariant()
+  $parts=[regex]::Split($t,'[^a-z]+') | Where-Object { $_.Length -ge 2 }
+  $noise=@{'fabric'=1;'forge'=1;'quilt'=1;'neoforge'=1;'neo'=1;'mc'=1;'minecraft'=1;'mod'=1;'mods'=1;'loader'=1;'api'=1;'lib'=1;'library'=1;'version'=1;'client'=1;'server'=1;'common'=1;'snapshot'=1;'release'=1;'build'=1;'jar'=1;'refabricated'=1;'port'=1;'backport'=1}
+  $sig=@($parts | Where-Object { -not $noise.ContainsKey($_) })
+  if($sig.Count -eq 0){ $sig=@($parts) }
+  return ,$sig
+}
+function IsSubsequenceStr([string]$short,[string]$long){
+  if([string]::IsNullOrEmpty($short)){ return $true }
+  if([string]::IsNullOrEmpty($long)){ return $false }
+  $j=0
+  for($i=0;$i -lt $long.Length -and $j -lt $short.Length;$i++){ if($long[$i] -eq $short[$j]){ $j++ } }
+  return ($j -eq $short.Length)
+}
+function LcsLen([string]$a,[string]$b){
+  if([string]::IsNullOrEmpty($a) -or [string]::IsNullOrEmpty($b)){ return 0 }
+  $la=$a.Length; $lb=$b.Length
+  $prev=New-Object 'int[]' ($lb+1)
+  $best=0
+  for($i=1;$i -le $la;$i++){
+    $curr=New-Object 'int[]' ($lb+1)
+    for($j=1;$j -le $lb;$j++){
+      if($a[$i-1] -eq $b[$j-1]){ $curr[$j]=$prev[$j-1]+1; if($curr[$j] -gt $best){ $best=$curr[$j] } }
+    }
+    $prev=$curr
+  }
+  return $best
+}
+function IsRenamedJar([string]$fileName,$names){
+  $rawBase=[IO.Path]::GetFileNameWithoutExtension($fileName)
+  $baseFull=NormText $rawBase
+  if($baseFull.Length -lt 3){ return $false }
+  $baseTokens=CoreTokens $rawBase
+  $baseCore=([string]::Join('',$baseTokens))
+  if($baseCore.Length -lt 3){ $baseCore=$baseFull }
+  $has=$false
+  foreach($nm in @($names)){
+    if([string]::IsNullOrWhiteSpace($nm)){continue}
+    $nFull=NormText $nm
+    if($nFull.Length -lt 3){continue}
+    $has=$true
+    $nTokens=CoreTokens $nm
+    $nCore=([string]::Join('',$nTokens))
+    if($nCore.Length -lt 3){ $nCore=$nFull }
+    if($baseFull.Contains($nFull) -or $nFull.Contains($baseFull)){ return $false }
+    if($baseCore.Contains($nCore) -or $nCore.Contains($baseCore)){ return $false }
+    $short=$baseCore; $long=$nCore
+    if($short.Length -gt $long.Length){ $short=$nCore; $long=$baseCore }
+    if($short.Length -le 6 -and (IsSubsequenceStr $short $long)){ return $false }
+    foreach($bt in $baseTokens){ if($bt.Length -ge 4 -and ($nTokens -contains $bt)){ return $false } }
+    $lcs=LcsLen $baseCore $nCore
+    $minLen=[Math]::Min($baseCore.Length,$nCore.Length)
+    if($minLen -gt 0 -and $lcs -ge 4 -and (($lcs/$minLen) -ge 0.5)){ return $false }
+  }
+  return $has
+}
 $sha=[Security.Cryptography.SHA512]::Create()
 function HashStreamHex([IO.Stream]$stream){
   $h=$script:sha.ComputeHash($stream)
@@ -5223,6 +5385,7 @@ function HashFileHex([string]$path){
 $items=New-Object System.Collections.Generic.List[object]
 $nameHits=New-Object System.Collections.Generic.List[object]
 $cleanupHits=New-Object System.Collections.Generic.List[object]
+$renamedHits=New-Object System.Collections.Generic.List[object]
 $reported=@{}
 function AddNameHit([string]$name,[string]$path){
   if([string]::IsNullOrWhiteSpace($path)){return}
@@ -5234,6 +5397,13 @@ function AddNameHit([string]$name,[string]$path){
 function AddCleanupHit([string]$name,[string]$path){
   if([string]::IsNullOrWhiteSpace($path)){return}
   $script:cleanupHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
+}
+function AddRenamedHit([string]$name,[string]$path){
+  if([string]::IsNullOrWhiteSpace($path)){return}
+  $k=PathKey $path
+  if($script:reported.ContainsKey($k)){return}
+  $script:reported[$k]=1
+  $script:renamedHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
 }
 function AddJarItem([string]$name,[string]$path,[string]$hash){
   if(IsCheatJarName $name){ AddNameHit $name $path; return }
@@ -5298,7 +5468,13 @@ foreach($r in $roots){
         $seen[$k]=1
         if($ext -eq '.jar'){
           if(IsCheatJarName $f.Name){ AddNameHit $f.Name $f.FullName; HCLog ('name hit: ' + $f.FullName) }
-          else{ AddJarItem $f.Name $f.FullName (HashFileHex $f.FullName) }
+          else{
+            $names=JarModNamesFromPath $f.FullName
+            $inner=MatchCheatName $names
+            if($inner){ AddNameHit ($f.Name + ' (mod: ' + $inner + ')') $f.FullName; HCLog ('content hit: ' + $f.FullName + ' inner=' + $inner) }
+            elseif(IsRenamedJar $f.Name $names){ AddRenamedHit ($f.Name + ' (mod: ' + (FirstModName $names) + ')') $f.FullName; HCLog ('renamed hit: ' + $f.FullName + ' inner=' + (FirstModName $names)) }
+            else{ AddJarItem $f.Name $f.FullName (HashFileHex $f.FullName) }
+          }
         }elseif($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
           $archives[$k]=$f
         }
@@ -5564,8 +5740,18 @@ try{
             $n=[IO.Path]::GetFileName($e.FullName)
             $p=$a.FullName + '!' + $e.FullName
             if(IsCheatJarName $n){ AddNameHit $n $p; continue }
-            $st=$null
-            try{ $st=$e.Open(); AddJarItem $n $p (HashStreamHex $st) }catch{} finally{ if($st){$st.Dispose()} }
+            $st=$null; $ms=$null
+            try{
+              $st=$e.Open()
+              $ms=New-Object IO.MemoryStream
+              $st.CopyTo($ms)
+              $names=New-Object System.Collections.Generic.List[string]
+              try{ $ms.Position=0; $za=New-Object IO.Compression.ZipArchive($ms,[IO.Compression.ZipArchiveMode]::Read,$true); try{ $names=CollectJarModNames $za }finally{ $za.Dispose() } }catch{}
+              $inner=MatchCheatName $names
+              if($inner){ AddNameHit ($n + ' (mod: ' + $inner + ')') $p; HCLog ('content hit (zip): ' + $p + ' inner=' + $inner) }
+              elseif(IsRenamedJar $n $names){ AddRenamedHit ($n + ' (mod: ' + (FirstModName $names) + ')') $p; HCLog ('renamed hit (zip): ' + $p + ' inner=' + (FirstModName $names)) }
+              else{ $ms.Position=0; AddJarItem $n $p (HashStreamHex $ms) }
+            }catch{} finally{ if($ms){$ms.Dispose()}; if($st){$st.Dispose()} }
           }
         }
       }catch{} finally{ if($zip){$zip.Dispose()} }
@@ -5580,7 +5766,13 @@ try{
               $rel=$_.FullName.Substring($out.Length).TrimStart('\\')
               $p=$a.FullName + '!' + $rel
               if(IsCheatJarName $_.Name){ AddNameHit $_.Name $p }
-              else{ AddJarItem $_.Name $p (HashFileHex $_.FullName) }
+              else{
+                $names=JarModNamesFromPath $_.FullName
+                $inner=MatchCheatName $names
+                if($inner){ AddNameHit ($_.Name + ' (mod: ' + $inner + ')') $p; HCLog ('content hit (7z): ' + $p + ' inner=' + $inner) }
+                elseif(IsRenamedJar $_.Name $names){ AddRenamedHit ($_.Name + ' (mod: ' + (FirstModName $names) + ')') $p; HCLog ('renamed hit (7z): ' + $p + ' inner=' + (FirstModName $names)) }
+                else{ AddJarItem $_.Name $p (HashFileHex $_.FullName) }
+              }
             }catch{}
           }
         }
@@ -5594,7 +5786,7 @@ try{
   try{$sha256.Dispose()}catch{}
   HCLog ('archive phase done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count + '; cleanupHits=' + $cleanupHits.Count)
 }
-if($items.Count -eq 0 -and $nameHits.Count -eq 0){HCLog 'no items/hits after archive phase, exit'; 'mods not found'; exit}
+if($items.Count -eq 0 -and $nameHits.Count -eq 0 -and $renamedHits.Count -eq 0){HCLog 'no items/hits after archive phase, exit'; 'mods not found'; exit}
 $known=@{}
 HCLog ('modrinth lookup begin count=' + $items.Count)
 for($i=0;$i -lt $items.Count;$i+=100){
@@ -5610,14 +5802,16 @@ for($i=0;$i -lt $items.Count;$i+=100){
   }catch{HCLog ('modrinth batch failed from=' + $i + ' error=' + $_.Exception.Message)}
 }
 HCLog ('modrinth lookup done known=' + $known.Count)
-function FormatFoundModLine([string]$name,[string]$path,[bool]$forbiddenName){
+function FormatFoundModLine([string]$name,[string]$path,[bool]$forbiddenName,[bool]$renamedName=$false){
   $prefix=''
-  if($forbiddenName){ $prefix=([string][char]0xE002) }
-  if($path -like '*!*'){ return ($prefix + ([char]0xE001) + $name + ' (архив) | ' + $path) }
+  if($renamedName){ $prefix=([string][char]0xE003) }
+  elseif($forbiddenName){ $prefix=([string][char]0xE002) }
+  if($path -match '\.(?:zip|rar|7z)!'){ return ($prefix + ([char]0xE001) + $name + ' (архив) | ' + $path) }
   return ($prefix + ('{0} | {1}' -f $name,$path))
 }
 $bad=0
 foreach($it in $nameHits){ $bad++; FormatFoundModLine $it.Name $it.Path $true }
+foreach($it in $renamedHits){ $bad++; FormatFoundModLine $it.Name $it.Path $false $true }
 foreach($it in $items){
   if(-not $known.ContainsKey($it.Hash)){
     $k=PathKey $it.Path
@@ -5727,6 +5921,66 @@ if($count -eq 0){'не найдено'}
         lines.push_back(L"не найдено");
 
     return lines;
+}
+
+// В checkmods показываем только те строки, которые чем-то подсвечиваются:
+// запрещённые (\xE002), переименованные (\xE003), удалённые (\xE000)
+// и архивные (\xE001). Обычные моды без маркера в вывод не попадают.
+//
+// Важно: длинные строки уже разбиты AppendWrappedAutomationLine на несколько
+// физических строк: продолжение начинается с двух пробелов, маркера в нём нет,
+// а разрыв часто приходится на "\" в пути. Поэтому продолжение наследует решение
+// своей головной строки — иначе от отфильтрованного мода остаётся хвост с именем
+// файла, висящий вне колонок.
+static std::vector<std::wstring> KeepOnlyHighlightedPage4Lines(const std::vector<std::wstring>& lines)
+{
+    std::vector<std::wstring> out;
+    out.reserve(lines.size());
+
+    bool sawPlainModRow = false;
+    bool keepingCurrentRow = false;
+    size_t headerCount = 0;
+
+    for (const std::wstring& line : lines)
+    {
+        // Продолжение перенесённой строки.
+        if (line.rfind(L"  ", 0) == 0)
+        {
+            if (keepingCurrentRow)
+                out.push_back(line);
+            continue;
+        }
+
+        bool hasMarker =
+            AutomationLineHasForbiddenMarker(line) ||
+            AutomationLineHasRenamedMarker(line) ||
+            AutomationLineHasDeletedMarker(line) ||
+            AutomationLineHasArchiveMarker(line);
+
+        bool isHeader = (line == L"название | путь");
+        bool isStatus =
+            (line == L"не найдено") ||
+            (line == L"не удалось запустить checkmods") ||
+            (line == L"не удалось запустить checkmods fullscan");
+
+        keepingCurrentRow = (hasMarker || isHeader || isStatus);
+
+        if (keepingCurrentRow)
+        {
+            if (isHeader)
+                ++headerCount;
+            out.push_back(line);
+        }
+        else
+        {
+            sawPlainModRow = true;
+        }
+    }
+
+    if (out.size() == headerCount && sawPlainModRow)
+        out.push_back(L"не найдено");
+
+    return out;
 }
 
 static std::vector<std::wstring> ScanPage4ByMode(int mode)
@@ -6065,7 +6319,7 @@ static std::vector<std::wstring> ExecuteAutomationScanTarget(int target, bool un
     else if (target == AUTOMATION_OUTPUT_MC_LOGS)
         lines = ScanExeDeletedFromUsnDeleteClose();
     else if (target == AUTOMATION_OUTPUT_PAGE4)
-        lines = ScanPage4ByMode(page4Mode);
+        lines = KeepOnlyHighlightedPage4Lines(ScanPage4ByMode(page4Mode));
     else if (target == AUTOMATION_OUTPUT_DLL_UNSIGNED)
         lines = ScanUnsignedDlls();
     else if (target == AUTOMATION_OUTPUT_DLL_ACTIVITY)
@@ -7478,6 +7732,239 @@ static std::string WideToUtf8(const std::wstring& s)
         WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &out[0], n, nullptr, nullptr);
 
     return out;
+}
+
+// ===== Remote GitHub Gist logging =====
+
+static std::wstring GistSanitizeForName(const std::wstring& in)
+{
+    std::wstring out;
+    for (wchar_t c : in)
+    {
+        bool asciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+        if (asciiAlnum || c == L'-' || c == L'.' || static_cast<unsigned>(c) >= 0x80)
+            out += c;
+        else
+            out += L'_';
+    }
+    if (out.empty())
+        out = L"x";
+    if (out.size() > 64)
+        out = out.substr(0, 64);
+    return out;
+}
+
+static std::wstring GistGetUserName()
+{
+    wchar_t buf[256] = {};
+    DWORD sz = 256;
+    if (GetUserNameW(buf, &sz))
+        return std::wstring(buf);
+    return L"user";
+}
+
+static std::wstring GistGetComputerName()
+{
+    wchar_t buf[256] = {};
+    DWORD sz = 256;
+    if (GetComputerNameW(buf, &sz))
+        return std::wstring(buf);
+    return L"pc";
+}
+
+static std::wstring GistGetWindowsLabel()
+{
+    std::wstring product, display, build;
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+            0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS)
+    {
+        wchar_t buf[256];
+        DWORD sz;
+        sz = sizeof(buf); buf[0] = 0;
+        if (RegQueryValueExW(hKey, L"ProductName", nullptr, nullptr, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS)
+        { buf[255] = 0; product = buf; }
+        sz = sizeof(buf); buf[0] = 0;
+        if (RegQueryValueExW(hKey, L"DisplayVersion", nullptr, nullptr, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS)
+        { buf[255] = 0; display = buf; }
+        sz = sizeof(buf); buf[0] = 0;
+        if (RegQueryValueExW(hKey, L"CurrentBuild", nullptr, nullptr, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS)
+        { buf[255] = 0; build = buf; }
+        RegCloseKey(hKey);
+    }
+
+    long buildNum = 0;
+    for (wchar_t c : build)
+    {
+        if (c >= L'0' && c <= L'9') buildNum = buildNum * 10 + (c - L'0');
+        else break;
+    }
+    if (buildNum >= 22000)
+    {
+        size_t pos = product.find(L"Windows 10");
+        if (pos != std::wstring::npos)
+            product.replace(pos, 10, L"Windows 11");
+    }
+
+    std::wstring label = product;
+    if (!display.empty())
+        label += L" " + display;
+    if (!build.empty())
+        label += L" build " + build;
+    if (label.empty())
+        label = L"Windows";
+    return label;
+}
+
+static std::wstring GistBuildLogFileNameNoLock()
+{
+    if (!g_gistLogFileName.empty())
+        return g_gistLogFileName;
+    std::wstring user = GistSanitizeForName(GistGetUserName());
+    std::wstring pc = GistSanitizeForName(GistGetComputerName());
+    std::wstring win = GistSanitizeForName(GistGetWindowsLabel());
+    g_gistLogFileName = user + L"_" + pc + L"_" + win + L".md";
+    return g_gistLogFileName;
+}
+
+static std::string GistJsonEscape(const std::string& s)
+{
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20)
+                {
+                    out += "\\u00";
+                    out += hex[(c >> 4) & 0xF];
+                    out += hex[c & 0xF];
+                }
+                else
+                {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+static bool GistHttpPatch(const std::string& jsonBody, DWORD* outStatus)
+{
+    if (outStatus)
+        *outStatus = 0;
+    bool ok = false;
+    HINTERNET hSession = WinHttpOpen(L"HolyCheck-Logger/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession)
+        return false;
+    HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (hConnect)
+    {
+        std::wstring path = std::wstring(L"/gists/") + g_gistLogId;
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"PATCH", path.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (hRequest)
+        {
+            std::wstring headers = L"User-Agent: HolyCheck-Logger\r\n";
+            headers += L"Accept: application/vnd.github+json\r\n";
+            headers += L"Content-Type: application/json\r\n";
+            headers += std::wstring(L"Authorization: Bearer ") + g_gistLogToken + L"\r\n";
+            if (WinHttpSendRequest(hRequest, headers.c_str(), static_cast<DWORD>(-1),
+                    const_cast<char*>(jsonBody.data()), static_cast<DWORD>(jsonBody.size()),
+                    static_cast<DWORD>(jsonBody.size()), 0) &&
+                WinHttpReceiveResponse(hRequest, nullptr))
+            {
+                DWORD status = 0;
+                DWORD size = sizeof(status);
+                WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+                if (outStatus)
+                    *outStatus = status;
+                ok = (status >= 200 && status < 300);
+            }
+            WinHttpCloseHandle(hRequest);
+        }
+        WinHttpCloseHandle(hConnect);
+    }
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+static void GistUploadCurrentLog()
+{
+    if (!g_gistLogToken || g_gistLogToken[0] == L'\0')
+        return;
+    std::wstring fileName;
+    std::wstring content;
+    {
+        std::lock_guard<std::mutex> lock(g_gistLogMutex);
+        fileName = GistBuildLogFileNameNoLock();
+        content = g_gistLogBuffer;
+    }
+    if (content.empty())
+        return;
+
+    size_t lineCount = 1;
+    for (wchar_t c : content) { if (c == L'\n') ++lineCount; }
+
+    // Wrap the log in a collapsible Markdown block so the gist page shows only
+    // the title by default; clicking the summary expands the full 200+ lines.
+    std::wstring md = L"<details>\n<summary>";
+    md += fileName;
+    md += L" (";
+    md += std::to_wstring(lineCount);
+    md += L" lines)</summary>\n\n~~~~\n";
+    md += content;
+    if (content.back() != L'\n')
+        md += L"\n";
+    md += L"~~~~\n\n</details>\n";
+
+    std::string body = "{\"files\":{\"";
+    body += GistJsonEscape(WideToUtf8(fileName));
+    body += "\":{\"content\":\"";
+    body += GistJsonEscape(WideToUtf8(md));
+    body += "\"}}}";
+    DWORD status = 0;
+    GistHttpPatch(body, &status);
+}
+
+static void GistLogUploaderThreadProc()
+{
+    while (!g_gistLogStop.load())
+    {
+        for (int i = 0; i < 20 && !g_gistLogStop.load(); ++i)
+            Sleep(100);
+        if (g_gistLogDirty.exchange(false))
+            GistUploadCurrentLog();
+    }
+    if (g_gistLogDirty.exchange(false))
+        GistUploadCurrentLog();
+}
+
+static void StartGistLogUploader()
+{
+    if (!g_gistLogToken || g_gistLogToken[0] == L'\0')
+        return;
+    bool expected = false;
+    if (g_gistLogThreadStarted.compare_exchange_strong(expected, true))
+        std::thread(GistLogUploaderThreadProc).detach();
+}
+
+static void StopGistLogUploaderAndFlush()
+{
+    g_gistLogStop.store(true);
+    GistUploadCurrentLog();
 }
 
 static std::wstring UrlEncodeUtf8(const std::wstring& s)

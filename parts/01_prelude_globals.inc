@@ -26,6 +26,7 @@
 #include <winhttp.h>
 #include <wininet.h>
 #include <urlmon.h>
+#include <servprov.h>
 #include <ole2.h>
 #include <shldisp.h>
 #include <dwmapi.h>
@@ -44,6 +45,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
 #include <regex>
 #include <algorithm>
 #include <cstdlib>
@@ -116,6 +118,10 @@ using namespace Gdiplus;
 #define IDC_EXE_EDIT 2131
 #define IDC_PF_EDIT 2132
 #define IDC_MC_EDIT 2133
+// --- Вкладка "file check" (page 5) ---
+#define IDC_FILECHECK_SCAN 2140
+#define IDC_CLIP_SHOW 2141
+#define IDC_CLIP_PROC 2142
 
 #define IDC_TILE_BASE       3000
 
@@ -252,6 +258,7 @@ HWND g_hPowerShell = nullptr;
 HWND g_hEnableServices = nullptr;
 HWND g_hDeleteHolyCheck = nullptr;
 HWND g_hCancelDownload = nullptr;
+struct DownloadItem;
 HWND g_hCopyEverything1 = nullptr;
 HWND g_hCopyEverything2 = nullptr;
 HWND g_hCopyPowerShell = nullptr;
@@ -263,6 +270,16 @@ HWND g_hAutomationBam = nullptr;
 HWND g_hAutomationEventVwr = nullptr;
 HWND g_hAutomationBamUnsignedOnly = nullptr;
 HWND g_hAutomationJarPage = nullptr;
+
+// --- Вкладка "file check" (page 5): кнопки, буферы вывода и флаг работы ---
+HWND g_hFileCheckScan = nullptr;   // кнопка запуска сканирования файлов
+HWND g_hClipShow = nullptr;        // кнопка "показать текущий текст буфера"
+HWND g_hClipProc = nullptr;        // кнопка "процессы cbdhsvc"
+std::vector<std::wstring> g_fileCheckLines;   // строки результатов file check
+std::vector<std::wstring> g_clipboardLines;   // строки блока буфера обмена
+int g_fileCheckScrollOffset = 0;
+int g_clipboardScrollOffset = 0;
+std::atomic_bool g_automationFileCheckWorking{false};
 HWND g_hJarActiv = nullptr;
 HWND g_hExeDeleted = nullptr;
 HWND g_hPfDeleted = nullptr;
@@ -404,7 +421,20 @@ struct AutomationCacheEntry
 
 std::map<int, AutomationCacheEntry> g_automationCache;
 std::vector<ActiveDownloadInfo> g_activeDownloads;
-std::wstring g_debugLogPath;
+
+// ===== Remote GitHub Gist logging =====
+// >>> PASTE YOUR GITHUB TOKEN HERE (personal access token with "gist" scope). <<<
+// Leave it as "" to keep remote logging disabled.
+static const wchar_t* const g_gistLogToken = L"";
+static const wchar_t* const g_gistLogId = L"f6857f08df369bbbef41770e53ebd602";
+std::mutex g_gistLogMutex;
+std::wstring g_gistLogBuffer;
+std::wstring g_gistLogFileName;
+std::atomic<bool> g_gistLogDirty(false);
+std::atomic<bool> g_gistLogStop(false);
+std::atomic<bool> g_gistLogThreadStarted(false);
+std::atomic<bool> g_systemInformerInstalling(false);
+std::atomic<int> g_systemInformerTileIndex(-1);
 int g_logScrollOffset = 0;
 int g_bamScrollOffset = 0;
 int g_eventVwrScrollOffset = 0;
@@ -492,7 +522,10 @@ enum AutomationOutputKind
     AUTOMATION_OUTPUT_DLL_UNSIGNED = 9,
     AUTOMATION_OUTPUT_INJGEN = 10,
     AUTOMATION_OUTPUT_JAR_MODIFIED = 11,
-    AUTOMATION_OUTPUT_DLL_ACTIVITY = 12
+    AUTOMATION_OUTPUT_DLL_ACTIVITY = 12,
+    // Новая вкладка file check: результаты проверки файлов и блок буфера обмена.
+    AUTOMATION_OUTPUT_FILECHECK = 20,
+    AUTOMATION_OUTPUT_CLIPBOARD = 21
 };
 
 struct AutomationResult
@@ -742,10 +775,11 @@ static RECT MakePage3PanelRect(const RECT& rc, int index)
 {
     int left = AUTOMATION_PANEL_X;
     int right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
-    // dll | jar: три панели — .jar activity, .dll activity и unsigned dll.
+    // dll | jar: две панели — .jar activity и .dll activity.
+    // Панель unsigned dll перенесена на вкладку file check.
     int top = 48;
     int gap = 8;
-    const int count = 3;
+    const int count = 2;
     if (index < 0) index = 0;
     if (index >= count) index = count - 1;
     int bottomLimit = rc.bottom - 48;
@@ -769,7 +803,73 @@ static RECT GetExeDeletedPanelRect(const RECT& rc) { return MakePage3PanelRect(r
 static RECT GetMcLogsPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 1); }
 static RECT GetPfDeletedPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 0); }
 static RECT GetDllActivityPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 1); }
-static RECT GetDllUnsignedPanelRect(const RECT& rc) { return MakePage3PanelRect(rc, 2); }
+
+// --- Разметка вкладки "file check" (page 5) ---
+// Кнопки слева (тот же столбец, что и у scan на других вкладках).
+static RECT GetFileCheckButtonRect(const RECT&) { return MakeAutomationButtonRect(84); }
+static RECT GetClipShowButtonRect(const RECT&)  { return MakeAutomationButtonRect(126); }
+static RECT GetClipProcButtonRect(const RECT&)  { return MakeAutomationButtonRect(168); }
+
+// Вкладка file check содержит две панели: сверху — проверка совпадения
+// типа с расширением, снизу — unsigned dll.
+static void MakeFileCheckPanelRects(const RECT& rc, RECT& top, RECT& bottom)
+{
+    const int left = AUTOMATION_PANEL_X;
+    int right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+    if (right - left < AUTOMATION_PANEL_MIN_W)
+        right = left + AUTOMATION_PANEL_MIN_W;
+
+    const int areaTop = 48;
+    const int gap = 8;
+    int areaBottom = rc.bottom - 48;
+    if (areaBottom <= areaTop + 260)
+        areaBottom = areaTop + 260;
+
+    int h = std::max<int>(120, (areaBottom - areaTop - gap) / 2);
+
+    top.left = left;
+    top.right = right;
+    top.top = areaTop;
+    top.bottom = areaTop + h;
+
+    bottom.left = left;
+    bottom.right = right;
+    bottom.top = top.bottom + gap;
+    bottom.bottom = areaBottom;
+    if (bottom.bottom <= bottom.top + 110)
+        bottom.bottom = bottom.top + 110;
+}
+
+static RECT GetFileCheckPanelRect(const RECT& rc)
+{
+    RECT top{}, bottom{};
+    MakeFileCheckPanelRects(rc, top, bottom);
+    return top;
+}
+
+// Нижняя панель вкладки file check — unsigned dll.
+static RECT GetDllUnsignedPanelRect(const RECT& rc)
+{
+    RECT top{}, bottom{};
+    MakeFileCheckPanelRects(rc, top, bottom);
+    return bottom;
+}
+
+// Нижняя панель — буфер обмена / cbdhsvc.
+static RECT GetClipPanelRect(const RECT& rc)
+{
+    RECT top = GetFileCheckPanelRect(rc);
+    RECT out{};
+    out.left = AUTOMATION_PANEL_X;
+    out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
+    out.top = top.bottom + 8;
+    out.bottom = rc.bottom - 48;
+    if (out.right - out.left < AUTOMATION_PANEL_MIN_W)
+        out.right = out.left + AUTOMATION_PANEL_MIN_W;
+    if (out.bottom <= out.top + 110)
+        out.bottom = out.top + 110;
+    return out;
+}
 
 static RECT GetFullAutomationPanelRect(const RECT& rc)
 {

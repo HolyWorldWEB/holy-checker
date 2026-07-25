@@ -1,5 +1,7 @@
 #include "parts/01_prelude_globals.inc"
 #include "parts/02_state_paths_urls.inc"
+// 10 зависит только от символов 01/02 и должен идти ДО 08/09, которые вызывают его функции.
+#include "parts/10_filecheck_clipboard.inc"
 #include "parts/03_winhttp_download.inc"
 #include "parts/04_zip_process_utils.inc"
 #include "parts/05_fallback_sources.inc"
