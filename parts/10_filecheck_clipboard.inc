@@ -206,6 +206,20 @@ static bool ExtensionMatchesType(const std::wstring& ext, const std::wstring& re
     return false;
 }
 
+// Возвращает предполагаемое исходное расширение исполняемого файла по его
+// сигнатуре. Функция нужна в том числе для файлов, переименованных в .zip.
+// Сам файл при проверке не переименовывается и никак не изменяется.
+static std::wstring ExecutableExtensionFromType(const std::wstring& realType)
+{
+    if (realType == L"DLL(PE)")
+        return L".dll";
+    if (realType == L"EXE(PE)")
+        return L".exe";
+    if (realType == L"ELF")
+        return L".elf";
+    return L"";
+}
+
 // -----------------------------------------------------------------------------
 //  Доброкачественные случаи (по требованию): картинка, названная как другая
 //  картинка (.png ↔ .jpg), либо как обобщённое/служебное расширение (например
@@ -344,25 +358,33 @@ static bool EvaluateFile(const std::wstring& path, FileCheckHit& out)
         return false;
 
     // Несовпадение. Оцениваем серьёзность.
-    bool realIsExecutable = (realType == L"EXE(PE)" || realType == L"DLL(PE)" || realType == L"ELF");
+    std::wstring originalExecutableExt = ExecutableExtensionFromType(realType);
+    bool realIsExecutable = !originalExecutableExt.empty();
     if (!realIsExecutable)
         return false;
     std::wstring reason;
     std::wstring status;
-    if (realIsExecutable)
+
+    // Отдельно показываем случай переименования исполняемого файла в .zip.
+    // Определение идёт по magic bytes/PE-заголовку, исходный .zip остаётся на
+    // месте с прежним именем: FileCheck открывает его только на чтение.
+    if (ext == L"zip")
     {
         status = L"ПОДОЗРИТЕЛЬНО";
-        reason = L"расширение ." + ext + L", но по сигнатуре это исполняемый файл (" + realType + L")";
+        reason = L"файл с именем .zip по сигнатуре имеет исходный тип " +
+                 originalExecutableExt + L" (" + realType +
+                 L"); имя исходного файла не изменялось";
     }
     else
     {
-        status = L"внимание";
-        reason = L"тип по содержимому (" + realType + L") не соответствует расшир��нию ." + ext;
+        status = L"ПОДОЗРИТЕЛЬНО";
+        reason = L"расширение ." + ext + L", но по сигнатуре это исполняемый файл " +
+                 originalExecutableExt + L" (" + realType + L")";
     }
 
     out.path        = path;
     out.declaredExt = ext.empty() ? L"(нет)" : (L"." + ext);
-    out.realType    = realType;
+    out.realType    = originalExecutableExt + L" (" + realType + L")";
     out.status      = status;
     out.reason      = reason;
     return true;
@@ -681,4 +703,3 @@ static void ShowClipboardProcessesUI()
     SetAutomationLines(AUTOMATION_OUTPUT_CLIPBOARD, std::move(lines));
     InvalidateAutomationPanel(AUTOMATION_OUTPUT_CLIPBOARD);
 }
-

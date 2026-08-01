@@ -5,6 +5,7 @@ static bool ReadFilePrefix(const std::wstring& path, std::vector<unsigned char>&
 static bool StartsWithBytes(const std::vector<unsigned char>& data, std::initializer_list<unsigned char> bytes);
 static bool LooksLikeDownloadedHtml(const std::vector<unsigned char>& data);
 static bool IsZipArchiveStructurallyValid(const std::wstring& path);
+static bool IsRecuvaItem(const DownloadItem& item);
 
 static unsigned long long GetMinCompleteExeSizeForName(const std::wstring& itemName)
 {
@@ -1205,6 +1206,110 @@ static std::wstring FindInstalledSystemInformerPath()
     return L"";
 }
 
+static void AddUniqueRecuvaLaunchCandidate(std::vector<std::wstring>& candidates, const std::wstring& rawPath)
+{
+    std::wstring path = ExtractExecutablePathFromRegistryValue(rawPath);
+
+    if (path.empty())
+        return;
+
+    std::wstring lower = ToLower(path);
+    bool recuvaName = lower.find(L"recuva64.exe") != std::wstring::npos ||
+        lower.find(L"recuva.exe") != std::wstring::npos;
+
+    if (!recuvaName)
+        return;
+
+    for (const std::wstring& existing : candidates)
+    {
+        if (ToLower(existing) == lower)
+            return;
+    }
+
+    candidates.push_back(path);
+}
+
+static void AddRecuvaCandidateFromEnv(std::vector<std::wstring>& candidates, const wchar_t* envName, const wchar_t* relativePath)
+{
+    wchar_t base[MAX_PATH * 4]{};
+    DWORD len = GetEnvironmentVariableW(envName, base, ARRAYSIZE(base));
+
+    if (len == 0 || len >= ARRAYSIZE(base))
+        return;
+
+    AddUniqueRecuvaLaunchCandidate(candidates, CombinePath(base, relativePath));
+}
+
+static void AddRecuvaUninstallRegistryCandidates(std::vector<std::wstring>& candidates, HKEY root, REGSAM wowFlags)
+{
+    HKEY uninstallKey{};
+    if (RegOpenKeyExW(root,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            0, KEY_READ | wowFlags, &uninstallKey) != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    for (DWORD index = 0;; ++index)
+    {
+        wchar_t subName[512]{};
+        DWORD subNameLen = ARRAYSIZE(subName);
+
+        if (RegEnumKeyExW(uninstallKey, index, subName, &subNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+
+        HKEY itemKey{};
+        if (RegOpenKeyExW(uninstallKey, subName, 0, KEY_READ | wowFlags, &itemKey) != ERROR_SUCCESS)
+            continue;
+
+        std::wstring displayName;
+        if (LaunchRegistryGetString(itemKey, L"DisplayName", displayName) &&
+            ToLower(displayName).find(L"recuva") != std::wstring::npos)
+        {
+            std::wstring installLocation;
+            if (LaunchRegistryGetString(itemKey, L"InstallLocation", installLocation))
+            {
+                installLocation = TrimLaunchString(installLocation);
+                if (!installLocation.empty())
+                {
+                    AddUniqueRecuvaLaunchCandidate(candidates, CombinePath(installLocation, L"recuva64.exe"));
+                    AddUniqueRecuvaLaunchCandidate(candidates, CombinePath(installLocation, L"recuva.exe"));
+                }
+            }
+
+            std::wstring displayIcon;
+            if (LaunchRegistryGetString(itemKey, L"DisplayIcon", displayIcon))
+                AddUniqueRecuvaLaunchCandidate(candidates, displayIcon);
+        }
+
+        RegCloseKey(itemKey);
+    }
+
+    RegCloseKey(uninstallKey);
+}
+
+static std::wstring FindInstalledRecuvaPath()
+{
+    std::vector<std::wstring> candidates;
+
+    AddRecuvaUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddRecuvaUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddRecuvaUninstallRegistryCandidates(candidates, HKEY_CURRENT_USER, 0);
+
+    AddRecuvaCandidateFromEnv(candidates, L"ProgramFiles", L"Recuva\\recuva64.exe");
+    AddRecuvaCandidateFromEnv(candidates, L"ProgramFiles", L"Recuva\\recuva.exe");
+    AddRecuvaCandidateFromEnv(candidates, L"ProgramFiles(x86)", L"Recuva\\recuva64.exe");
+    AddRecuvaCandidateFromEnv(candidates, L"ProgramFiles(x86)", L"Recuva\\recuva.exe");
+
+    for (const std::wstring& path : candidates)
+    {
+        if (FileExists(path))
+            return path;
+    }
+
+    return L"";
+}
+
 static std::wstring FindLaunchPathForItem(const DownloadItem& item, const std::wstring& baseFolder)
 {
     std::wstring target = GetItemTargetPath(item, baseFolder);
@@ -1212,6 +1317,13 @@ static std::wstring FindLaunchPathForItem(const DownloadItem& item, const std::w
     if (IsSystemInformerItem(item))
     {
         std::wstring installedPath = FindInstalledSystemInformerPath();
+        if (!installedPath.empty())
+            return installedPath;
+    }
+
+    if (IsRecuvaItem(item))
+    {
+        std::wstring installedPath = FindInstalledRecuvaPath();
         if (!installedPath.empty())
             return installedPath;
     }
@@ -1775,10 +1887,120 @@ static void SystemInformerInstallWorker(std::wstring setupPath)
     }
 }
 
+static bool InstallRecuvaSilently(const std::wstring& setupPath)
+{
+    std::wstring installed = FindInstalledRecuvaPath();
+
+    if (!installed.empty())
+        return true;
+
+    if (setupPath.empty() || !FileExists(setupPath))
+        return false;
+
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+
+    // Official Recuva setup supports the NSIS /S switch. The process is
+    // launched hidden and elevated, so only the Windows UAC prompt can appear.
+    if (!StartElevatedProcessHidden(setupPath, L"/S", process, pid))
+        return false;
+
+    bool ok = false;
+    if (process)
+    {
+        DWORD waitResult = WaitForSingleObject(process, 240000);
+        DWORD exitCode = 1;
+        ok = waitResult == WAIT_OBJECT_0 && GetExitCodeProcess(process, &exitCode) && exitCode == 0;
+        CloseHandle(process);
+    }
+
+    for (int attempt = 0; attempt < 20 && FindInstalledRecuvaPath().empty(); ++attempt)
+        Sleep(250);
+
+    return ok && !FindInstalledRecuvaPath().empty();
+}
+
+static void RecuvaInstallWorker(std::wstring setupPath)
+{
+    HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    try
+    {
+        if (InstallRecuvaSilently(setupPath))
+        {
+            std::wstring installed = FindInstalledRecuvaPath();
+            bool launched = false;
+
+            // The installation has fully completed at this point. Try a normal
+            // launch first to avoid a second UAC prompt, then use elevation as
+            // a fallback. A few retries cover delayed antivirus/file unlocks.
+            for (int attempt = 0; attempt < 3 && !launched && !installed.empty(); ++attempt)
+            {
+                launched = OpenPath(installed) || OpenPathElevated(installed);
+
+                if (!launched)
+                    Sleep(500);
+            }
+
+            PostLog(launched
+                ? L"Recuva: установлена и открыта"
+                : L"Recuva: установлена, но не открылась");
+        }
+        else
+        {
+            PostLog(L"Recuva: ошибка фоновой установки");
+        }
+    }
+    catch (...)
+    {
+        DebugLogLine(L"recuva", L"background install failed with exception");
+    }
+
+    if (SUCCEEDED(comInit))
+        CoUninitialize();
+
+    g_recuvaInstalling.store(false);
+
+    int tileIndex = g_recuvaTileIndex.exchange(-1);
+    if (tileIndex >= 0)
+    {
+        SetItemBusyIndex(tileIndex, false);
+        SetTileEnabledByIndex(tileIndex, true);
+    }
+}
+
 static bool OpenItemPath(const DownloadItem& item, const std::wstring& path)
 {
     if (IsEverythingItem(item))
         return OpenEverythingPath(path);
+
+    if (IsRecuvaItem(item))
+    {
+        std::wstring installed = FindInstalledRecuvaPath();
+
+        // If Recuva is already installed, never open the downloaded setup.
+        if (!installed.empty())
+            return OpenPath(installed) || OpenPathElevated(installed);
+
+        if (path.empty() || !FileExists(path))
+            return false;
+
+        bool expected = false;
+        if (!g_recuvaInstalling.compare_exchange_strong(expected, true))
+            return true;
+
+        try
+        {
+            std::thread(RecuvaInstallWorker, path).detach();
+        }
+        catch (...)
+        {
+            g_recuvaInstalling.store(false);
+            return false;
+        }
+
+        return true;
+    }
 
     if (IsSystemInformerItem(item))
     {
@@ -2280,8 +2502,7 @@ static std::vector<std::wstring> GetDirectDownloadUrls(const DownloadItem& item)
     }
     else if (name.find(L"recuva") != std::wstring::npos)
     {
-        AddUniqueString(urls, L"https://download.ccleaner.com/rcsetup154.exe");
-        AddUniqueString(urls, L"https://download.ccleaner.com/recuva64.exe");
+        AddUniqueString(urls, L"https://download.ccleaner.com/rcsetup155.exe");
     }
     else if (name == L"everything")
     {

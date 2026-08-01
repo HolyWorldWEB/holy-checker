@@ -435,6 +435,8 @@ std::atomic<bool> g_gistLogStop(false);
 std::atomic<bool> g_gistLogThreadStarted(false);
 std::atomic<bool> g_systemInformerInstalling(false);
 std::atomic<int> g_systemInformerTileIndex(-1);
+std::atomic<bool> g_recuvaInstalling(false);
+std::atomic<int> g_recuvaTileIndex(-1);
 int g_logScrollOffset = 0;
 int g_bamScrollOffset = 0;
 int g_eventVwrScrollOffset = 0;
@@ -977,7 +979,7 @@ static std::vector<DownloadItem> g_items =
     { L"BrowserDownloadsView", L"https://www.nirsoft.net/utils/browserdownloadsview.zip", L"browserdownloadsview.zip", 0 },
     { L"MinecraftVersionChecker", L"https://github.com/HolyWorldWEB/VersionChecker/releases/download/v1.0.0/MinecraftVersionChecker.exe", L"MinecraftVersionChecker.exe", 0 },
     { L"USBDriveLog",          L"https://www.nirsoft.net/utils/usbdrivelog.zip", L"usbdrivelog.zip", 0 },
-    { L"USBDeview",            L"https://usbdeview.com/wp-content/uploads/2025/02/usbdeview-x64.zip", L"usbdeview-x64.zip", 0 },
+    { L"USBDeview",            L"https://usbdeview.com/wp-content/uploads/2025/02/usbdeview-x64.zip", L"usbdeview-x64.zip", 3 },
     { L"JournalTrace",         L"https://github.com/spokwn/JournalTrace/releases/download/1.2/JournalTrace.exe", L"JournalTrace.exe", 0 },
     { L"WinRAR",               L"https://www.rarlab.com/rar/winrar-x64-722ru.exe", L"winrar-x64-722ru.exe", 0 },
 
@@ -986,7 +988,7 @@ static std::vector<DownloadItem> g_items =
     { L"JumpListExplorer",     L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/JumpListExplorer.zip", L"JumpListExplorer.zip", 1 },
     { L"SimpleUnlocker",       L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/simpleunlocker_release.zip", L"simpleunlocker_release.zip", 1 },
     { L"WinPrefetchView",      L"https://www.nirsoft.net/utils/winprefetchview.zip", L"winprefetchview.zip", 1 },
-    { L"Recuva",               L"https://download.ccleaner.com/rcsetup154.exe", L"rcsetup154.exe", 1 },
+    { L"Recuva",               L"https://download.ccleaner.com/rcsetup155.exe", L"rcsetup155.exe", 1 },
 
     { L"PathsParser",          L"https://github.com/spokwn/PathsParser/releases/download/v1.1/PathsParser.exe", L"PathsParser.exe", 2 },
     { L"Detect It Easy",       L"https://github.com/horsicq/Detect-It-Easy/releases/download/Beta/die_win64_portable_3.10_x64.zip", L"die_win64_portable_3.10_x64.zip", 2 },

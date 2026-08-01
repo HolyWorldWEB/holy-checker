@@ -2016,6 +2016,47 @@ static void AppendWrappedAutomationLines(std::vector<std::wstring>& out, const s
         AppendWrappedAutomationLine(out, line, maxChars);
 }
 
+static std::mutex g_childProcessMutex;
+static std::vector<HANDLE> g_childProcesses;
+
+// Every hidden child process (curl / powershell / bitsadmin / 7z) is tracked
+// so cancelling can kill it immediately instead of waiting out its full
+// timeout, which is what used to make cancel look frozen.
+static void RegisterChildProcess(HANDLE process)
+{
+    if (!process || process == INVALID_HANDLE_VALUE)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_childProcessMutex);
+    g_childProcesses.push_back(process);
+}
+
+// Must run before the owner closes the handle, otherwise a cancel could
+// terminate a recycled handle value.
+static void UnregisterChildProcess(HANDLE process)
+{
+    if (!process || process == INVALID_HANDLE_VALUE)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_childProcessMutex);
+    g_childProcesses.erase(
+        std::remove(g_childProcesses.begin(), g_childProcesses.end(), process),
+        g_childProcesses.end());
+}
+
+static void TerminateTrackedChildProcesses()
+{
+    std::vector<HANDLE> processes;
+
+    {
+        std::lock_guard<std::mutex> lock(g_childProcessMutex);
+        processes = g_childProcesses;
+    }
+
+    for (HANDLE process : processes)
+        TerminateProcess(process, 1);
+}
+
 static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& output, DWORD timeoutMs)
 {
     output.clear();
@@ -2050,6 +2091,9 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
     std::wstring cmdLine = L"cmd.exe /d /c " + command;
 
     BOOL ok = CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+    if (ok)
+        RegisterChildProcess(pi.hProcess);
     CloseHandle(writePipe);
 
     if (!ok)
@@ -2110,6 +2154,7 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
         L" exit=" + std::to_wstring(exitCode) + L" bytes=" + std::to_wstring(bytes.size()));
 
     CloseHandle(pi.hThread);
+    UnregisterChildProcess(pi.hProcess);
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
 
@@ -2164,6 +2209,9 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
 
     LPCWSTR appName = (exePath.find(L"\\") != std::wstring::npos || exePath.find(L":") != std::wstring::npos) ? exePath.c_str() : nullptr;
     BOOL ok = CreateProcessW(appName, &cmdLine[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+    if (ok)
+        RegisterChildProcess(pi.hProcess);
     CloseHandle(writePipe);
 
     if (!ok)
@@ -2224,6 +2272,7 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
         L" exit=" + std::to_wstring(exitCode) + L" bytes=" + std::to_wstring(bytes.size()));
 
     CloseHandle(pi.hThread);
+    UnregisterChildProcess(pi.hProcess);
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
 
@@ -4983,7 +5032,8 @@ static std::vector<std::wstring> ScanModrinthHashes(int scanMode)
     std::vector<std::wstring> lines;
     lines.push_back(L"название | путь");
 
-    DebugLogSeparator((scanMode == 1) ? L"checkmods fullscan start" : L"checkmods start");
+    // Обычного режима больше нет: checkmods всегда работает как fullscan.
+    DebugLogSeparator(L"checkmods fullscan start");
     DebugLogLine(L"checkmods", L"mode=" + std::to_wstring(scanMode));
 
     wchar_t selfExePathBuf[32768]{};
@@ -4994,7 +5044,7 @@ static std::vector<std::wstring> ScanModrinthHashes(int scanMode)
 
     std::wstring script;
     script.reserve(110592);
-    script += (scanMode == 1) ? L"$script:HolyCheckFullScan=$true\n" : L"$script:HolyCheckFullScan=$false\n";
+    script += L"$script:HolyCheckFullScan=$true\n";
     script += L"$script:HolyCheckDebugLog=''\n";
     script += L"$script:HolyCheckSelfExe='" + EscapePowerShellSingleQuotedForDebug(selfExePath) + L"'\n";
     script += LR"HCPS(
@@ -5113,10 +5163,8 @@ function EnumerateCandidateFiles([string]$root){
   if([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)){return}
   HCLog ('enumerate start: ' + $root + ' fullscan=' + $script:HolyCheckFullScan)
 
-  # scan и fullscan отличаются только списком корней:
-  # scan получает только заранее добавленные папки из программы,
-  # fullscan дополнительно получает корни дисков. Сам обход один и тот же,
-  # чтобы обычный scan случайно не уходил за пределы папок через junction/symlink.
+  # Режим только один — fullscan: в список корней всегда входят и папки
+  # лаунчеров, и корни дисков. Обход не ходит через junction/symlink.
   $stack=New-Object System.Collections.Generic.Stack[string]
   $dirSeen=@{}
   try{[void]$stack.Push((Resolve-Path -LiteralPath $root -ErrorAction Stop).Path)}catch{ HCLog ('enumerate resolve failed: ' + $root + ' error=' + $_.Exception.Message); return}
@@ -5148,9 +5196,42 @@ function EnumerateCandidateFiles([string]$root){
   }
 }
 function Find7Zip(){
-  $c=@('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe')
+  $c=@('C:\Program Files\7-Zip\7z.exe','C:\Program Files (x86)\7-Zip\7z.exe',
+       'C:\Program Files\NanaZip\7z.exe','C:\Program Files\7-Zip-Zstandard\7z.exe')
   foreach($x in $c){if(Test-Path -LiteralPath $x){return $x}}
-  try{$cmd=Get-Command 7z.exe -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
+  foreach($n in @('7z.exe','7za.exe','7zr.exe')){
+    try{$cmd=Get-Command $n -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
+  }
+  return $null
+}
+function FindWinRar(){
+  # UnRAR/Rar/WinRAR используются как замена 7-Zip для .rar и .7z.
+  $c=@('C:\Program Files\WinRAR\UnRAR.exe','C:\Program Files (x86)\WinRAR\UnRAR.exe',
+       'C:\Program Files\WinRAR\Rar.exe','C:\Program Files (x86)\WinRAR\Rar.exe',
+       'C:\Program Files\WinRAR\WinRAR.exe','C:\Program Files (x86)\WinRAR\WinRAR.exe')
+  foreach($x in $c){if(Test-Path -LiteralPath $x){return $x}}
+  foreach($n in @('unrar.exe','rar.exe','winrar.exe')){
+    try{$cmd=Get-Command $n -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
+  }
+  foreach($key in @('HKLM:\SOFTWARE\WinRAR','HKLM:\SOFTWARE\WOW6432Node\WinRAR')){
+    try{
+      $reg=Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+      if($reg){
+        foreach($v in @($reg.exe64,$reg.exe32)){
+          if(-not [string]::IsNullOrWhiteSpace($v) -and (Test-Path -LiteralPath $v)){ return $v }
+        }
+      }
+    }catch{}
+  }
+  return $null
+}
+function FindBsdTar(){
+  # tar.exe (bsdtar/libarchive) встроен в Windows 10 1803+ и читает 7z/rar
+  # без установки чего-либо вообще.
+  foreach($x in @((Join-Path $env:SystemRoot 'System32\tar.exe'),(Join-Path $env:SystemRoot 'Sysnative\tar.exe'))){
+    try{ if(Test-Path -LiteralPath $x){ return $x } }catch{}
+  }
+  try{$cmd=Get-Command tar.exe -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
   return $null
 }
 $cheatJarNames=@()
@@ -5405,8 +5486,63 @@ function AddRenamedHit([string]$name,[string]$path){
   $script:reported[$k]=1
   $script:renamedHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
 }
+# --- smart library / jar-in-jar filtering ---------------------------------
+# Modrinth only indexes published mods, so helper libraries (lwjgl, guava,
+# joda-time, ...) and jar-in-jar submodules unpacked by launchers always come
+# back as "unknown" and used to flood the report. These checks drop that noise
+# BEFORE hashing, which also cuts the number of Modrinth requests.
+# Red (forbidden name) and yellow (renamed jar) detection already ran at every
+# call site, so nothing dangerous can be hidden by this filter.
+$script:libraryNames=@(
+  'lwjgl','joda-time','opentest4j','j2objc-annotations','guava','gson','asm',
+  'slf4j','log4j','netty','kotlin','kotlinx','commons','jackson','junit',
+  'hamcrest','jsr305','checker-qual','error_prone','byte-buddy','javax',
+  'jakarta','annotations','annotation','brigadier','datafixerupper','authlib',
+  'oshi','icu4j','jopt-simple','jopt','text2speech','caffeineconfig','mixin',
+  'mixinextras','mixinsquared','fastutil','rhino','jna','jsch','httpclient',
+  'httpcore','bcprov','snakeyaml','jarjar','failureaccess','objenesis',
+  'mockito','commonmark','blossom','architectury','forgeconfigapiport',
+  'placeholder-api','night-config','authlib-injector','logback','jline',
+  'ap-loader','jsr','guice','protobuf','grpc','okhttp','okio','trove','vecmath'
+)
+$script:librarySkipped=0
+function IsLibraryJarName([string]$name){
+  if([string]::IsNullOrWhiteSpace($name)){return $false}
+  $base=''
+  try{ $base=([IO.Path]::GetFileNameWithoutExtension($name)).ToLowerInvariant() }catch{ return $false }
+  if([string]::IsNullOrWhiteSpace($base)){return $false}
+  # Standard fabric/quilt API submodules shipped as jar-in-jar, for example
+  #   fabric-biome-api-v1-13.0.13+... / fabric-tag-extensions-v0-1.1.2+...
+  if($base -match '^(fabric|quilt)-[a-z0-9-]+-v\d+'){return $true}
+  if($base -match '^(fabric|quilt)-(api|api-base|loader|language|renderer|rendering)'){return $true}
+  foreach($lib in $script:libraryNames){
+    if($base -eq $lib){return $true}
+    if($base.StartsWith($lib + '-')){return $true}
+    if($base.StartsWith($lib + '_')){return $true}
+  }
+  return $false
+}
+function IsNonModLocation([string]$path){
+  if([string]::IsNullOrWhiteSpace($path)){return $false}
+  $p=$path.ToLowerInvariant()
+  # The [\\/]+ separator class matches / and \ and repeated separators, so this
+  # works for plain paths, archive inner paths and normalised paths alike.
+  # Anything that really sits in a mods folder always stays a mod.
+  if($p -match '[\\/]+mods[\\/]+'){return $false}
+  # Launcher scratch copies of mods that are already installed elsewhere.
+  if($p -match '[\\/]+processedmods[\\/]+'){return $true}
+  # Java / Gradle / launcher library and build locations.
+  if($p -match '[\\/]+(libraries|client-libs|clientlibs|natives|versions|runtime|jre|jdk|dependencies|caches|maven|\.m2|\.gradle|gradle|wrapper|build|target|classes|plugins)[\\/]+'){return $true}
+  return $false
+}
+function ShouldSkipAsLibrary([string]$name,[string]$path){
+  if(IsNonModLocation $path){return $true}
+  if(IsLibraryJarName $name){return $true}
+  return $false
+}
 function AddJarItem([string]$name,[string]$path,[string]$hash){
   if(IsCheatJarName $name){ AddNameHit $name $path; return }
+  if(ShouldSkipAsLibrary $name $path){ $script:librarySkipped++; HCLog ('skip library/non-mod: ' + $path); return }
   if([string]::IsNullOrWhiteSpace($hash)){return}
   $script:items.Add([PSCustomObject]@{Hash=$hash.ToLowerInvariant();Name=$name;Path=$path}) | Out-Null
 }
@@ -5446,9 +5582,8 @@ if($env:APPDATA){
   AddRoot (Join-Path $env:APPDATA '.tlauncher\legacy\Minecraft\game\mods')
   AddRoot (Join-Path $env:APPDATA 'PrismLauncher\instances')
 }
-if($script:HolyCheckFullScan){
-  foreach($drive in $driveRoots){ AddRoot $drive }
-}
+# Режим только один (fullscan): корни дисков добавляются всегда.
+foreach($drive in $driveRoots){ AddRoot $drive }
 
 HCLog ('final roots=' + $roots.Count + '; download/archive roots=' + $downloadRoots.Count)
 if($roots.Count -eq 0){HCLog 'no roots, exit'; 'mods folder not found'; exit}
@@ -5505,8 +5640,16 @@ HCLog ('collection done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count
 $tempRoot=Join-Path $env:TEMP ('HolyCheck_checkmods_' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 $seven=Find7Zip
+$script:winrar=FindWinRar
+$script:bsdtar=FindBsdTar
+$script:archToolMissing=$false
 $sevenText = if($seven){$seven}else{'not found'}
-HCLog ('tempRoot=' + $tempRoot + '; sevenZip=' + $sevenText)
+$winrarText = if($script:winrar){$script:winrar}else{'not found'}
+$tarText = if($script:bsdtar){$script:bsdtar}else{'not found'}
+HCLog ('tempRoot=' + $tempRoot + '; sevenZip=' + $sevenText + '; winrar=' + $winrarText + '; bsdtar=' + $tarText)
+function HasArchiveTool(){
+  return (($null -ne $seven) -or ($null -ne $script:winrar) -or ($null -ne $script:bsdtar))
+}
 function QuoteProcArg([string]$s){
   if($null -eq $s){return '""'}
   return '"' + ($s -replace '"','\"') + '"'
@@ -5550,7 +5693,7 @@ function Invoke7ZipExtractJarsSafe([string]$archive,[string]$outDir){
   try{
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$seven
-    $psi.Arguments=('x -y -p"" ' + (QuoteProcArg ('-o' + $outDir)) + ' ' + (QuoteProcArg $archive) + ' "*.jar"')
+    $psi.Arguments=('x -y -p"" ' + (QuoteProcArg ('-o' + $outDir)) + ' ' + (QuoteProcArg $archive) + ' "*.jar" -r')
     $psi.UseShellExecute=$false
     $psi.RedirectStandardInput=$true
     $psi.RedirectStandardOutput=$true
@@ -5578,6 +5721,84 @@ function Invoke7ZipExtractJarsSafe([string]$archive,[string]$outDir){
   }finally{
     if($p){try{$p.Dispose()}catch{}}
   }
+}
+function RunArchiveToolSafe([string]$exe,[string]$toolArgs,[int]$timeoutMs){
+  if([string]::IsNullOrWhiteSpace($exe)){return $false}
+  $p=$null
+  try{
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$exe
+    $psi.Arguments=$toolArgs
+    $psi.UseShellExecute=$false
+    $psi.RedirectStandardInput=$true
+    $psi.RedirectStandardOutput=$true
+    $psi.RedirectStandardError=$true
+    $psi.CreateNoWindow=$true
+    $p=New-Object System.Diagnostics.Process
+    $p.StartInfo=$psi
+    [void]$p.Start()
+    $stdout=$p.StandardOutput.ReadToEndAsync()
+    $stderr=$p.StandardError.ReadToEndAsync()
+    try{$p.StandardInput.Close()}catch{}
+    if(-not $p.WaitForExit($timeoutMs)){
+      try{$p.Kill()}catch{}
+      HCLog ('archive tool timeout: ' + $exe + ' ' + $toolArgs)
+      return $false
+    }
+    $null=$stdout.Result
+    $err=$stderr.Result
+    HCLog ('archive tool exit=' + $p.ExitCode + ' exe=' + $exe)
+    if($p.ExitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($err)){ HCLog ('archive tool stderr: ' + ($err.Substring(0,[Math]::Min(200,$err.Length)))) }
+    return ($p.ExitCode -eq 0)
+  }catch{
+    HCLog ('archive tool error: ' + $exe + ' error=' + $_.Exception.Message)
+    return $false
+  }finally{
+    if($p){try{$p.Dispose()}catch{}}
+  }
+}
+function DirHasJars([string]$dir){
+  try{ return ((@(Get-ChildItem -LiteralPath $dir -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue)).Count -gt 0) }catch{ return $false }
+}
+function ExtractJarsFromArchiveSafe([string]$archive,[string]$outDir){
+  # .rar и .7z больше не требуют именно 7-Zip: по очереди пробуем
+  # 7z-совместимые утилиты (7z/7za/7zr/NanaZip), затем UnRAR/Rar/WinRAR,
+  # затем встроенный в Windows tar.exe (bsdtar). Если нет ничего — ставим
+  # флаг и в конце требуем от пользователя установить 7-Zip или WinRAR.
+  if($seven){
+    if(Invoke7ZipExtractJarsSafe $archive $outDir){ return $true }
+    if(DirHasJars $outDir){ return $true }
+  }
+  if($script:winrar){
+    $exeName=''
+    try{ $exeName=([IO.Path]::GetFileName($script:winrar)).ToLowerInvariant() }catch{}
+    $target=$outDir
+    if(-not $target.EndsWith('\')){ $target=$target + '\' }
+    $toolArgs=''
+    if($exeName -eq 'winrar.exe'){
+      $toolArgs='x -y -ibck -p- ' + (QuoteProcArg $archive) + ' *.jar ' + (QuoteProcArg $target)
+    }else{
+      $toolArgs='x -y -p- -idq ' + (QuoteProcArg $archive) + ' *.jar ' + (QuoteProcArg $target)
+    }
+    if(RunArchiveToolSafe $script:winrar $toolArgs 60000){ return $true }
+    if(DirHasJars $outDir){ return $true }
+  }
+  if($script:bsdtar){
+    try{
+      $fi=New-Object System.IO.FileInfo($archive)
+      # tar распаковывает архив целиком, поэтому применяем его только к
+      # умеренным по размеру архивам (до 256 МБ).
+      if($fi.Length -le 268435456){
+        $toolArgs='-xf ' + (QuoteProcArg $archive) + ' -C ' + (QuoteProcArg $outDir)
+        if(RunArchiveToolSafe $script:bsdtar $toolArgs 90000){ return $true }
+        if(DirHasJars $outDir){ return $true }
+      }else{
+        HCLog ('bsdtar skipped, archive too large: ' + $archive)
+      }
+    }catch{}
+  }
+  if(-not (HasArchiveTool)){ $script:archToolMissing=$true }
+  return $false
 }
 function ZipHasEncryptedEntries([string]$path){
   $fs=$null; $br=$null
@@ -5665,17 +5886,20 @@ function ArchiveIsEncryptedOrUnreadable([string]$path,[string]$ext){
     if(ZipHasEncryptedEntries $path){ HCLog ('encrypted zip archive skipped: ' + $path); return $true }
     return $false
   }
-  if(($ext -eq '.rar' -or $ext -eq '.7z') -and $seven){
-    $lines=Invoke7ZipListSafe $path
-    if($null -eq $lines){ HCLog ('7z archive list unavailable, archive skipped: ' + $path); return $true }
-    if(SevenZipListIndicatesEncrypted $lines){ HCLog ('encrypted archive skipped: ' + $path); return $true }
+  if($ext -eq '.rar' -or $ext -eq '.7z'){
+    if(-not (HasArchiveTool)){ $script:archToolMissing=$true; HCLog ('no archive tool available, archive skipped: ' + $path); return $true }
+    if($seven){
+      $lines=Invoke7ZipListSafe $path
+      if($null -eq $lines){ HCLog ('7z archive list unavailable, archive skipped: ' + $path); return $true }
+      if(SevenZipListIndicatesEncrypted $lines){ HCLog ('encrypted archive skipped: ' + $path); return $true }
+    }
   }
   return $false
 }
 function ShouldSkipHugeArchive([System.IO.FileInfo]$a){
   try{
     if($null -eq $a){return $true}
-    if($a.Length -gt 805306368){ HCLog ('huge archive skipped (>768MB): ' + $a.FullName); return $true }
+    if($a.Length -gt 1610612736){ HCLog ('huge archive skipped (>1.5GB): ' + $a.FullName); return $true }
   }catch{}
   return $false
 }
@@ -5755,11 +5979,12 @@ try{
           }
         }
       }catch{} finally{ if($zip){$zip.Dispose()} }
-    }elseif(($ext -eq '.rar' -or $ext -eq '.7z') -and $seven){
+    }elseif($ext -eq '.rar' -or $ext -eq '.7z'){
+      if(-not (HasArchiveTool)){ $script:archToolMissing=$true; HCLog ('no archive tool for: ' + $a.FullName); continue }
       try{
         $out=Join-Path $tempRoot ([Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $out | Out-Null
-        if(-not (Invoke7ZipExtractJarsSafe $a.FullName $out)){ Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue; continue }
+        if(-not (ExtractJarsFromArchiveSafe $a.FullName $out)){ Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue; continue }
         Get-ChildItem -LiteralPath $out -Filter '*.jar' -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
           if($_.FullName -notmatch '\\(libraries|assets|runtime|versions)\\'){
             try{
@@ -5822,17 +6047,18 @@ foreach($it in $items){
     }
   }
 }
-HCLog ('finish bad=' + $bad + '; known=' + $known.Count + '; nameHits=' + $nameHits.Count + '; items=' + $items.Count)
+HCLog ('finish bad=' + $bad + '; skippedLibs=' + $script:librarySkipped + '; known=' + $known.Count + '; nameHits=' + $nameHits.Count + '; items=' + $items.Count)
 if($bad -eq 0){'не найдено'}
+if($script:archToolMissing){ 'установите 7-Zip или WinRAR | архивы .rar/.7z не проверены' }
 )HCPS";
 
     std::wstring output;
-    DWORD timeoutMs = (scanMode == 1) ? 900000 : 300000;
+    DWORD timeoutMs = 900000;
     DebugLogLine(L"checkmods", L"powershell capture start timeout=" + std::to_wstring(timeoutMs));
     if (!RunHiddenPowerShellScriptCapture(script, output, timeoutMs))
     {
         DebugLogLine(L"checkmods", L"powershell capture launch failed mode=" + std::to_wstring(scanMode));
-        lines.push_back((scanMode == 1) ? L"не удалось запустить checkmods fullscan" : L"не удалось запустить checkmods");
+        lines.push_back(L"не удалось запустить checkmods");
         return lines;
     }
     DebugLogLine(L"checkmods", L"powershell capture done timedOut=" + std::to_wstring(g_lastHiddenProcessTimedOut ? 1 : 0) +
@@ -5925,7 +6151,9 @@ if($count -eq 0){'не найдено'}
 
 static std::vector<std::wstring> ScanPage4ByMode(int mode)
 {
-    return ScanModrinthHashes(mode == 1 ? 1 : 0);
+    // Любая кнопка checkmods запускает полное сканирование.
+    (void)mode;
+    return ScanModrinthHashes(1);
 }
 
 static std::vector<std::wstring> ScanInjGenStyle()
@@ -6506,13 +6734,13 @@ static bool IsCancelRequested()
 
 static void RequestCancelDownloads()
 {
-    bool hasWork = g_working.load() || g_activeSingleDownloads.load() > 0;
-
-    if (!hasWork)
-        return;
-
+    // Cancel is unconditional on purpose. The old hasWork guard returned
+    // early whenever the counters were already clear, which left orphaned
+    // child processes and sockets running and looked like a freeze.
     g_cancelRequested = true;
+
     AbortActiveHttpHandles();
+    TerminateTrackedChildProcesses();
     PostLog(L"Отмена загрузок...");
 }
 

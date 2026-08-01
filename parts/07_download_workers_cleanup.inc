@@ -519,6 +519,13 @@ static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, c
             return installedPath;
     }
 
+    if (IsRecuvaItem(item))
+    {
+        std::wstring installedPath = FindInstalledRecuvaPath();
+        if (!installedPath.empty())
+            return installedPath;
+    }
+
     std::wstring target = GetItemTargetPath(item, baseFolder);
 
     if (EndsWithI(target, L".zip"))
@@ -621,18 +628,23 @@ static void OpenOrDownloadSingleById(int id)
         if (item.tab == 0)
             CleanupOldJuniorTextFiles(tabFolder);
 
-        if (IsSystemInformerItem(item))
+        if (IsSystemInformerItem(item) || IsRecuvaItem(item))
         {
-            // The tile must stay dead while the setup runs in the background.
-            g_systemInformerTileIndex.store(index);
+            // Installer tiles stay locked while their background setup runs.
+            std::atomic<int>& tileIndex = IsSystemInformerItem(item)
+                ? g_systemInformerTileIndex : g_recuvaTileIndex;
+            std::atomic<bool>& installing = IsSystemInformerItem(item)
+                ? g_systemInformerInstalling : g_recuvaInstalling;
+
+            tileIndex.store(index);
             SetItemBusyIndex(index, true);
             SetTileEnabledByIndex(index, false);
 
             OpenItemPath(item, quickLaunchPath);
 
-            if (!g_systemInformerInstalling.load())
+            if (!installing.load())
             {
-                g_systemInformerTileIndex.store(-1);
+                tileIndex.store(-1);
                 SetItemBusyIndex(index, false);
                 SetTileEnabledByIndex(index, true);
             }
@@ -661,6 +673,8 @@ static void OpenOrDownloadSingleById(int id)
 
     if (IsSystemInformerItem(item))
         g_systemInformerTileIndex.store(index);
+    else if (IsRecuvaItem(item))
+        g_recuvaTileIndex.store(index);
 
     SetItemBusyIndex(index, true);
     SetTileEnabledByIndex(index, false);
@@ -1039,8 +1053,15 @@ static bool UninstallSystemInformerIfPresent()
     return ok;
 }
 
+static void CloseProcessesByName(const std::vector<std::wstring>& processNames);
+
 static bool UninstallRecuvaIfPresent()
 {
+    // Close the installed copy first; otherwise the silent uninstaller can
+    // leave locked files behind. The actual uninstall runs hidden in the
+    // already detached delete worker.
+    CloseProcessesByName({ L"recuva.exe", L"recuva64.exe" });
+
     return UninstallProgramIfPresent(
         L"Recuva",
         { L"recuva", L"piriform recuva", L"ccleaner recuva" },
@@ -1533,6 +1554,43 @@ Out ('deleted-exe-count: ' + $deleted)
 }
 
 
+// Anything still locked after the retry passes (an antivirus scan, a driver
+// handle) is queued for removal on the next boot. Needs admin rights;
+// failing is harmless because the folder is already mostly gone.
+static void ScheduleFolderDeleteOnReboot(const std::wstring& path)
+{
+    DWORD attr = GetFileAttributesW(path.c_str());
+
+    if (attr == INVALID_FILE_ATTRIBUTES)
+        return;
+
+    if (attr & FILE_ATTRIBUTE_DIRECTORY)
+    {
+        std::wstring mask = CombinePath(path, L"*");
+
+        WIN32_FIND_DATAW data{};
+        HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
+
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+                    continue;
+
+                // Children must be queued before their parent directory.
+                ScheduleFolderDeleteOnReboot(CombinePath(path, data.cFileName));
+            }
+            while (FindNextFileW(hFind, &data));
+
+            FindClose(hFind);
+        }
+    }
+
+    MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+
 static void DeleteHolyCheckWorker()
 {
     RequestCancelDownloads();
@@ -1556,10 +1614,32 @@ static void DeleteHolyCheckWorker()
 
     CloseProcessesFromFolder(folder);
 
-    if (DeleteDirectoryTree(folder))
+    // Locks are usually released a moment after the owning process dies, so
+    // a single pass used to leave files behind. Re-kill and retry instead.
+    bool removed = false;
+
+    for (int attempt = 0; attempt < 4 && !removed; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            CloseProcessesFromFolder(folder);
+            Sleep(250);
+        }
+
+        removed = DeleteDirectoryTree(folder);
+    }
+
+    if (removed)
+    {
         PostLog(L"Папка удалена полностью");
+    }
     else
-        PostLog(L"Папка удалена частично, завершаю HolyCheck и удаляю exe");
+    {
+        if (IsSafeHolyCheckDeletionTarget(folder))
+            ScheduleFolderDeleteOnReboot(folder);
+
+        PostLog(L"Остатки удалятся после перезагрузки, завершаю HolyCheck");
+    }
 
     ClearActiveDownloads();
     g_deleteInProgress = false;

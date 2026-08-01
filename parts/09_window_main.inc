@@ -1221,9 +1221,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (id == IDC_AUTOMATION_NAV)
         {
-            // From the main screen this button opens the "file check" tab.
-            // Inside the check section the same button leads to "checkmods".
-            g_currentPage = (g_currentPage == 0) ? 5 : 1;
+            // The check section is the primary destination for this button,
+            // from the main screen and from anywhere else alike.
+            g_currentPage = 1;
             ResizeMainWindowForPage(g_currentPage);
             LayoutControls(hwnd);
             UpdateHistoryEditWindow();
@@ -1326,7 +1326,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // The regular check scan runs checkmods and eventvwr together.
             // They execute in parallel, so the event-log query does not slow
             // down the Modrinth/hash scan.
-            g_page4ScanMode.store(0);
+            // Обычного режима больше нет: кнопка scan тоже запускает fullscan.
+            g_page4ScanMode.store(1);
             StartAutomationBatchScan({
                 AUTOMATION_OUTPUT_PAGE4,
                 AUTOMATION_OUTPUT_EVENTVWR
@@ -1572,15 +1573,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
         int index = static_cast<int>(wParam);
 
-        // The System Informer tile stays locked until the background install
-        // finishes; that worker re-enables it itself.
-        bool systemInformerBusy =
-            g_systemInformerInstalling.load() && g_systemInformerTileIndex.load() == index;
+        // Background-installer tiles stay locked until their own worker
+        // finishes and re-enables them.
+        bool installerBusy =
+            (g_systemInformerInstalling.load() && g_systemInformerTileIndex.load() == index) ||
+            (g_recuvaInstalling.load() && g_recuvaTileIndex.load() == index);
 
-        if (!systemInformerBusy)
+        if (!installerBusy)
             SetItemBusyIndex(index, false);
 
-        if (!g_deleteInProgress.load() && !systemInformerBusy)
+        if (!g_deleteInProgress.load() && !installerBusy)
             SetTileEnabledByIndex(index, true);
 
         InvalidateBottomPanel();
