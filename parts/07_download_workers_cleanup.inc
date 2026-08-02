@@ -750,7 +750,7 @@ static bool DeleteDirectoryTree(const std::wstring& folder)
         if (DeleteFileOrFolderPermanent(folder))
             return true;
 
-        Sleep(450);
+        Sleep(120);
     }
 
     return !DirectoryExists(folder);
@@ -809,7 +809,7 @@ static bool RunElevatedCommandAndWait(const std::wstring& command)
 
     if (sei.hProcess)
     {
-        DWORD waitResult = WaitForSingleObject(sei.hProcess, 120000);
+        DWORD waitResult = WaitForSingleObject(sei.hProcess, 60000);
         DWORD exitCode = 1;
 
         if (waitResult != WAIT_OBJECT_0 || !GetExitCodeProcess(sei.hProcess, &exitCode) || exitCode != 0)
@@ -1039,7 +1039,7 @@ static bool UninstallSystemInformerIfPresent()
         return false;
     }
 
-    bool ok = DriveSystemInformerUninstallWizard(pid, 180000);
+    bool ok = DriveSystemInformerUninstallWizard(pid, 60000);
 
     if (process)
     {
@@ -1093,6 +1093,29 @@ static bool IsProcessNameEqual(const wchar_t* processName, const wchar_t* wanted
     return _wcsicmp(processName, wantedName) == 0;
 }
 
+static void TerminateAndWaitHandles(std::vector<HANDLE>& handles, DWORD timeoutMs)
+{
+    if (handles.empty())
+        return;
+
+    // Wait on the whole batch at once (chunked to the API limit) instead of
+    // blocking on each process one after another. TerminateProcess was already
+    // issued for every handle, so this only waits for the kernel to finish.
+    size_t offset = 0;
+    while (offset < handles.size())
+    {
+        DWORD count = static_cast<DWORD>(
+            (std::min<size_t>)(MAXIMUM_WAIT_OBJECTS, handles.size() - offset));
+        WaitForMultipleObjects(count, handles.data() + offset, TRUE, timeoutMs);
+        offset += count;
+    }
+
+    for (HANDLE h : handles)
+        CloseHandle(h);
+
+    handles.clear();
+}
+
 static void CloseProcessesByName(const std::vector<std::wstring>& names)
 {
     if (names.empty())
@@ -1105,6 +1128,8 @@ static void CloseProcessesByName(const std::vector<std::wstring>& names)
     DWORD currentPid = GetCurrentProcessId();
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
+
+    std::vector<HANDLE> killed;
 
     if (Process32FirstW(snapshot, &pe))
     {
@@ -1132,13 +1157,15 @@ static void CloseProcessesByName(const std::vector<std::wstring>& names)
 
             PostLog(L"Закрывается: " + std::wstring(pe.szExeFile));
             TerminateProcess(process, 0);
-            WaitForSingleObject(process, 3000);
-            CloseHandle(process);
+            killed.push_back(process);
         }
         while (Process32NextW(snapshot, &pe));
     }
 
     CloseHandle(snapshot);
+
+    // Every process was signalled to die already; wait for the whole set once.
+    TerminateAndWaitHandles(killed, 1500);
 }
 
 static void CloseProcessesFromFolder(const std::wstring& folder)
@@ -1151,6 +1178,8 @@ static void CloseProcessesFromFolder(const std::wstring& folder)
     DWORD currentPid = GetCurrentProcessId();
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
+
+    std::vector<HANDLE> killed;
 
     if (Process32FirstW(snapshot, &pe))
     {
@@ -1167,22 +1196,29 @@ static void CloseProcessesFromFolder(const std::wstring& folder)
             wchar_t imagePath[MAX_PATH * 4]{};
             DWORD size = ARRAYSIZE(imagePath);
 
+            bool killedThis = false;
+
             if (QueryFullProcessImageNameW(process, 0, imagePath, &size))
             {
                 if (IsPathInsideFolder(imagePath, folder))
                 {
                     PostLog(L"Закрывается: " + std::wstring(pe.szExeFile));
                     TerminateProcess(process, 0);
-                    WaitForSingleObject(process, 3000);
+                    killed.push_back(process);
+                    killedThis = true;
                 }
             }
 
-            CloseHandle(process);
+            if (!killedThis)
+                CloseHandle(process);
         }
         while (Process32NextW(snapshot, &pe));
     }
 
     CloseHandle(snapshot);
+
+    // Wait for the whole batch of folder processes to exit in one shot.
+    TerminateAndWaitHandles(killed, 1500);
 }
 
 
@@ -1542,7 +1578,7 @@ Out ('deleted-exe-count: ' + $deleted)
 )HCPS";
 
     std::wstring output;
-    if (RunHiddenPowerShellScriptCapture(script, output, 120000))
+    if (RunHiddenPowerShellScriptCapture(script, output, 60000))
     {
         DebugLogLine(L"delete", L"holycheck.exe cleanup output=" + output);
         PostLog(L"Удаление holycheck.exe завершено");
@@ -1597,35 +1633,39 @@ static void DeleteHolyCheckWorker()
 
     AbortActiveHttpHandles();
 
-    for (int i = 0; i < 10 && (g_working.load() || g_activeSingleDownloads.load() > 0); ++i)
-        Sleep(50);
-
     std::wstring folder = GetHolyCheckFolderPathOnly();
+
+    // SystemInformer/Recuva live in Program Files, not the HolyCheck folder,
+    // so their uninstalls do not block the folder wipe. Kick them off first
+    // and let them run in the background while we close processes and delete.
+    std::thread siThread(UninstallSystemInformerIfPresent);
+    std::thread recuvaThread(UninstallRecuvaIfPresent);
+
+    // Cancel already fired above; don't sit around waiting on in-flight work.
+    for (int i = 0; i < 6 && (g_working.load() || g_activeSingleDownloads.load() > 0); ++i)
+        Sleep(50);
 
     DeletePowerShellCheckOutputFiles();
     DeleteHolyCheckByNameInDesktopDownloads();
 
     PostLog(L"Закрываю программы");
-    CloseProcessesByName({ L"powershell.exe", L"pwsh.exe" });
+    // Kill anything holding a lock up front: the HolyCheck helpers, the shells
+    // that launched them, and the download/extract tools. Releasing the locks
+    // first makes the folder deletion below succeed on the first pass.
+    CloseProcessesByName({
+        L"powershell.exe", L"pwsh.exe", L"conhost.exe",
+        L"curl.exe", L"7z.exe", L"7za.exe", L"7zg.exe", L"WinRAR.exe", L"Rar.exe",
+        L"recuva.exe", L"recuva64.exe" });
+
+    // DeleteDirectoryTree re-kills folder processes and retries internally, so
+    // one call already clears freshly released locks. A single extra kill+retry
+    // covers the rare straggler without the old multi-second retry storm.
     CloseProcessesFromFolder(folder);
+    bool removed = DeleteDirectoryTree(folder);
 
-    UninstallSystemInformerIfPresent();
-    UninstallRecuvaIfPresent();
-
-    CloseProcessesFromFolder(folder);
-
-    // Locks are usually released a moment after the owning process dies, so
-    // a single pass used to leave files behind. Re-kill and retry instead.
-    bool removed = false;
-
-    for (int attempt = 0; attempt < 4 && !removed; ++attempt)
+    if (!removed)
     {
-        if (attempt > 0)
-        {
-            CloseProcessesFromFolder(folder);
-            Sleep(250);
-        }
-
+        CloseProcessesFromFolder(folder);
         removed = DeleteDirectoryTree(folder);
     }
 
@@ -1640,6 +1680,13 @@ static void DeleteHolyCheckWorker()
 
         PostLog(L"Остатки удалятся после перезагрузки, завершаю HolyCheck");
     }
+
+    // Let the background uninstalls finish before the process exits, otherwise
+    // ExitProcess would kill them mid-way.
+    if (siThread.joinable())
+        siThread.join();
+    if (recuvaThread.joinable())
+        recuvaThread.join();
 
     ClearActiveDownloads();
     g_deleteInProgress = false;
