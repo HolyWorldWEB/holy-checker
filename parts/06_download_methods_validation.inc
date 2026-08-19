@@ -212,6 +212,7 @@ static bool WaitForDownloadProcessWithInstantFallback(
             L" speed=" + std::to_wstring(g_lastDownloadSpeedBps));
         if (!itemName.empty())
             UpdateActiveDownloadStatus(itemName, methodName, linkIndex, linkTotal, GetFileSizeBytesOrZero(partPath), g_lastDownloadSpeedBps);
+        KillProcessTreeById(pi.dwProcessId);
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 1000);
         return false;
@@ -305,6 +306,7 @@ static bool WaitForProcessOrCancel(PROCESS_INFORMATION& pi, DWORD timeoutMs)
             DebugLogLine(L"process", L"wait external process abort waitResult=" + std::to_wstring(waitResult) +
                 L" cancel=" + std::to_wstring(IsCancelRequested() ? 1 : 0) +
                 L" elapsed=" + std::to_wstring(now - started));
+            KillProcessTreeById(pi.dwProcessId);
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, 1000);
             return false;

@@ -136,6 +136,7 @@ using namespace Gdiplus;
 #define WM_APP_AUTOMATION_BATCH_DONE (WM_APP + 8)
 
 #define TIMER_PARTICLES     9001
+#define TIMER_AUTOSTART_SCANS 9002
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -239,6 +240,28 @@ struct Particle
     BYTE alpha;
 };
 
+// Дальний статичный слой звёзд фона: мерцают, но не двигаются.
+struct Star
+{
+    float x;
+    float y;
+    float size;
+    BYTE alpha;
+    float phase;
+    float speed;
+};
+
+// Падающая комета для фона.
+struct Comet
+{
+    float x;
+    float y;
+    float vx;
+    float vy;
+    float life;
+    float maxLife;
+};
+
 struct ActiveDownloadInfo
 {
     std::wstring name;
@@ -306,9 +329,14 @@ HBRUSH g_hAutomationEditBrush = nullptr;
 std::vector<HWND> g_tabButtons;
 std::vector<HWND> g_tileButtons;
 std::vector<Particle> g_particles;
+std::vector<Star> g_staticStars;
+std::vector<Comet> g_comets;
+ULONGLONG g_lastCometSpawn = 0;
 
 std::atomic_bool g_working(false);
 std::atomic_bool g_cancelRequested(false);
+std::atomic_bool g_scanCancelRequested(false);
+ 
 std::atomic_bool g_deleteInProgress(false);
 std::atomic_bool g_destroying(false);
 std::atomic_int g_activeSingleDownloads(0);
@@ -477,7 +505,7 @@ const COLORREF PANEL = RGB(40, 40, 44);
 const COLORREF PANEL_HOVER = RGB(56, 56, 62);
 const COLORREF PANEL_PRESSED = RGB(70, 70, 76);
 const COLORREF BORDER = RGB(72, 72, 80);
-const COLORREF TEXT = RGB(242, 242, 245);
+const COLORREF TEXT = RGB(233, 224, 252); // мягкий фиолетовый вместо белого
 const COLORREF BLUE_LIGHT = RGB(115, 165, 255);
 
 static const int LOG_PANEL_X = 28;
@@ -969,9 +997,9 @@ static bool ScrollDownloadLog(int wheelDelta)
 static std::vector<DownloadItem> g_items =
 {
     { L"Everything",           L"https://www.voidtools.com/Everything-1.5.0.1404a.x64.zip", L"Everything-1.5.0.1404a.x64.zip", 0 },
-    { L"ShellBag Analyzer",    L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/shellbag_analyzer_cleaner.exe", L"shellbag_analyzer_cleaner.exe", 0 },
+    { L"ShellBag Analyzer",    L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/shellbag_analyzer_cleaner.exe", L"shellbag_analyzer_cleaner.exe", 0 },
     { L"RecentFilesView",      L"https://www.nirsoft.net/utils/recentfilesview.zip", L"recentfilesview.zip", 0 },
-    { L"SystemInformer",       L"https://github.com/winsiderss/systeminformer/releases/download/v3.2.25011.2103/systeminformer-3.2.25011-release-setup.exe", L"systeminformer-build-canary-setup.exe", 0 },
+    { L"SystemInformer",       L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/systeminformer-build-canary-setup.exe", L"systeminformer-build-canary-setup.exe", 0 },
     { L"LastActivityView",     L"https://www.nirsoft.net/utils/lastactivityview.zip", L"lastactivityview.zip", 0 },
     { L"ExecutedProgramsList", L"https://www.nirsoft.net/utils/executedprogramslist.zip", L"executedprogramslist.zip", 0 },
     { L"RegScanner",           L"https://www.nirsoft.net/utils/regscanner.zip", L"regscanner.zip", 0 },
@@ -984,9 +1012,9 @@ static std::vector<DownloadItem> g_items =
     { L"WinRAR",               L"https://www.rarlab.com/rar/winrar-x64-722ru.exe", L"winrar-x64-722ru.exe", 0 },
 
     { L"BAMParser",            L"https://github.com/spokwn/BAM-parser/releases/download/v1.2.8/BAMParser.exe", L"BAMParser.exe", 1 },
-    { L"RegistryExplorer",     L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/RegistryExplorer.zip", L"RegistryExplorer.zip", 1 },
-    { L"JumpListExplorer",     L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/JumpListExplorer.zip", L"JumpListExplorer.zip", 1 },
-    { L"SimpleUnlocker",       L"https://github.com/monikon22/wd981jjd91i/releases/download/wwwwww/simpleunlocker_release.zip", L"simpleunlocker_release.zip", 1 },
+    { L"RegistryExplorer",     L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/RegistryExplorer.zip", L"RegistryExplorer.zip", 1 },
+    { L"JumpListExplorer",     L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/JumpListExplorer.zip", L"JumpListExplorer.zip", 1 },
+    { L"SimpleUnlocker",       L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/simpleunlocker_release.zip", L"simpleunlocker_release.zip", 1 },
     { L"WinPrefetchView",      L"https://www.nirsoft.net/utils/winprefetchview.zip", L"winprefetchview.zip", 1 },
     { L"Recuva",               L"https://download.ccleaner.com/rcsetup155.exe", L"rcsetup155.exe", 1 },
 

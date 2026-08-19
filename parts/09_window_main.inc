@@ -830,7 +830,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         GetClientRect(hwnd, &rc);
         InitParticles(rc.right, rc.bottom);
 
-        SetTimer(hwnd, TIMER_PARTICLES, 90, nullptr);
+        SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
+
+        // Автозапуск сканирований check + file check сразу после открытия окна
+        // (dll и jar остаются на ручном запуске кнопками).
+        SetTimer(hwnd, TIMER_AUTOSTART_SCANS, 900, nullptr);
+
         LayoutControls(hwnd);
 
         return 0;
@@ -866,7 +871,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (rc.right > 100 && rc.bottom > 100)
                 InitParticles(static_cast<int>(rc.right), static_cast<int>(rc.bottom));
 
-            SetTimer(hwnd, TIMER_PARTICLES, 90, nullptr);
+            SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
         }
 
         RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN);
@@ -883,7 +888,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_EXITSIZEMOVE:
     {
         g_particlesPaused = false;
-        SetTimer(hwnd, TIMER_PARTICLES, 90, nullptr);
+        SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -891,8 +896,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == TIMER_PARTICLES)
         {
-            if (!g_particlesPaused && !AnyAutomationScanWorking() && !IsIconic(hwnd))
+            if (!g_particlesPaused && !IsIconic(hwnd))
                 UpdateParticles(hwnd);
+
+            return 0;
+        }
+
+        if (wParam == TIMER_AUTOSTART_SCANS)
+        {
+            KillTimer(hwnd, TIMER_AUTOSTART_SCANS);
+
+            // Автозапуск при открытии программы: checkmods, Event Viewer,
+            // Unsigned DLL и File Check. Обычные DLL / JAR остаются ручными.
+            g_page4ScanMode.store(1);
+            StartAutomationBatchScan({
+                AUTOMATION_OUTPUT_PAGE4,
+                AUTOMATION_OUTPUT_EVENTVWR,
+                AUTOMATION_OUTPUT_DLL_UNSIGNED
+            });
+            StartFileCheckScan();
 
             return 0;
         }
@@ -1621,8 +1643,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
         g_destroying = true;
         g_cancelRequested = true;
+        g_scanCancelRequested = true;
         AbortActiveHttpHandles();
         KillTimer(hwnd, TIMER_PARTICLES);
+        KillTimer(hwnd, TIMER_AUTOSTART_SCANS);
 
         if (g_hFont)
         {

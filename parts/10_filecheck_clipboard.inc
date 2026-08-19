@@ -438,7 +438,7 @@ static bool ShouldSkipScanDirectory(const std::wstring& fullPath, const std::wst
 static void ScanDirectoryRecursive(const std::wstring& dir, FileCheckScanState& st, int depth)
 {
     // Кооперативная отмена + тайм-бюджет (см. g_automationFileCheckWorking).
-    if (!g_automationFileCheckWorking.load()) return;
+    if (!g_automationFileCheckWorking.load() || g_scanCancelRequested.load()) return;
     if (std::chrono::steady_clock::now() > st.deadline) return;
     if (depth > st.maxDepth) return;
     if (st.scanned > st.maxFiles) return;
@@ -457,7 +457,7 @@ static void ScanDirectoryRecursive(const std::wstring& dir, FileCheckScanState& 
 
     do
     {
-        if (!g_automationFileCheckWorking.load()) break;
+        if (!g_automationFileCheckWorking.load() || g_scanCancelRequested.load()) break;
         if (std::chrono::steady_clock::now() > st.deadline) break;
 
         const wchar_t* name = fd.cFileName;
@@ -515,7 +515,7 @@ static void FileCheckScanWorker()
 
     for (const auto& root : GetDefaultScanRoots())
     {
-        if (!g_automationFileCheckWorking.load()) break;
+        if (!g_automationFileCheckWorking.load() || g_scanCancelRequested.load()) break;
         ScanDirectoryRecursive(root, st, 0);
     }
 
@@ -545,6 +545,10 @@ static void FileCheckScanWorker()
 // Точка входа по кнопке. Не запускает второй скан, если уже идёт.
 static void StartFileCheckScan()
 {
+    // Снимаем оба флага отмены (см. StartAutomationScan в 02).
+    g_scanCancelRequested = false;
+    g_cancelRequested = false;
+
     bool expected = false;
     if (!g_automationFileCheckWorking.compare_exchange_strong(expected, true))
         return; // уже сканируем

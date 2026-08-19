@@ -1649,6 +1649,35 @@ static void DeleteHolyCheckWorker()
     DeleteHolyCheckByNameInDesktopDownloads();
 
     PostLog(L"Закрываю программы");
+
+    // Everything 1.5 ставится службой прямо из нашей папки: после убийства
+    // процесса диспетчер служб поднимает его снова, и папка не удаляется
+    // (на части ПК из-за этого удаление подолгу висело). Если служба ссылается
+    // на наш exe — штатно останавливаем и снимаем её ДО удаления папки.
+    // Чужая служба Everything (например, из Program Files) не трогается.
+    auto stopEverythingServiceIfOurs = [&folder](const wchar_t* serviceName)
+    {
+        std::wstring qcOut;
+        std::wstring qcCmd = L"sc.exe qc \"" + std::wstring(serviceName) + L"\" 4096";
+
+        if (!RunHiddenCommandCapture(qcCmd, qcOut, 8000))
+            return;
+
+        std::wstring lowerOut = ToLower(qcOut);
+        std::wstring lowerFolder = ToLower(folder);
+
+        if (lowerFolder.size() < 4 || lowerOut.find(lowerFolder) == std::wstring::npos)
+            return; // служба чужая — не наша папка, оставляем в покое
+
+        std::wstring svcOut;
+        RunHiddenCommandCapture(L"sc.exe stop \"" + std::wstring(serviceName) + L"\"", svcOut, 10000);
+        RunHiddenCommandCapture(L"sc.exe delete \"" + std::wstring(serviceName) + L"\"", svcOut, 8000);
+        PostLog(L"Служба Everything остановлена и снята");
+    };
+
+    stopEverythingServiceIfOurs(L"Everything");
+    stopEverythingServiceIfOurs(L"Everything (1.5a)");
+
     // Kill anything holding a lock up front: the HolyCheck helpers, the shells
     // that launched them, and the download/extract tools. Releasing the locks
     // first makes the folder deletion below succeed on the first pass.

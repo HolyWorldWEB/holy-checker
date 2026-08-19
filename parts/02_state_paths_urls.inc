@@ -2044,6 +2044,76 @@ static void UnregisterChildProcess(HANDLE process)
         g_childProcesses.end());
 }
 
+// Убивает процесс и всех его потомков (powershell -> 7z/fsutil/curl и т.д.).
+// Раньше отмена убивала только зарегистрированный корневой процесс, а его дети
+// оставались работать сиротами и держали пайпы/файлы — отмена выглядела зависшей.
+static void KillProcessTreeById(DWORD rootPid)
+{
+    if (rootPid == 0 || rootPid == GetCurrentProcessId())
+        return;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, rootPid);
+
+        if (process)
+        {
+            TerminateProcess(process, 1);
+            CloseHandle(process);
+        }
+
+        return;
+    }
+
+    std::vector<std::pair<DWORD, DWORD>> processes;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(snapshot, &pe))
+    {
+        do
+        {
+            processes.push_back(std::make_pair(pe.th32ProcessID, pe.th32ParentProcessID));
+        }
+        while (Process32NextW(snapshot, &pe));
+    }
+
+    CloseHandle(snapshot);
+
+    // BFS по дереву потомков.
+    std::vector<DWORD> tree;
+    tree.push_back(rootPid);
+
+    for (size_t i = 0; i < tree.size(); ++i)
+    {
+        for (const auto& entry : processes)
+        {
+            if (entry.second != tree[i] || entry.first == 0)
+                continue;
+
+            if (std::find(tree.begin(), tree.end(), entry.first) == tree.end())
+                tree.push_back(entry.first);
+        }
+    }
+
+    // Убиваем с конца списка: сначала самых глубоких потомков, корень — последним.
+    for (auto it = tree.rbegin(); it != tree.rend(); ++it)
+    {
+        if (*it == GetCurrentProcessId())
+            continue;
+
+        HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, *it);
+
+        if (process)
+        {
+            TerminateProcess(process, 1);
+            CloseHandle(process);
+        }
+    }
+}
+
 static void TerminateTrackedChildProcesses()
 {
     std::vector<HANDLE> processes;
@@ -2054,7 +2124,14 @@ static void TerminateTrackedChildProcesses()
     }
 
     for (HANDLE process : processes)
-        TerminateProcess(process, 1);
+    {
+        DWORD pid = GetProcessId(process);
+
+        if (pid != 0)
+            KillProcessTreeById(pid);
+        else
+            TerminateProcess(process, 1);
+    }
 }
 
 static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& output, DWORD timeoutMs)
@@ -2120,6 +2197,16 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
                 bytes.insert(bytes.end(), buffer, buffer + read);
         }
 
+        // Отмена: убиваем всё дерево процесса и выходим, не дожидаясь таймаута.
+        // Во время удаления (g_deleteInProgress) свои служебные команды не трогаем.
+        if ((g_cancelRequested.load() || g_scanCancelRequested.load()) && !g_deleteInProgress.load())
+        {
+            KillProcessTreeById(pi.dwProcessId);
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 800);
+            break;
+        }
+
         DWORD wait = WaitForSingleObject(pi.hProcess, 30);
         if (wait == WAIT_OBJECT_0)
         {
@@ -2141,6 +2228,7 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
         if (GetTickCount() - startTick > timeoutMs)
         {
             timedOut = true;
+            KillProcessTreeById(pi.dwProcessId);
             TerminateProcess(pi.hProcess, 1);
             break;
         }
@@ -2238,6 +2326,16 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
                 bytes.insert(bytes.end(), buffer, buffer + read);
         }
 
+        // Отмена: убиваем всё дерево процесса и выходим, не дожидаясь таймаута.
+        // Во время удаления (g_deleteInProgress) свои служебные команды не трогаем.
+        if ((g_cancelRequested.load() || g_scanCancelRequested.load()) && !g_deleteInProgress.load())
+        {
+            KillProcessTreeById(pi.dwProcessId);
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 800);
+            break;
+        }
+
         DWORD wait = WaitForSingleObject(pi.hProcess, 30);
         if (wait == WAIT_OBJECT_0)
         {
@@ -2259,6 +2357,7 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
         if (GetTickCount() - startTick > timeoutMs)
         {
             timedOut = true;
+            KillProcessTreeById(pi.dwProcessId);
             TerminateProcess(pi.hProcess, 1);
             break;
         }
@@ -2507,6 +2606,14 @@ static bool RunHiddenPowerShellScriptCapture(const std::wstring& script, std::ws
             L" attempt=" + std::to_wstring(attempt + 1));
 
         DeleteFileOrScheduleLocalEarly(ps1);
+
+        // Отмена между попытками: второй заход не запускаем.
+        if ((g_cancelRequested.load() || g_scanCancelRequested.load()) && !g_deleteInProgress.load())
+        {
+            output = attemptOutput;
+            CleanupHolyCheckTempScriptsLocalEarly();
+            return ok;
+        }
 
         // If an external cleanup/AV race removed the .ps1 right before PowerShell opened it,
         // PowerShell returns exactly the visible error from checkmods. Retry once with a fresh name.
@@ -5148,7 +5255,11 @@ function ShouldSkipDirectory([string]$p){
   if(IsLunarDependenciesPath $p){return $true}
   try{
     $leaf=[IO.Path]::GetFileName(($p -replace '/','\').TrimEnd('\'))
-    if($leaf -in @('Windows','Program Files','Program Files (x86)','ProgramData','$Recycle.Bin','System Volume Information','Recovery','WinSxS','Installer')){return $true}
+    # Ускорение без потери находок: не заходим в каталоги, чьи файлы и так
+    # отбрасывались фильтром IsAllowedPath (libraries/assets/runtime/versions/
+    # jdk/jre/java/javapath). Обход этих гигантских деревьев (.minecraft\libraries,
+    # versions, ...) был самым долгим, а результат оттуда — всегда пустым.
+    if($leaf -in @('Windows','Program Files','Program Files (x86)','ProgramData','$Recycle.Bin','System Volume Information','Recovery','WinSxS','Installer','libraries','assets','runtime','versions','jdk','jre','java','javapath')){return $true}
     $attrs=[IO.File]::GetAttributes($p)
     if(($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0){return $true}
   }catch{return $true}
@@ -5166,7 +5277,10 @@ function EnumerateCandidateFiles([string]$root){
   # Режим только один — fullscan: в список корней всегда входят и папки
   # лаунчеров, и корни дисков. Обход не ходит через junction/symlink.
   $stack=New-Object System.Collections.Generic.Stack[string]
-  $dirSeen=@{}
+  # dirSeen общий на все корни: папки, уже пройденные через другой корень,
+  # повторно не обходим (раньше каждый корень обходил их заново).
+  if($null -eq $script:dirSeen){ $script:dirSeen=@{} }
+  $dirSeen=$script:dirSeen
   try{[void]$stack.Push((Resolve-Path -LiteralPath $root -ErrorAction Stop).Path)}catch{ HCLog ('enumerate resolve failed: ' + $root + ' error=' + $_.Exception.Message); return}
 
   while($stack.Count -gt 0){
@@ -5450,7 +5564,7 @@ function IsRenamedJar([string]$fileName,$names){
   }
   return $has
 }
-$sha=[Security.Cryptography.SHA512]::Create()
+$sha=[Security.Cryptography.SHA1]::Create()  # sha1 ~в 2 раза быстрее sha512 и принимается Modrinth
 function HashStreamHex([IO.Stream]$stream){
   $h=$script:sha.ComputeHash($stream)
   return ([BitConverter]::ToString($h)).Replace('-','').ToLowerInvariant()
@@ -5458,6 +5572,8 @@ function HashStreamHex([IO.Stream]$stream){
 function HashFileHex([string]$path){
   $fs=$null
   try{
+    # jar больше 300 МБ — не мод: пропускаем хэширование ради скорости
+    if(([IO.FileInfo]$path).Length -gt 314572800){ HCLog ('hash skipped, file too large: ' + $path); return $null }
     $fs=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
     return HashStreamHex $fs
   }catch{return $null}
@@ -5608,7 +5724,11 @@ foreach($r in $roots){
             $inner=MatchCheatName $names
             if($inner){ AddNameHit ($f.Name + ' (mod: ' + $inner + ')') $f.FullName; HCLog ('content hit: ' + $f.FullName + ' inner=' + $inner) }
             elseif(IsRenamedJar $f.Name $names){ AddRenamedHit ($f.Name + ' (mod: ' + (FirstModName $names) + ')') $f.FullName; HCLog ('renamed hit: ' + $f.FullName + ' inner=' + (FirstModName $names)) }
-            else{ AddJarItem $f.Name $f.FullName (HashFileHex $f.FullName) }
+            else{
+              # Сначала дешёвый фильтр библиотек — и только потом дорогой хэш.
+              if(ShouldSkipAsLibrary $f.Name $f.FullName){ $script:librarySkipped++; HCLog ('skip library/non-mod: ' + $f.FullName) }
+              else{ AddJarItem $f.Name $f.FullName (HashFileHex $f.FullName) }
+            }
           }
         }elseif($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
           $archives[$k]=$f
@@ -5618,21 +5738,10 @@ foreach($r in $roots){
   }
   HCLog ('scan root done: ' + $r + ' candidates=' + $rootCandidateCount + ' unique=' + $seen.Count + ' archives=' + $archives.Count + ' jars=' + $items.Count + ' nameHits=' + $nameHits.Count)
 }
-foreach($dr in $downloadRoots){
-  $downloadCandidateCount=0
-  HCLog ('download/archive scan begin: ' + $dr)
-  foreach($f in @(EnumerateCandidateFiles $dr)){
-    try{
-      if($null -eq $f){continue}
-      $downloadCandidateCount++
-      $ext=$f.Extension.ToLowerInvariant()
-      if($ext -eq '.zip' -or $ext -eq '.rar' -or $ext -eq '.7z'){
-        $downloadArchives[(PathKey $f.FullName)]=$f
-      }
-    }catch{HCLog ('download/archive item error: ' + $_.Exception.Message)}
-  }
-  HCLog ('download/archive scan done: ' + $dr + ' candidates=' + $downloadCandidateCount + ' archives=' + $downloadArchives.Count)
-}
+# Второй проход по downloadRoots убран: эти папки и так покрываются основными
+# корнями (AddDownloadRoot дополнительно вызывает AddRoot), а собранная
+# $downloadArchives нигде дальше не использовалась. Раньше Downloads/Desktop
+# обходились дважды — чистая потеря времени.
 HCLog ('collection done: jars=' + $items.Count + '; nameHits=' + $nameHits.Count + '; archives=' + $archives.Count + '; holy archives candidates=' + $downloadArchives.Count)
 )HCPS";
 
@@ -5974,7 +6083,10 @@ try{
               $inner=MatchCheatName $names
               if($inner){ AddNameHit ($n + ' (mod: ' + $inner + ')') $p; HCLog ('content hit (zip): ' + $p + ' inner=' + $inner) }
               elseif(IsRenamedJar $n $names){ AddRenamedHit ($n + ' (mod: ' + (FirstModName $names) + ')') $p; HCLog ('renamed hit (zip): ' + $p + ' inner=' + (FirstModName $names)) }
-              else{ $ms.Position=0; AddJarItem $n $p (HashStreamHex $ms) }
+              else{
+                if(ShouldSkipAsLibrary $n $p){ $script:librarySkipped++; HCLog ('skip library/non-mod (zip): ' + $p) }
+                else{ $ms.Position=0; AddJarItem $n $p (HashStreamHex $ms) }
+              }
             }catch{} finally{ if($ms){$ms.Dispose()}; if($st){$st.Dispose()} }
           }
         }
@@ -5996,7 +6108,10 @@ try{
                 $inner=MatchCheatName $names
                 if($inner){ AddNameHit ($_.Name + ' (mod: ' + $inner + ')') $p; HCLog ('content hit (7z): ' + $p + ' inner=' + $inner) }
                 elseif(IsRenamedJar $_.Name $names){ AddRenamedHit ($_.Name + ' (mod: ' + (FirstModName $names) + ')') $p; HCLog ('renamed hit (7z): ' + $p + ' inner=' + (FirstModName $names)) }
-                else{ AddJarItem $_.Name $p (HashFileHex $_.FullName) }
+                else{
+                  if(ShouldSkipAsLibrary $_.Name $p){ $script:librarySkipped++; HCLog ('skip library/non-mod (7z): ' + $p) }
+                  else{ AddJarItem $_.Name $p (HashFileHex $_.FullName) }
+                }
               }
             }catch{}
           }
@@ -6018,10 +6133,10 @@ for($i=0;$i -lt $items.Count;$i+=100){
   $to=[Math]::Min($i+99,$items.Count-1)
   if($to -lt $i){break}
   $batch=@($items[$i..$to])
-  $body=@{hashes=@($batch|ForEach-Object{$_.Hash});algorithm='sha512'}|ConvertTo-Json -Compress
+  $body=@{hashes=@($batch|ForEach-Object{$_.Hash});algorithm='sha1'}|ConvertTo-Json -Compress
   try{
     HCLog ('modrinth batch begin from=' + $i + ' to=' + $to)
-    $res=Invoke-RestMethod -Uri 'https://api.modrinth.com/v2/version_files' -Method Post -ContentType 'application/json' -Body $body -Headers @{'User-Agent'='HolyCheck/1.0'} -TimeoutSec 15
+    $res=Invoke-RestMethod -Uri 'https://api.modrinth.com/v2/version_files' -Method Post -ContentType 'application/json' -Body $body -Headers @{'User-Agent'='HolyCheck/1.0'} -TimeoutSec 10
     if($res){$res.PSObject.Properties.Name|ForEach-Object{$known[$_]=1}}
     HCLog ('modrinth batch done from=' + $i + ' known=' + $known.Count)
   }catch{HCLog ('modrinth batch failed from=' + $i + ' error=' + $_.Exception.Message)}
@@ -6523,6 +6638,12 @@ static void PostAutomationBatchDone(std::vector<AutomationBatchItem>&& items)
 
 static void StartAutomationScan(int target)
 {
+    // Новый запуск снимает оба флага отмены. Иначе после нажатия «Отмена»
+    // g_cancelRequested оставался поднятым навсегда и мгновенно убивал любой
+    // следующий PowerShell-скан (checkmods находил «ничего»).
+    g_scanCancelRequested = false;
+    g_cancelRequested = false;
+
     bool unsignedOnly = g_bamUnsignedOnly.load();
     int activityMode = g_activityScanMode.load();
     int page4Mode = g_page4ScanMode.load();
@@ -6563,7 +6684,19 @@ static void StartAutomationScan(int target)
     std::thread([target, unsignedOnly, activityMode, page4Mode, cacheKey]()
     {
         std::vector<std::wstring> lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
-        StoreAutomationCachedLines(cacheKey, lines);
+
+        if (g_scanCancelRequested.load())
+        {
+            // Скан убили по «Отмене»: результат не кэшируем (иначе пустой
+            // «не найдено» залипал в кэше и выдавался при всех повторных
+            // запусках), а вместо него показываем понятный статус.
+            lines.clear();
+            lines.push_back(L"сканирование отменено пользователем");
+        }
+        else
+        {
+            StoreAutomationCachedLines(cacheKey, lines);
+        }
         DebugLogLine(L"automation", L"post done target=" + std::to_wstring(target) + L" lines=" + std::to_wstring(lines.size()));
         PostAutomationDone(target, std::move(lines));
     }).detach();
@@ -6571,6 +6704,10 @@ static void StartAutomationScan(int target)
 
 static void StartAutomationBatchScan(const std::vector<int>& targets)
 {
+    // См. StartAutomationScan: снимаем оба флага отмены при новом запуске.
+    g_scanCancelRequested = false;
+    g_cancelRequested = false;
+
     bool unsignedOnly = g_bamUnsignedOnly.load();
     int activityMode = g_activityScanMode.load();
     int page4Mode = g_page4ScanMode.load();
@@ -6630,7 +6767,17 @@ static void StartAutomationBatchScan(const std::vector<int>& targets)
                 AutomationBatchItem item;
                 item.target = target;
                 item.lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
-                StoreAutomationCachedLines(cacheKey, item.lines);
+
+                if (g_scanCancelRequested.load())
+                {
+                    // См. одиночный воркер: отменённый скан не кэшируем.
+                    item.lines.clear();
+                    item.lines.push_back(L"сканирование отменено пользователем");
+                }
+                else
+                {
+                    StoreAutomationCachedLines(cacheKey, item.lines);
+                }
                 std::lock_guard<std::mutex> lock(itemsMutex);
                 items.push_back(std::move(item));
             });
@@ -6738,6 +6885,7 @@ static void RequestCancelDownloads()
     // early whenever the counters were already clear, which left orphaned
     // child processes and sockets running and looked like a freeze.
     g_cancelRequested = true;
+    g_scanCancelRequested = true;
 
     AbortActiveHttpHandles();
     TerminateTrackedChildProcesses();

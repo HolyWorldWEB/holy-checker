@@ -3,6 +3,9 @@ static bool IsPathLikeAutomationCell(const std::wstring& cell);
 static void InitParticles(int width, int height)
 {
     g_particles.clear();
+    g_staticStars.clear();
+    g_comets.clear();
+    g_lastCometSpawn = 0;
 
     int safeW = std::max(width, 1);
     int safeH = std::max(height, 1);
@@ -13,7 +16,8 @@ static void InitParticles(int width, int height)
 
     srand(static_cast<unsigned int>(time(nullptr)));
 
-    for (int i = 0; i < 28; ++i)
+    // Подвижных звёзд стало в 3 раза больше: 28 -> 84.
+    for (int i = 0; i < 84; ++i)
     {
         Particle p{};
 
@@ -36,6 +40,22 @@ static void InitParticles(int width, int height)
 
         g_particles.push_back(p);
     }
+
+    // Дальний слой: статичные мерцающие звёзды. Не двигаются, поэтому почти
+    // бесплатны по CPU — просто рисуются с синусоидальной прозрачностью.
+    for (int i = 0; i < 150; ++i)
+    {
+        Star s{};
+
+        s.x = 1.0f + static_cast<float>(rand() % std::max(safeW - 2, 1));
+        s.y = 1.0f + static_cast<float>(rand() % std::max(safeParticleH - 2, 1));
+        s.size = 0.6f + static_cast<float>(rand() % 20) / 10.0f;
+        s.alpha = static_cast<BYTE>(20 + rand() % 70);
+        s.phase = static_cast<float>(rand() % 628) / 100.0f;
+        s.speed = 0.5f + static_cast<float>(rand() % 200) / 100.0f;
+
+        g_staticStars.push_back(s);
+    }
 }
 
 static void UpdateParticles(HWND hwnd)
@@ -54,6 +74,14 @@ static void UpdateParticles(HWND hwnd)
 
     if (g_particles.empty())
         InitParticles(width, height);
+
+    // Дельта-время: скорость анимации не зависит от частоты таймера.
+    static ULONGLONG s_lastTick = 0;
+    ULONGLONG now = GetTickCount64();
+    float dt = s_lastTick ? static_cast<float>(now - s_lastTick) / 1000.0f : 0.05f;
+    s_lastTick = now;
+    if (dt > 0.2f) dt = 0.2f;
+    const float moveScale = dt / 0.05f; // 1.0 при тике 50 мс
 
     const float minX = 2.0f;
     const float minY = 2.0f;
@@ -78,13 +106,49 @@ static void UpdateParticles(HWND hwnd)
 
     for (auto& p : g_particles)
     {
-        p.x += p.vx;
-        p.y += p.vy;
+        p.x += p.vx * moveScale;
+        p.y += p.vy * moveScale;
 
         if (p.x < minX) p.x = maxX;
         if (p.x > maxX) p.x = minX;
         if (p.y < minY) p.y = maxY;
         if (p.y > maxY) p.y = minY;
+    }
+
+    // Кометы: падают по диагонали раз в 3-8 секунд, не больше двух одновременно.
+    if (g_lastCometSpawn == 0)
+        g_lastCometSpawn = now;
+
+    if (now - g_lastCometSpawn > 3000ULL + static_cast<ULONGLONG>(rand() % 5000) &&
+        g_comets.size() < 2)
+    {
+        g_lastCometSpawn = now;
+
+        Comet c{};
+        bool leftToRight = (rand() % 2) == 0;
+        float speed = 220.0f + static_cast<float>(rand() % 140);
+
+        c.x = leftToRight ? -12.0f : static_cast<float>(width + 12);
+        c.y = 8.0f + static_cast<float>(rand() % std::max(height / 3, 40));
+        c.vx = (leftToRight ? 1.0f : -1.0f) * speed;
+        c.vy = speed * 0.45f;
+        c.life = c.maxLife = 2.6f;
+
+        g_comets.push_back(c);
+    }
+
+    for (size_t i = 0; i < g_comets.size();)
+    {
+        Comet& c = g_comets[i];
+        c.x += c.vx * dt;
+        c.y += c.vy * dt;
+        c.life -= dt;
+
+        if (c.life <= 0.0f || c.y > static_cast<float>(height + 40) ||
+            c.x < -80.0f || c.x > static_cast<float>(width + 80))
+            g_comets.erase(g_comets.begin() + i);
+        else
+            ++i;
     }
 
     RedrawWindow(
@@ -100,7 +164,7 @@ static void DrawParticles(Graphics& g, const RECT& rc)
     int width = static_cast<int>(rc.right - rc.left);
     int height = static_cast<int>(rc.bottom - rc.top);
 
-    if (g_particlesPaused || AnyAutomationScanWorking() || width < 100 || height < 100 || g_particles.empty())
+    if (g_particlesPaused || width < 100 || height < 100)
         return;
 
     int clipHeight = std::max(height - 58, 1);
@@ -109,8 +173,26 @@ static void DrawParticles(Graphics& g, const RECT& rc)
     g.SetClip(Rect(0, 0, static_cast<INT>(width), static_cast<INT>(clipHeight)), CombineModeReplace);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
 
-    Pen linePen(Color(14, 120, 130, 160), 1.0f);
+    // Одна кисть и одно перо на весь кадр: SetColor вместо создания новых
+    // GDI+-объектов на каждую звезду — это главная оптимизация при выросшем
+    // числе частиц (раньше на каждую звезду создавался новый SolidBrush).
+    SolidBrush starBrush(Color(255, 120, 160, 255));
+    Pen linePen(Color(16, 150, 125, 200), 1.0f);
 
+    float timeSec = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
+
+    // Слой 1: статичные мерцающие звёзды.
+    for (const auto& s : g_staticStars)
+    {
+        float twinkle = 0.55f + 0.45f * sinf(timeSec * s.speed + s.phase);
+        int a = static_cast<int>(s.alpha * twinkle);
+        if (a < 4) a = 4;
+
+        starBrush.SetColor(Color(static_cast<BYTE>(a), 180, 148, 255));
+        g.FillEllipse(&starBrush, s.x, s.y, s.size, s.size);
+    }
+
+    // Слой 2: линии между ближними подвижными звёздами.
     for (size_t i = 0; i < g_particles.size(); ++i)
     {
         for (size_t j = i + 1; j < g_particles.size(); ++j)
@@ -132,13 +214,46 @@ static void DrawParticles(Graphics& g, const RECT& rc)
         }
     }
 
+    // Слой 3: подвижные звёзды.
     for (const auto& p : g_particles)
     {
         if (p.x < 0.0f || p.y < 0.0f || p.x > width || p.y > clipHeight)
             continue;
 
-        SolidBrush brush(Color(p.alpha, 120, 160, 255));
-        g.FillEllipse(&brush, p.x, p.y, p.size, p.size);
+        starBrush.SetColor(Color(p.alpha, 150, 135, 255));
+        g.FillEllipse(&starBrush, p.x, p.y, p.size, p.size);
+    }
+
+    // Слой 4: кометы с затухающим хвостом.
+    for (const auto& c : g_comets)
+    {
+        float lifeK = c.maxLife > 0.0f ? c.life / c.maxLife : 0.0f;
+        float vlen = sqrtf(c.vx * c.vx + c.vy * c.vy);
+
+        if (vlen < 1.0f)
+            continue;
+
+        float nx = -c.vx / vlen;
+        float ny = -c.vy / vlen;
+
+        for (int seg = 0; seg < 4; ++seg)
+        {
+            float d0 = 42.0f * static_cast<float>(seg) / 4.0f;
+            float d1 = 42.0f * static_cast<float>(seg + 1) / 4.0f;
+            int a = static_cast<int>(150.0f * lifeK * (1.0f - static_cast<float>(seg) / 4.0f));
+
+            if (a < 5)
+                continue;
+
+            linePen.SetColor(Color(static_cast<BYTE>(a), 185, 150, 255));
+            linePen.SetWidth(2.2f - static_cast<float>(seg) * 0.45f);
+            g.DrawLine(&linePen, c.x + nx * d0, c.y + ny * d0, c.x + nx * d1, c.y + ny * d1);
+        }
+
+        int headA = static_cast<int>(230.0f * lifeK);
+        if (headA > 255) headA = 255;
+        starBrush.SetColor(Color(static_cast<BYTE>(headA), 215, 190, 255));
+        g.FillEllipse(&starBrush, c.x - 2.0f, c.y - 2.0f, 4.0f, 4.0f);
     }
 
     g.Restore(state);
@@ -147,6 +262,7 @@ static void DrawParticles(Graphics& g, const RECT& rc)
 static void DrawAmbientBackground(Graphics& g, const RECT& rc)
 {
     const float w = static_cast<float>(rc.right - rc.left);
+    const float h = static_cast<float>(rc.bottom - rc.top);
 
     g.SetSmoothingMode(SmoothingModeAntiAlias);
 
@@ -159,14 +275,25 @@ static void DrawAmbientBackground(Graphics& g, const RECT& rc)
     blueBrush.SetSurroundColors(blueSurround, &blueCount);
     g.FillPath(&blueBrush, &blueGlow);
 
+    // Белый glow убран полностью — теперь здесь фиолетовый.
     GraphicsPath whiteGlow;
     whiteGlow.AddEllipse(RectF(w - 360.0f, -160.0f, 420.0f, 420.0f));
     PathGradientBrush whiteBrush(&whiteGlow);
-    whiteBrush.SetCenterColor(Color(24, 245, 248, 255));
-    Color whiteSurround[] = { Color(0, 245, 248, 255) };
+    whiteBrush.SetCenterColor(Color(28, 175, 125, 255));
+    Color whiteSurround[] = { Color(0, 175, 125, 255) };
     INT whiteCount = 1;
     whiteBrush.SetSurroundColors(whiteSurround, &whiteCount);
     g.FillPath(&whiteBrush, &whiteGlow);
+
+    // Третий, фиолетовый glow снизу по центру — добавляет фону глубину.
+    GraphicsPath violetGlow;
+    violetGlow.AddEllipse(RectF(w * 0.38f - 190.0f, h - 300.0f, 400.0f, 400.0f));
+    PathGradientBrush violetBrush(&violetGlow);
+    violetBrush.SetCenterColor(Color(26, 165, 120, 255));
+    Color violetSurround[] = { Color(0, 165, 120, 255) };
+    INT violetCount = 1;
+    violetBrush.SetSurroundColors(violetSurround, &violetCount);
+    g.FillPath(&violetBrush, &violetGlow);
 }
 
 static void DrawLogo(Graphics& g)
@@ -1942,8 +2069,8 @@ namespace TileUi
                 Gdiplus::LinearGradientBrush highlightBrush(
                     Gdiplus::PointF(inner.X, inner.Y),
                     Gdiplus::PointF(inner.X, inner.GetBottom()),
-                    Gdiplus::Color(24, 255, 255, 255),
-                    Gdiplus::Color(0, 255, 255, 255));
+                    Gdiplus::Color(24, 205, 175, 255),
+                    Gdiplus::Color(0, 205, 175, 255));
 
                 Gdiplus::Pen highlightPen(&highlightBrush, 1.0f);
                 graphics.DrawPath(&highlightPen, &innerPath);
