@@ -1208,7 +1208,8 @@ static void ClampAutomationScrollOffsetLocked(int target)
 
 static void SetAutomationLines(int target, std::vector<std::wstring> lines)
 {
-    LimitAutomationLines(lines);
+    if (target != AUTOMATION_OUTPUT_FILECHECK)
+        LimitAutomationLines(lines);
 
     std::lock_guard<std::mutex> lock(g_automationMutex);
     AutomationLinesRef(target) = std::move(lines);
@@ -2207,7 +2208,7 @@ static bool RunHiddenCommandCapture(const std::wstring& command, std::wstring& o
             break;
         }
 
-        DWORD wait = WaitForSingleObject(pi.hProcess, 30);
+        DWORD wait = WaitForSingleObject(pi.hProcess, 100);
         if (wait == WAIT_OBJECT_0)
         {
             for (;;)
@@ -2336,7 +2337,7 @@ static bool RunHiddenProcessCapture(const std::wstring& exePath, const std::wstr
             break;
         }
 
-        DWORD wait = WaitForSingleObject(pi.hProcess, 30);
+        DWORD wait = WaitForSingleObject(pi.hProcess, 100);
         if (wait == WAIT_OBJECT_0)
         {
             for (;;)
@@ -5327,6 +5328,8 @@ function FindWinRar(){
   foreach($n in @('unrar.exe','rar.exe','winrar.exe')){
     try{$cmd=Get-Command $n -ErrorAction SilentlyContinue; if($cmd){return $cmd.Source}}catch{}
   }
+)HCPS"
+LR"HCPS(
   foreach($key in @('HKLM:\SOFTWARE\WinRAR','HKLM:\SOFTWARE\WOW6432Node\WinRAR')){
     try{
       $reg=Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
@@ -5418,6 +5421,8 @@ function LoadRemoteRedNames(){
   $cfg=@()
   try{ if(-not [string]::IsNullOrWhiteSpace($script:HolyCheckSelfExe)){ $cfg += (Join-Path ([IO.Path]::GetDirectoryName($script:HolyCheckSelfExe)) 'checkmods_red_sources.txt') } }catch{}
   try{ $cfg += (Join-Path $env:APPDATA 'HolyCheck\checkmods_red_sources.txt') }catch{}
+)HCPS"
+LR"HCPS(
   try{ $cfg += (Join-Path $env:ProgramData 'HolyCheck\checkmods_red_sources.txt') }catch{}
   foreach($file in $cfg){
     try{
@@ -5589,6 +5594,8 @@ function AddNameHit([string]$name,[string]$path){
   $k=PathKey $path
   if($script:reported.ContainsKey($k)){return}
   $script:reported[$k]=1
+)HCPS"
+LR"HCPS(
   $script:nameHits.Add([PSCustomObject]@{Name=$name;Path=$path}) | Out-Null
 }
 function AddCleanupHit([string]$name,[string]$path){
@@ -5673,6 +5680,8 @@ foreach($drive in $driveRoots){
         AddDownloadRoot (Join-Path $_.FullName 'Downloads')
         AddDownloadRoot (Join-Path $_.FullName 'Desktop')
         AddDownloadRoot (Join-Path $_.FullName 'OneDrive\Desktop')
+)HCPS"
+LR"HCPS(
         AddRoot (Join-Path $_.FullName 'Documents')
         AddRoot (Join-Path $_.FullName '.lunarclient\profiles')
         AddRoot (Join-Path $_.FullName 'AppData\Roaming\.minecraft\mods')
@@ -5932,6 +5941,8 @@ function ZipHasEncryptedEntries([string]$path){
     $limit=[Math]::Min(([int64]$cdOffset + [int64]$cdSize), $fs.Length)
     $count=0
     while($fs.Position + 46 -le $limit -and ($entries -eq 0 -or $count -lt $entries) -and $count -lt 100000){
+)HCPS"
+LR"HCPS(
       $entryStart=$fs.Position
       $sig=$br.ReadUInt32()
       if($sig -ne 0x02014b50){break}
@@ -6035,6 +6046,8 @@ function Invoke7ZipExtractExesSafe([string]$archive,[string]$outDir){
     $stderr=$p.StandardError.ReadToEndAsync()
     try{$p.StandardInput.Close()}catch{}
     if(-not $p.WaitForExit(30000)){
+)HCPS"
+LR"HCPS(
       try{$p.Kill()}catch{}
       HCLog ('7z exe extract timeout, archive skipped: ' + $archive)
       return $false
@@ -6683,6 +6696,7 @@ static void StartAutomationScan(int target)
 
     std::thread([target, unsignedOnly, activityMode, page4Mode, cacheKey]()
     {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         std::vector<std::wstring> lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
 
         if (g_scanCancelRequested.load())
@@ -6756,30 +6770,37 @@ static void StartAutomationBatchScan(const std::vector<int>& targets)
         std::vector<AutomationBatchItem> items;
         std::mutex itemsMutex;
         std::vector<std::thread> workers;
-        workers.reserve(started.size());
+        const size_t workerCount = std::min<size_t>(2, started.size());
+        workers.reserve(workerCount);
+        std::atomic_size_t nextItem{0};
 
-        for (const auto& startedItem : started)
+        for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
         {
-            int target = startedItem.first;
-            int cacheKey = startedItem.second;
-            workers.emplace_back([target, unsignedOnly, activityMode, page4Mode, cacheKey, &items, &itemsMutex]()
+            workers.emplace_back([&started, unsignedOnly, activityMode, page4Mode, &items, &itemsMutex, &nextItem]()
             {
-                AutomationBatchItem item;
-                item.target = target;
-                item.lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                for (;;)
+                {
+                    size_t index = nextItem.fetch_add(1);
+                    if (index >= started.size()) break;
+                    int target = started[index].first;
+                    int cacheKey = started[index].second;
+                    AutomationBatchItem item;
+                    item.target = target;
+                    item.lines = ExecuteAutomationScanTarget(target, unsignedOnly, activityMode, page4Mode);
 
-                if (g_scanCancelRequested.load())
-                {
-                    // См. одиночный воркер: отменённый скан не кэшируем.
-                    item.lines.clear();
-                    item.lines.push_back(L"сканирование отменено пользователем");
+                    if (g_scanCancelRequested.load())
+                    {
+                        item.lines.clear();
+                        item.lines.push_back(L"сканирование отменено пользователем");
+                    }
+                    else
+                    {
+                        StoreAutomationCachedLines(cacheKey, item.lines);
+                    }
+                    std::lock_guard<std::mutex> lock(itemsMutex);
+                    items.push_back(std::move(item));
                 }
-                else
-                {
-                    StoreAutomationCachedLines(cacheKey, item.lines);
-                }
-                std::lock_guard<std::mutex> lock(itemsMutex);
-                items.push_back(std::move(item));
             });
         }
 
@@ -8371,4 +8392,3 @@ static std::wstring MakeAbsoluteUrl(const std::wstring& base, const std::wstring
 
     return origin + dir + href;
 }
-

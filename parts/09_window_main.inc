@@ -1,4 +1,4 @@
-static int AutomationTargetFromEdit(HWND hwnd)
+﻿static int AutomationTargetFromEdit(HWND hwnd)
 {
     if (hwnd == g_hEventEdit) return AUTOMATION_OUTPUT_EVENTVWR;
     if (hwnd == g_hJarEdit) return AUTOMATION_OUTPUT_JAR_ACTIVITY;
@@ -56,7 +56,7 @@ static void ShowCopyOnlyMenu(HWND owner, POINT screenPt, const std::wstring& tex
     if (!menu)
         return;
 
-    AppendMenuW(menu, text.empty() ? (MF_STRING | MF_GRAYED) : MF_STRING, IDM_AUTOMATION_COPY_PATH, L"Копировать");
+    AppendMenuW(menu, text.empty() ? (MF_STRING | MF_GRAYED) : MF_STRING, IDM_AUTOMATION_COPY_PATH, L"copy");
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, owner, nullptr);
     DestroyMenu(menu);
 
@@ -382,6 +382,13 @@ static std::wstring AutomationPathFromLineForCopy(int target, const std::wstring
         return IsFullPathLikeAutomationCell(path) ? path : L"";
     }
 
+    // File Check: name | path | type | real type | status.
+    if (target == AUTOMATION_OUTPUT_FILECHECK && cols.size() >= 2)
+    {
+        std::wstring path = ExtractAutomationPathFromProgramCell(cols[1]);
+        return IsFullPathLikeAutomationCell(path) ? path : L"";
+    }
+
     if ((target == AUTOMATION_OUTPUT_PAGE4 || target == AUTOMATION_OUTPUT_DLL_UNSIGNED) && cols.size() >= 2)
     {
         for (size_t i = 1; i < cols.size(); ++i)
@@ -423,6 +430,9 @@ static std::wstring AutomationNameFromLineForCopy(int target, const std::wstring
         return L"";
 
     if ((target == AUTOMATION_OUTPUT_PAGE4 || target == AUTOMATION_OUTPUT_DLL_UNSIGNED) && cols.size() >= 1)
+        return TrimAutomationField(cols[0]);
+
+    if (target == AUTOMATION_OUTPUT_FILECHECK && cols.size() >= 1)
         return TrimAutomationField(cols[0]);
 
     // BAM: date | program | path | signature.
@@ -506,7 +516,7 @@ static void ShowAutomationCopyPathMenu(HWND hwnd, POINT screenPt, const std::wst
 
     if (highlightTarget == AUTOMATION_OUTPUT_EVENTVWR)
     {
-        AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_PATH, L"Копировать");
+        AppendMenuW(menu, MF_STRING, IDM_AUTOMATION_COPY_PATH, L"copy");
     }
     else
     {
@@ -726,7 +736,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 style,
                 0, 0, 0, 0,
                 hwnd,
-                reinterpret_cast<HMENU>(id),
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                 g_hInst,
                 nullptr
             );
@@ -830,7 +840,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         GetClientRect(hwnd, &rc);
         InitParticles(rc.right, rc.bottom);
 
-        SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
+        SetTimer(hwnd, TIMER_PARTICLES, PARTICLE_FRAME_MS, nullptr);
 
         // Автозапуск сканирований check + file check сразу после открытия окна
         // (dll и jar остаются на ручном запуске кнопками).
@@ -871,7 +881,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (rc.right > 100 && rc.bottom > 100)
                 InitParticles(static_cast<int>(rc.right), static_cast<int>(rc.bottom));
 
-            SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
+            SetTimer(hwnd, TIMER_PARTICLES, PARTICLE_FRAME_MS, nullptr);
         }
 
         RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN);
@@ -888,7 +898,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_EXITSIZEMOVE:
     {
         g_particlesPaused = false;
-        SetTimer(hwnd, TIMER_PARTICLES, 16, nullptr);
+        SetTimer(hwnd, TIMER_PARTICLES, PARTICLE_FRAME_MS, nullptr);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -906,13 +916,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             KillTimer(hwnd, TIMER_AUTOSTART_SCANS);
 
-            // Автозапуск при открытии программы: checkmods, Event Viewer,
-            // Unsigned DLL и File Check. Обычные DLL / JAR остаются ручными.
+            // Автозапуск при открытии программы: Check, FileCheck и DLL | JAR.
+            // DLL | JAR теперь стартует тем же отложенным WM_TIMER-событием,
+            // что и остальные сканы: окно уже создано, UI не блокируется.
             g_page4ScanMode.store(1);
+            g_activityScanMode.store(0);
             StartAutomationBatchScan({
                 AUTOMATION_OUTPUT_PAGE4,
                 AUTOMATION_OUTPUT_EVENTVWR,
-                AUTOMATION_OUTPUT_DLL_UNSIGNED
+                AUTOMATION_OUTPUT_DLL_UNSIGNED,
+                AUTOMATION_OUTPUT_JAR_ACTIVITY,
+                AUTOMATION_OUTPUT_DLL_ACTIVITY
             });
             StartFileCheckScan();
 
@@ -1599,7 +1613,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // finishes and re-enables them.
         bool installerBusy =
             (g_systemInformerInstalling.load() && g_systemInformerTileIndex.load() == index) ||
-            (g_recuvaInstalling.load() && g_recuvaTileIndex.load() == index);
+            (g_recuvaInstalling.load() && g_recuvaTileIndex.load() == index) ||
+            (g_ftkImagerInstalling.load() && g_ftkImagerTileIndex.load() == index);
 
         if (!installerBusy)
             SetItemBusyIndex(index, false);
@@ -1647,6 +1662,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         AbortActiveHttpHandles();
         KillTimer(hwnd, TIMER_PARTICLES);
         KillTimer(hwnd, TIMER_AUTOSTART_SCANS);
+        ReleaseSceneBuffer();
 
         if (g_hFont)
         {

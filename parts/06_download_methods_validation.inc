@@ -1,4 +1,4 @@
-static const unsigned long long MIN_ACCEPTABLE_DOWNLOAD_SPEED_BPS = 14ull * 1024ull;
+﻿static const unsigned long long MIN_ACCEPTABLE_DOWNLOAD_SPEED_BPS = 14ull * 1024ull;
 static const unsigned long long FAST_SWITCH_DOWNLOAD_SPEED_BPS = 96ull * 1024ull;
 
 static bool ReadFilePrefix(const std::wstring& path, std::vector<unsigned char>& out, DWORD maxBytes);
@@ -912,6 +912,50 @@ static bool DownloadWithWinInetFallback(
     return true;
 }
 
+static bool FindFileRecursiveByName(const std::wstring& folder, const std::wstring& fileName, std::wstring& outPath)
+{
+    std::wstring mask = CombinePath(folder, L"*");
+
+    WIN32_FIND_DATAW data{};
+    HANDLE hFind = FindFirstFileW(mask.c_str(), &data);
+
+    if (hFind == INVALID_HANDLE_VALUE)
+        return false;
+
+    std::vector<std::wstring> subFolders;
+
+    do
+    {
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+            continue;
+
+        std::wstring path = CombinePath(folder, data.cFileName);
+
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            subFolders.push_back(path);
+        }
+        else if (_wcsicmp(data.cFileName, fileName.c_str()) == 0)
+        {
+            outPath = path;
+            FindClose(hFind);
+            return true;
+        }
+    }
+    while (FindNextFileW(hFind, &data));
+
+    FindClose(hFind);
+
+    for (const auto& subFolder : subFolders)
+    {
+        if (FindFileRecursiveByName(subFolder, fileName, outPath))
+            return true;
+    }
+
+    return false;
+}
+
+
 static bool FindFirstExeRecursive(const std::wstring& folder, std::wstring& outPath)
 {
     std::wstring mask = CombinePath(folder, L"*");
@@ -998,6 +1042,72 @@ static std::wstring GetItemExtractDir(const DownloadItem& item, const std::wstri
     return CombinePath(tabFolder, RemoveExtension(item.file));
 }
 
+static bool IsFtkImagerItem(const DownloadItem& item)
+{
+    return _wcsicmp(item.name.c_str(), L"FTK Imager") == 0;
+}
+
+// Locate only the real FTK Imager executable. Do not fall back to the first
+// .exe in the archive because FTK packages may also contain setup/helper EXEs.
+// Search the expected extraction folder first, then the whole Extra programs
+// folder to stay compatible with folders created by older HolyCheck builds.
+static std::wstring FindFtkImagerLaunchPath(const DownloadItem& item, const std::wstring& baseFolder)
+{
+    if (!IsFtkImagerItem(item))
+        return L"";
+
+    std::wstring tabFolder = CombinePath(baseFolder, GetTabFolderName(item.tab));
+    std::wstring extractDir = GetItemExtractDir(item, baseFolder);
+    std::wstring exePath;
+
+    std::wstring directPath = CombinePath(extractDir, L"FTK Imager.exe");
+    if (FileExists(directPath))
+        return directPath;
+
+    if (FindFileRecursiveByName(extractDir, L"FTK Imager.exe", exePath) && FileExists(exePath))
+        return exePath;
+
+    directPath = CombinePath(tabFolder, L"FTK Imager.exe");
+    if (FileExists(directPath))
+        return directPath;
+
+    exePath.clear();
+    if (FindFileRecursiveByName(tabFolder, L"FTK Imager.exe", exePath) && FileExists(exePath))
+        return exePath;
+
+    return L"";
+}
+
+// FTK 8.3 package used by HolyCheck contains the Exterro installer rather than
+// a portable FTK Imager.exe. Always select this exact installer name so a
+// helper executable from the archive can never be launched by mistake.
+static std::wstring FindFtkImagerInstallerPath(const DownloadItem& item, const std::wstring& baseFolder)
+{
+    if (!IsFtkImagerItem(item))
+        return L"";
+
+    const wchar_t* installerName = L"Exterro_FTK_Imager_(x64).exe";
+    std::wstring extractDir = GetItemExtractDir(item, baseFolder);
+    std::wstring direct = CombinePath(extractDir, installerName);
+    if (FileExists(direct))
+        return direct;
+
+    std::wstring found;
+    if (FindFileRecursiveByName(extractDir, installerName, found) && FileExists(found))
+        return found;
+
+    std::wstring tabFolder = CombinePath(baseFolder, GetTabFolderName(item.tab));
+    direct = CombinePath(tabFolder, installerName);
+    if (FileExists(direct))
+        return direct;
+
+    found.clear();
+    if (FindFileRecursiveByName(tabFolder, installerName, found) && FileExists(found))
+        return found;
+
+    return L"";
+}
+
 static std::wstring TrimLaunchString(std::wstring value)
 {
     while (!value.empty() && iswspace(value.front()))
@@ -1075,6 +1185,242 @@ static bool LaunchRegistryGetString(HKEY key, const wchar_t* valueName, std::wst
 
     out = value;
     return !out.empty();
+}
+
+
+static void AddUniqueFtkLaunchCandidate(std::vector<std::wstring>& candidates, const std::wstring& rawPath)
+{
+    std::wstring path = ExtractExecutablePathFromRegistryValue(rawPath);
+    if (path.empty())
+        path = TrimLaunchString(rawPath);
+
+    if (path.empty())
+        return;
+
+    std::wstring lower = ToLower(path);
+    if (!EndsWithI(lower, L".exe") || lower.find(L"ftk imager") == std::wstring::npos)
+        return;
+
+    for (const auto& existing : candidates)
+    {
+        if (ToLower(existing) == lower)
+            return;
+    }
+    candidates.push_back(path);
+}
+
+static void AddFtkCandidateFromEnv(std::vector<std::wstring>& candidates, const wchar_t* envName, const wchar_t* relativePath)
+{
+    wchar_t base[MAX_PATH * 4]{};
+    DWORD len = GetEnvironmentVariableW(envName, base, ARRAYSIZE(base));
+    if (len == 0 || len >= ARRAYSIZE(base))
+        return;
+    AddUniqueFtkLaunchCandidate(candidates, CombinePath(base, relativePath));
+}
+
+static void AddFtkRootFromEnv(std::vector<std::wstring>& roots, const wchar_t* envName)
+{
+    wchar_t base[MAX_PATH * 4]{};
+    DWORD len = GetEnvironmentVariableW(envName, base, ARRAYSIZE(base));
+    if (len == 0 || len >= ARRAYSIZE(base) || !DirectoryExists(base))
+        return;
+
+    std::wstring key = ToLower(base);
+    for (const auto& existing : roots)
+        if (ToLower(existing) == key)
+            return;
+    roots.push_back(base);
+}
+
+// Full Program Files scan used only from the background worker. Reparse points
+// are skipped so junctions cannot create loops or unexpectedly leave the tree.
+static bool FindFtkImagerInProgramFilesTree(const std::wstring& root, std::wstring& outPath)
+{
+    if (root.empty() || !DirectoryExists(root))
+        return false;
+
+    std::queue<std::wstring> q;
+    q.push(root);
+
+    while (!q.empty())
+    {
+        std::wstring dir = std::move(q.front());
+        q.pop();
+
+        WIN32_FIND_DATAW data{};
+        HANDLE h = FindFirstFileW(CombinePath(dir, L"*").c_str(), &data);
+        if (h == INVALID_HANDLE_VALUE)
+            continue;
+
+        do
+        {
+            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0)
+                continue;
+
+            std::wstring full = CombinePath(dir, data.cFileName);
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+                    q.push(full);
+            }
+            else if (_wcsicmp(data.cFileName, L"FTK Imager.exe") == 0)
+            {
+                outPath = full;
+                FindClose(h);
+                return true;
+            }
+        }
+        while (FindNextFileW(h, &data));
+
+        FindClose(h);
+    }
+
+    return false;
+}
+
+static void AddFtkAppPathRegistryCandidate(std::vector<std::wstring>& candidates, HKEY root, REGSAM wowFlags)
+{
+    HKEY key{};
+    if (RegOpenKeyExW(root,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\FTK Imager.exe",
+        0, KEY_READ | wowFlags, &key) != ERROR_SUCCESS)
+        return;
+
+    std::wstring value;
+    if (LaunchRegistryGetString(key, nullptr, value))
+        AddUniqueFtkLaunchCandidate(candidates, value);
+    RegCloseKey(key);
+}
+
+static void AddFtkUninstallRegistryCandidates(std::vector<std::wstring>& candidates, HKEY root, REGSAM wowFlags)
+{
+    HKEY uninstall{};
+    if (RegOpenKeyExW(root,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        0, KEY_READ | wowFlags, &uninstall) != ERROR_SUCCESS)
+        return;
+
+    DWORD index = 0;
+    wchar_t subName[512]{};
+    DWORD subLen = ARRAYSIZE(subName);
+    while (RegEnumKeyExW(uninstall, index++, subName, &subLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+    {
+        HKEY sub{};
+        if (RegOpenKeyExW(uninstall, subName, 0, KEY_READ | wowFlags, &sub) == ERROR_SUCCESS)
+        {
+            std::wstring displayName;
+            if (LaunchRegistryGetString(sub, L"DisplayName", displayName) &&
+                ToLower(displayName).find(L"ftk imager") != std::wstring::npos)
+            {
+                std::wstring installLocation;
+                if (LaunchRegistryGetString(sub, L"InstallLocation", installLocation))
+                    AddUniqueFtkLaunchCandidate(candidates, CombinePath(TrimLaunchString(installLocation), L"FTK Imager.exe"));
+
+                std::wstring displayIcon;
+                if (LaunchRegistryGetString(sub, L"DisplayIcon", displayIcon))
+                    AddUniqueFtkLaunchCandidate(candidates, displayIcon);
+            }
+            RegCloseKey(sub);
+        }
+        subLen = ARRAYSIZE(subName);
+    }
+    RegCloseKey(uninstall);
+}
+
+static std::wstring FindInstalledFtkImagerPath(bool deepProgramFilesScan)
+{
+    std::vector<std::wstring> candidates;
+
+    // Current/default AccessData layout plus Exterro-branded layouts that can
+    // appear on newer/custom packages. Check all Windows Program Files views.
+    const wchar_t* envs[] = { L"ProgramW6432", L"ProgramFiles", L"ProgramFiles(x86)" };
+    const wchar_t* rels[] = {
+        L"AccessData\\FTK Imager\\FTK Imager.exe",
+        L"AccessData\\AccessData FTK Imager\\FTK Imager.exe",
+        L"AccessData\\FTK Imager.exe",
+        L"Exterro\\FTK Imager\\FTK Imager.exe",
+        L"Exterro\\FTK Imager.exe"
+    };
+    for (const auto* env : envs)
+        for (const auto* rel : rels)
+            AddFtkCandidateFromEnv(candidates, env, rel);
+
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_CURRENT_USER, 0);
+    AddFtkUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddFtkUninstallRegistryCandidates(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddFtkUninstallRegistryCandidates(candidates, HKEY_CURRENT_USER, 0);
+
+    for (const auto& path : candidates)
+        if (FileExists(path))
+            return path;
+
+    if (!deepProgramFilesScan)
+        return L"";
+
+    std::vector<std::wstring> roots;
+    AddFtkRootFromEnv(roots, L"ProgramW6432");
+    AddFtkRootFromEnv(roots, L"ProgramFiles");
+    AddFtkRootFromEnv(roots, L"ProgramFiles(x86)");
+
+    for (const auto& root : roots)
+    {
+        std::wstring found;
+        if (FindFtkImagerInProgramFilesTree(root, found) && FileExists(found))
+            return found;
+    }
+
+    return L"";
+}
+
+static bool IsNonEmptyRegularFile(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return false;
+    return data.nFileSizeHigh != 0 || data.nFileSizeLow != 0;
+}
+
+// Do not treat FTK Imager as launchable merely because FTK Imager.exe has
+// appeared. InstallShield/MSI can create the EXE before its private DLLs are
+// copied, which causes errors such as "dongle.dll was not found". These are
+// direct FTK dependencies that are installed beside the executable.
+static bool IsFtkImagerLaunchReady(const std::wstring& exePath)
+{
+    if (exePath.empty() || !FileExists(exePath) ||
+        _wcsicmp(ExtractFileNameOnly(exePath).c_str(), L"FTK Imager.exe") != 0)
+        return false;
+
+    size_t slash = exePath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return false;
+    std::wstring dir = exePath.substr(0, slash);
+    if (dir.empty() || !DirectoryExists(dir))
+        return false;
+
+    const wchar_t* requiredFiles[] = {
+        L"dongle.dll",
+        L"LMS.dll",
+        L"adlib.dll",
+        L"adshared.dll"
+    };
+
+    for (const wchar_t* file : requiredFiles)
+    {
+        if (!IsNonEmptyRegularFile(CombinePath(dir, file)))
+            return false;
+    }
+
+    return true;
+}
+
+static std::wstring FindReadyInstalledFtkImagerPath(bool deepProgramFilesScan)
+{
+    std::wstring path = FindInstalledFtkImagerPath(deepProgramFilesScan);
+    return IsFtkImagerLaunchReady(path) ? path : L"";
 }
 
 static void AddUniqueSystemInformerLaunchCandidate(std::vector<std::wstring>& candidates, const std::wstring& rawPath)
@@ -1330,10 +1676,26 @@ static std::wstring FindLaunchPathForItem(const DownloadItem& item, const std::w
             return installedPath;
     }
 
+    if (IsFtkImagerItem(item))
+    {
+        // The button worker has already done the expensive Program Files scan.
+        // Here only re-check fast locations/registry, then fall back to the
+        // freshly extracted HolyCheck copy below.
+        std::wstring installedPath = FindReadyInstalledFtkImagerPath(false);
+        if (!installedPath.empty())
+            return installedPath;
+    }
+
     if (EndsWithI(target, L".zip"))
     {
         std::wstring extractDir = GetItemExtractDir(item, baseFolder);
         std::wstring exePath;
+
+        // FTK 8.3 archive contains Exterro_FTK_Imager_(x64).exe. The installer
+        // is handled by OpenItemPath on a background worker; after installation
+        // subsequent clicks resolve directly to Program Files above.
+        if (IsFtkImagerItem(item))
+            return FindFtkImagerInstallerPath(item, baseFolder);
 
         if (FindFirstExeRecursive(extractDir, exePath))
             return exePath;
@@ -1411,6 +1773,9 @@ static bool EnsureRegistryExplorerDotNetRuntime(const std::wstring& registryExpl
     std::wstring script;
     script.reserve(8192);
     script += L"$ErrorActionPreference='Stop'\n";
+    // Ускорение скачивания рантайма: без прогресс-бара Invoke-WebRequest
+    // в Windows PowerShell 5.1 (Win10/11) работает в десятки раз быстрее.
+    script += L"$ProgressPreference='SilentlyContinue'\n";
     script += L"$exe='" + QuotePowerShellSingleArgLocal(registryExplorerExe) + L"'\n";
     script += L"$dir='" + QuotePowerShellSingleArgLocal(exeDir) + L"'\n";
     script += LR"HCPS(
@@ -1610,6 +1975,15 @@ static bool StartElevatedProcessHidden(const std::wstring& file, const std::wstr
     if (file.empty())
         return false;
 
+    // Self-extracting installers (including FTK Imager) may resolve embedded
+    // payloads relative to their own folder. Give ShellExecute an explicit
+    // working directory instead of inheriting whatever directory launched
+    // HolyCheck. This is safe on both Windows 10 and Windows 11.
+    std::wstring workingDir;
+    size_t slash = file.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        workingDir = file.substr(0, slash);
+
     SHELLEXECUTEINFOW sei = {};
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -1617,6 +1991,7 @@ static bool StartElevatedProcessHidden(const std::wstring& file, const std::wstr
     sei.lpVerb = L"runas";
     sei.lpFile = file.c_str();
     sei.lpParameters = params.empty() ? nullptr : params.c_str();
+    sei.lpDirectory = workingDir.empty() ? nullptr : workingDir.c_str();
     sei.nShow = SW_HIDE;
 
     if (!ShellExecuteExW(&sei))
@@ -1971,8 +2346,335 @@ static void RecuvaInstallWorker(std::wstring setupPath)
     }
 }
 
+static bool OpenFtkImagerExecutable(const std::wstring& path);
+
+static std::wstring FindInstalledFtkImagerFastPath()
+{
+    // Hot path used while the installer is running. Avoid enumerating every
+    // Uninstall registry subkey or recursively scanning Program Files on each
+    // poll; those operations made FTK installation feel much slower.
+    std::vector<std::wstring> candidates;
+    const wchar_t* envs[] = { L"ProgramW6432", L"ProgramFiles", L"ProgramFiles(x86)" };
+    const wchar_t* rels[] = {
+        L"AccessData\\FTK Imager\\FTK Imager.exe",
+        L"AccessData\\AccessData FTK Imager\\FTK Imager.exe",
+        L"AccessData\\FTK Imager.exe",
+        L"Exterro\\FTK Imager\\FTK Imager.exe",
+        L"Exterro\\FTK Imager.exe"
+    };
+
+    for (const auto* env : envs)
+        for (const auto* rel : rels)
+            AddFtkCandidateFromEnv(candidates, env, rel);
+
+    // App Paths is cheap to query and covers installations that register an
+    // explicit executable path without using the default AccessData folder.
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
+    AddFtkAppPathRegistryCandidate(candidates, HKEY_CURRENT_USER, 0);
+
+    for (const auto& path : candidates)
+        if (IsFtkImagerLaunchReady(path))
+            return path;
+
+    return L"";
+}
+
+static bool WaitForFtkImagerInstall(HANDLE process, DWORD maxWaitMs, bool& processFinished, DWORD& exitCode)
+{
+    processFinished = false;
+    exitCode = STILL_ACTIVE;
+
+    const ULONGLONG started = GetTickCount64();
+    ULONGLONG lastRegistryProbe = 0;
+    ULONGLONG finishedAt = 0;
+    ULONGLONG readySince = 0;
+
+    for (;;)
+    {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG elapsed = now - started;
+
+        if (process && !processFinished)
+        {
+            DWORD waitResult = WaitForSingleObject(process, 0);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                processFinished = true;
+                finishedAt = elapsed;
+                GetExitCodeProcess(process, &exitCode);
+            }
+        }
+
+        // A visible FTK Imager.exe is not enough. Wait until its private DLLs
+        // (especially dongle.dll) are present and non-empty, then keep that
+        // state stable for a short interval before declaring installation ready.
+        std::wstring readyPath = FindInstalledFtkImagerFastPath();
+        if (readyPath.empty() && (elapsed == 0 || elapsed - lastRegistryProbe >= 2000))
+        {
+            lastRegistryProbe = elapsed;
+            readyPath = FindReadyInstalledFtkImagerPath(false);
+        }
+
+        if (!readyPath.empty())
+        {
+            if (readySince == 0)
+                readySince = now;
+
+            // Give MSI/InstallShield a little time to finish replacing/copying
+            // neighboring DLLs. This prevents the first automatic launch from
+            // racing the installer while keeping the delay barely noticeable.
+            if (now - readySince >= 2000)
+                return true;
+        }
+        else
+        {
+            readySince = 0;
+        }
+
+        // InstallShield can exit before the child Windows Installer finishes.
+        // A successful bootstrapper therefore gets a grace period in which we
+        // continue waiting for a fully launchable FTK installation.
+        if (processFinished)
+        {
+            const ULONGLONG graceMs = (exitCode == ERROR_SUCCESS || exitCode == 3010) ? 60000ULL : 8000ULL;
+            if (elapsed >= finishedAt + graceMs)
+                break;
+        }
+
+        if (elapsed >= maxWaitMs)
+            break;
+
+        Sleep(250);
+    }
+
+    std::wstring readyPath = FindReadyInstalledFtkImagerPath(true);
+    if (readyPath.empty())
+        return false;
+
+    // Final stabilization after a deep lookup as well.
+    Sleep(1500);
+    return IsFtkImagerLaunchReady(readyPath);
+}
+
+static bool RunFtkInstallerSilentAttempt(
+    const std::wstring& setupPath,
+    const std::wstring& args,
+    DWORD maxWaitMs,
+    bool& processFinished,
+    DWORD& exitCode)
+{
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+
+    processFinished = false;
+    exitCode = STILL_ACTIVE;
+
+    if (!StartElevatedProcessHidden(setupPath, args, process, pid))
+        return false;
+
+    DebugLogLine(L"ftk", L"silent setup started pid=" + std::to_wstring(pid) + L" args=" + args);
+
+    bool installed = WaitForFtkImagerInstall(process, maxWaitMs, processFinished, exitCode);
+
+    if (process)
+        CloseHandle(process);
+
+    DebugLogLine(L"ftk", L"silent setup state exit=" + std::to_wstring(exitCode) +
+        L" finished=" + std::to_wstring(processFinished ? 1 : 0) +
+        L" installed=" + std::to_wstring(installed ? 1 : 0));
+    return installed;
+}
+
+static bool InstallFtkImagerSilently(const std::wstring& setupPath)
+{
+    if (!FindReadyInstalledFtkImagerPath(false).empty())
+        return true;
+
+    if (setupPath.empty() || !FileExists(setupPath))
+    {
+        DebugLogLine(L"ftk", L"installer missing: " + setupPath);
+        return false;
+    }
+
+    // FTK Imager uses an InstallShield bootstrapper around Windows Installer.
+    // The FTK-specific unattended form used by deployment scripts is /s /v/qn;
+    // keep the first attempt minimal so InstallShield forwards it cleanly on
+    // both Windows 10 and Windows 11. A quoted MSI form remains below as the
+    // single compatibility fallback.
+    bool processFinished = false;
+    DWORD exitCode = STILL_ACTIVE;
+    if (RunFtkInstallerSilentAttempt(
+        setupPath,
+        L"/s /v/qn",
+        300000,
+        processFinished,
+        exitCode))
+    {
+        return true;
+    }
+
+    // Some InstallShield bootstrappers return 0 as soon as they hand work to
+    // Windows Installer. A zero bootstrapper exit code therefore is not proof
+    // that FTK was installed. If the bootstrapper really ended and FTK still
+    // cannot be found after the grace period, retry once with the alternate
+    // MSI quiet spelling. Never start the fallback while the first bootstrapper
+    // is still alive.
+    if (processFinished && exitCode != STILL_ACTIVE && FindReadyInstalledFtkImagerPath(false).empty())
+    {
+        bool fallbackFinished = false;
+        DWORD fallbackExit = STILL_ACTIVE;
+        return RunFtkInstallerSilentAttempt(
+            setupPath,
+            L"/s /v\"/qn /norestart REBOOT=ReallySuppress\"",
+            180000,
+            fallbackFinished,
+            fallbackExit);
+    }
+
+    return !FindReadyInstalledFtkImagerPath(false).empty();
+}
+
+static void FtkImagerInstallWorker(std::wstring setupPath)
+{
+    HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    try
+    {
+        if (InstallFtkImagerSilently(setupPath))
+        {
+            std::wstring installed = FindInstalledFtkImagerFastPath();
+            if (installed.empty())
+                installed = FindReadyInstalledFtkImagerPath(false);
+            if (installed.empty())
+                installed = FindReadyInstalledFtkImagerPath(true);
+            bool launched = false;
+            if (!g_deleteInProgress.load() && !g_destroying.load())
+                launched = !installed.empty() && OpenFtkImagerExecutable(installed);
+
+            PostLog(g_deleteInProgress.load() || g_destroying.load()
+                ? L"FTK Imager: установка завершена, запуск отменён из-за удаления"
+                : (launched ? L"FTK Imager: установлен и открыт" : L"FTK Imager: установлен, но не открылся"));
+        }
+        else
+        {
+            PostLog(L"FTK Imager: ошибка фоновой установки");
+        }
+    }
+    catch (...)
+    {
+        DebugLogLine(L"ftk", L"background install failed with exception");
+        PostLog(L"FTK Imager: ошибка фоновой установки");
+    }
+
+    if (SUCCEEDED(comInit))
+        CoUninitialize();
+
+    g_ftkImagerInstalling.store(false);
+    int tileIndex = g_ftkImagerTileIndex.exchange(-1);
+    if (tileIndex >= 0)
+    {
+        SetItemBusyIndex(tileIndex, false);
+        SetTileEnabledByIndex(tileIndex, true);
+    }
+}
+
+static std::wstring GetLaunchWorkingDirectory(const std::wstring& path)
+{
+    size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return L"";
+
+    return path.substr(0, slash);
+}
+
+static bool OpenFtkImagerExecutable(const std::wstring& path)
+{
+    if (!IsFtkImagerLaunchReady(path))
+    {
+        DebugLogLine(L"ftk", L"launch blocked: FTK dependencies are not ready beside " + path);
+        return false;
+    }
+
+    std::wstring workingDir = GetLaunchWorkingDirectory(path);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    if (CreateProcessW(
+        path.c_str(),
+        nullptr,
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        workingDir.empty() ? nullptr : workingDir.c_str(),
+        &si,
+        &pi))
+    {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        DebugLogLine(L"ftk", L"launched existing FTK Imager: " + path);
+        return true;
+    }
+
+    DWORD createError = GetLastError();
+    DebugLogLine(L"ftk", L"CreateProcess failed path=" + path + L" error=" + FormatWin32ErrorForLog(createError));
+
+    // Fallback through ShellExecute. If elevation is required, request it
+    // explicitly; HolyCheck normally already runs elevated, so this is mostly
+    // for systems with a different launch policy.
+    const wchar_t* verb = (createError == ERROR_ELEVATION_REQUIRED) ? L"runas" : L"open";
+    HINSTANCE result = ShellExecuteW(
+        g_hMain,
+        verb,
+        path.c_str(),
+        nullptr,
+        workingDir.empty() ? nullptr : workingDir.c_str(),
+        SW_SHOWNORMAL
+    );
+
+    return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
 static bool OpenItemPath(const DownloadItem& item, const std::wstring& path)
 {
+    if (IsFtkImagerItem(item))
+    {
+        std::wstring installed = FindReadyInstalledFtkImagerPath(false);
+        if (!installed.empty())
+            return OpenFtkImagerExecutable(installed);
+
+        std::wstring fileName = ToLower(ExtractFileNameOnly(path));
+        if (fileName == L"ftk imager.exe")
+            return IsFtkImagerLaunchReady(path) && OpenFtkImagerExecutable(path);
+
+        if (path.empty() || !FileExists(path) ||
+            _wcsicmp(ExtractFileNameOnly(path).c_str(), L"Exterro_FTK_Imager_(x64).exe") != 0)
+        {
+            DebugLogLine(L"ftk", L"exact installer not found: " + path);
+            return false;
+        }
+
+        bool expected = false;
+        if (!g_ftkImagerInstalling.compare_exchange_strong(expected, true))
+            return true;
+
+        try
+        {
+            std::thread(FtkImagerInstallWorker, path).detach();
+        }
+        catch (...)
+        {
+            g_ftkImagerInstalling.store(false);
+            return false;
+        }
+
+        return true;
+    }
+
     if (IsEverythingItem(item))
         return OpenEverythingPath(path);
 
@@ -2153,8 +2855,8 @@ Regex (case-insensetive) | DPS:
 2022/06/07:07:45:55 - mp3)HCSYSTEM";
 
 static const wchar_t* POWERSHELL_TXT =
-    LR"HCPS($ErrorActionPreference="SilentlyContinue";$out="$PWD\check.txt";$twinksOut="$PWD\checktwinks.txt";$mac = (Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress;if (-not $mac) { $mac = (Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual|WireGuard|TAP'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress };"1. Модель системы: $((Get-WmiObject Win32_ComputerSystem).Model)`n2. Серийный BIOS: $((Get-WmiObject Win32_BIOS).SerialNumber)`n3. Реестр: $((Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS').SystemProductName)`n4. Модель диска: $((Get-WmiObject Win32_DiskDrive | ForEach-Object { "$($_.Model) ($([math]::Round($_.Size/1GB, 2)) GB)" }) -join ', ')`n5. Видеоадаптеры: $(($(Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceClass -eq 'DISPLAY'} | ForEach-Object { "$($_.DeviceName) | $($_.Manufacturer) | $($_.DriverProviderName)" }) -join '; '))`n6. Виртуальные устройства: $((Get-WmiObject Win32_PnPEntity | Where-Object {$_.Name -match 'VMware|Virtual|VBox|Hyper-V|QEMU|Xen|KVM|VirtIO|VirtualBox|VMCI|SVGA|VMBus'}).Name -join ', ')`n7. Mac: $mac">$out;$bootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;function f($t){$p=(' '*((45-$t.Length)/2));"${p}${t}${p}"+(' '*(45-$p.Length*2-$t.Length))};"`n`n=============================================`n$(f 'ИНФОРМАЦИЯ О ВКЛЮЧЕНИИ ПК')`n=============================================`nПоследнее включение ПК: $($bootTime.ToString('yyyy-MM-dd HH:mm:ss'))">>$out;"`n`n`n=============================================`n$(f 'СОСТОЯНИЕ СЛУЖБ')`n=============================================">>$out;$services=@("PcaSvc","DPS","SysMain","EventLog","bam")|%{$s=Get-Service $_ -ea 0;if($s){$t=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -n Start -ea 0).Start;$n=switch($t){2{'Авто'}3{'Вручную'}4{'Отключена'}default{'Неизвестно'}};$p=if($s.Status-eq'Running'){try{$procId=(Get-WmiObject Win32_Service -Filter "Name='$_'").ProcessID;(Get-Process -Id $procId -ea 0).StartTime.ToString('yyyy-MM-dd HH:mm:ss')}catch{'Не удалось получить'}}else{'Не запущена'};[PSCustomObject]@{'Служба'=$_.PadRight(8);'Состояние'=$s.Status.ToString().PadRight(10);'Тип запуска'=$n.PadRight(9);'Время запуска'=$p.PadRight(20)}}};($services|ft -AutoSize -Wrap|Out-String -Width 4096|%{$_.Trim()})>>$out;"`n`n`n=============================================`n$(f 'СОБЫТИЯ ОЧИСТКИ ЖУРНАЛОВ (ID 104)')`n=============================================">>$out;$e=Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=104)]]" -ea 0;if($e){$e|%{$d=($_.Message-split"`n")[0];"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $d">>$out}};"`n`n`n=============================================`n$(f 'СОБЫТИЯ ПРИЛОЖЕНИЯ (ID 3079)')`n=============================================">>$out;Get-WinEvent -LogName Application -FilterXPath "*[System[(EventID=3079)]]" -MaxEvents 5 -ea 0|%{$m=($_.Message-split"Подробности:")[-1].Trim()-replace"`n|`r|\s+"," ";"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $m">>$out};"`n`n`n=============================================`n$(f 'СПИСОК ТВИНКОВ ИГРОКА')`n=============================================">>$out;$r=@{};$err=@();)HCPS"
-    LR"HCPS(Get-ChildItem -Path . -Recurse -Include *.log,*.log.gz -ea 0|%{try{if($_.Extension-eq'.gz'){$c=[System.IO.Compression.GzipStream]::new([System.IO.File]::OpenRead($_.FullName),[System.IO.Compression.CompressionMode]::Decompress);$s=[System.IO.StreamReader]::new($c);while(-not$s.EndOfStream){$l=$s.ReadLine();if($l-match'setting user:\s*(.+)$'){$r[$matches[1].Trim()]=1}};$s.Close()}else{Get-Content $_.FullName|?{$_-match'setting user:\s*(.+)$'}|%{$r[$matches[1].Trim()]=1}}}catch{$err+="Ошибка логов $($_.Name): $_"}};if(Test-Path "$env:APPDATA\.iasx"){try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$env:APPDATA\.iasx")) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка appdata iasx: $_"}};Get-ChildItem -Path . -Recurse -Filter *.iasx -ea 0|%{try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка iasx $($_.Name): $_"}};Get-ChildItem -Path . -Recurse -Filter accounts_v1.do_not_send_to_anyone -ea 0|%{try{$b=[System.IO.File]::ReadAllBytes($_.FullName);$ms=New-Object System.IO.MemoryStream(,$b[2..($b.Length-1)]);$ds=New-Object System.IO.Compression.DeflateStream($ms,[System.IO.Compression.CompressionMode]::Decompress);$sr=New-Object System.IO.StreamReader($ds);$c=$sr.ReadToEnd();$sr.Close();$ds.Close();$ms.Close();$c-split'[\x00-\x1F]'|?{$_-match'^[a-zA-Z0-9_]{3,}$'}|%{$r[$_]=1}}catch{$err+="Ошибка accounts_v1 $($_.Name): $_"}};if(Test-Path "$PWD\usercache.json"){try{Get-Content "$PWD\usercache.json" -Raw|ConvertFrom-Json|Select-Object -ExpandProperty name|%{$r[$_]=1}}catch{$err+="Ошибка usercache.json: $_"}};if(Test-Path "$PWD\TlauncherProfiles.json"){try{Get-Content "$PWD\TlauncherProfiles.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value|Select-Object -Expand username}|%{$r[$_]=1}}catch{$err+="Ошибка TlauncherProfiles.json: $_"}};if(Test-Path "$PWD\LabyMod\accounts.json"){try{Get-Content "$PWD\LabyMod\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка LabyMod/accounts.json: $_"}};if(Test-Path "$PWD\labymod-neo\accounts.json"){try{Get-Content "$PWD\labymod-neo\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка labymod-neo/accounts.json: $_"}};Get-ChildItem -Path . -Recurse -Filter ias.json -ea 0|%{try{$j=Get-Content $_.FullName -Raw|ConvertFrom-Json;if($j.accounts){$j.accounts|%{if($_.name){$r[$_.name]=1}elseif($_.data.username){$r[$_.data.username]=1}}}}catch{$err+="Ошибка ias.json $($_.Name): $_"}};if(Test-Path "$PWD\usernamecache.json"){try{Get-Content "$PWD\usernamecache.json" -Raw|ConvertFrom-Json|%{$_.PSObject.Properties.Value}|%{$r[$_]=1}}catch{$err+="Ошибка usernamecache.json: $_"}};if(Test-Path "$env:APPDATA\.lunarclient"){try{Get-ChildItem "$env:APPDATA\.lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;)HCPS"
+    LR"HCPS($ErrorActionPreference="SilentlyContinue";$out="$PWD\check.txt";$twinksOut="$PWD\checktwinks.txt";$mac = (Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress;if (-not $mac) { $mac = (Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual|WireGuard|TAP'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress };"1. Модель системы: $((Get-CimInstance Win32_ComputerSystem).Model)`n2. Серийный BIOS: $((Get-CimInstance Win32_BIOS).SerialNumber)`n3. Реестр: $((Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS').SystemProductName)`n4. Модель диска: $((Get-CimInstance Win32_DiskDrive | ForEach-Object { "$($_.Model) ($([math]::Round($_.Size/1GB, 2)) GB)" }) -join ', ')`n5. Видеоадаптеры: $(($(Get-CimInstance Win32_PnPSignedDriver | Where-Object {$_.DeviceClass -eq 'DISPLAY'} | ForEach-Object { "$($_.DeviceName) | $($_.Manufacturer) | $($_.DriverProviderName)" }) -join '; '))`n6. Виртуальные устройства: $((Get-CimInstance Win32_PnPEntity | Where-Object {$_.Name -match 'VMware|Virtual|VBox|Hyper-V|QEMU|Xen|KVM|VirtIO|VirtualBox|VMCI|SVGA|VMBus'}).Name -join ', ')`n7. Mac: $mac">$out;$bootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;function f($t){$p=(' '*((45-$t.Length)/2));"${p}${t}${p}"+(' '*(45-$p.Length*2-$t.Length))};"`n`n=============================================`n$(f 'ИНФОРМАЦИЯ О ВКЛЮЧЕНИИ ПК')`n=============================================`nПоследнее включение ПК: $($bootTime.ToString('yyyy-MM-dd HH:mm:ss'))">>$out;"`n`n`n=============================================`n$(f 'СОСТОЯНИЕ СЛУЖБ')`n=============================================">>$out;$services=@("PcaSvc","DPS","SysMain","EventLog","bam")|%{$s=Get-Service $_ -ea 0;if($s){$t=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -n Start -ea 0).Start;$n=switch($t){2{'Авто'}3{'Вручную'}4{'Отключена'}default{'Неизвестно'}};$p=if($s.Status-eq'Running'){try{$procId=(Get-CimInstance Win32_Service -Filter "Name='$_'").ProcessID;(Get-Process -Id $procId -ea 0).StartTime.ToString('yyyy-MM-dd HH:mm:ss')}catch{'Не удалось получить'}}else{'Не запущена'};[PSCustomObject]@{'Служба'=$_.PadRight(8);'Состояние'=$s.Status.ToString().PadRight(10);'Тип запуска'=$n.PadRight(9);'Время запуска'=$p.PadRight(20)}}};($services|ft -AutoSize -Wrap|Out-String -Width 4096|%{$_.Trim()})>>$out;"`n`n`n=============================================`n$(f 'СОБЫТИЯ ОЧИСТКИ ЖУРНАЛОВ (ID 104)')`n=============================================">>$out;$e=Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=104)]]" -ea 0;if($e){$e|%{$d=($_.Message-split"`n")[0];"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $d">>$out}};"`n`n`n=============================================`n$(f 'СОБЫТИЯ ПРИЛОЖЕНИЯ (ID 3079)')`n=============================================">>$out;Get-WinEvent -LogName Application -FilterXPath "*[System[(EventID=3079)]]" -MaxEvents 5 -ea 0|%{$m=($_.Message-split"Подробности:")[-1].Trim()-replace"`n|`r|\s+"," ";"ID $($_.Id) | $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $m">>$out};"`n`n`n=============================================`n$(f 'СПИСОК ТВИНКОВ ИГРОКА')`n=============================================">>$out;$r=@{};$err=@();$scanFiles=@(Get-ChildItem -LiteralPath . -File -Recurse -ea 0);)HCPS"
+    LR"HCPS($scanFiles|?{$_.Name -like '*.log' -or $_.Name -like '*.log.gz'}|%{try{if($_.Extension-eq'.gz'){$c=[System.IO.Compression.GzipStream]::new([System.IO.File]::OpenRead($_.FullName),[System.IO.Compression.CompressionMode]::Decompress);$s=[System.IO.StreamReader]::new($c);while(-not$s.EndOfStream){$l=$s.ReadLine();if($l-match'setting user:\s*(.+)$'){$r[$matches[1].Trim()]=1}};$s.Close()}else{Get-Content $_.FullName|?{$_-match'setting user:\s*(.+)$'}|%{$r[$matches[1].Trim()]=1}}}catch{$err+="Ошибка логов $($_.Name): $_"}};if(Test-Path "$env:APPDATA\.iasx"){try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$env:APPDATA\.iasx")) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка appdata iasx: $_"}};$scanFiles|?{$_.Extension -eq'.iasx'}|%{try{[System.Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($_.FullName)) -split '[\0-\x1F\x7F-\x9F]'|%{$_.TrimEnd('t')}|?{$_-match '^[\p{IsCyrillic}\p{IsBasicLatin}_]{3,20}$'-and$_-notmatch'=$'-and$_-notmatch'(java|alias|user|pass|field|object|count|list|data|xp|sr|lastused|premium|obj|q$|\[)'}|%{$r[$_]=1}}catch{$err+="Ошибка iasx $($_.Name): $_"}};$scanFiles|?{$_.Name -eq'accounts_v1.do_not_send_to_anyone'}|%{try{$b=[System.IO.File]::ReadAllBytes($_.FullName);$ms=New-Object System.IO.MemoryStream(,$b[2..($b.Length-1)]);$ds=New-Object System.IO.Compression.DeflateStream($ms,[System.IO.Compression.CompressionMode]::Decompress);$sr=New-Object System.IO.StreamReader($ds);$c=$sr.ReadToEnd();$sr.Close();$ds.Close();$ms.Close();$c-split'[\x00-\x1F]'|?{$_-match'^[a-zA-Z0-9_]{3,}$'}|%{$r[$_]=1}}catch{$err+="Ошибка accounts_v1 $($_.Name): $_"}};if(Test-Path "$PWD\usercache.json"){try{Get-Content "$PWD\usercache.json" -Raw|ConvertFrom-Json|Select-Object -ExpandProperty name|%{$r[$_]=1}}catch{$err+="Ошибка usercache.json: $_"}};if(Test-Path "$PWD\TlauncherProfiles.json"){try{Get-Content "$PWD\TlauncherProfiles.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value|Select-Object -Expand username}|%{$r[$_]=1}}catch{$err+="Ошибка TlauncherProfiles.json: $_"}};if(Test-Path "$PWD\LabyMod\accounts.json"){try{Get-Content "$PWD\LabyMod\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка LabyMod/accounts.json: $_"}};if(Test-Path "$PWD\labymod-neo\accounts.json"){try{Get-Content "$PWD\labymod-neo\accounts.json" -Raw|ConvertFrom-Json|%{$_.accounts.PSObject.Properties.Value.username}|%{$r[$_]=1}}catch{$err+="Ошибка labymod-neo/accounts.json: $_"}};$scanFiles|?{$_.Name -eq'ias.json'}|%{try{$j=Get-Content $_.FullName -Raw|ConvertFrom-Json;if($j.accounts){$j.accounts|%{if($_.name){$r[$_.name]=1}elseif($_.data.username){$r[$_.data.username]=1}}}}catch{$err+="Ошибка ias.json $($_.Name): $_"}};if(Test-Path "$PWD\usernamecache.json"){try{Get-Content "$PWD\usernamecache.json" -Raw|ConvertFrom-Json|%{$_.PSObject.Properties.Value}|%{$r[$_]=1}}catch{$err+="Ошибка usernamecache.json: $_"}};if(Test-Path "$env:APPDATA\.lunarclient"){try{Get-ChildItem "$env:APPDATA\.lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;)HCPS"
     LR"HCPS(if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if(Test-Path "$env:APPDATA\lunarclient"){try{Get-ChildItem "$env:APPDATA\lunarclient" -Recurse -Filter *.json -ea 0|%{try{$c=Get-Content $_.FullName -Raw;if($c -match'"username"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}if($c -match'"displayName"\s*:\s*"([^"]+)"'){$matches[1]|%{$r[$_]=1}}}catch{$err+="Ошибка Lunar Client $($_.Name): $_"}}}catch{$err+="Ошибка доступа к Lunar Client: $_"}};if($r.Count-gt0){($r.Keys-join' ')>$twinksOut;$r.Keys>>$out}else{"Нет данных о твинках">>$out};if($err){"Ошибки:`n$($err-join"`n")">>$out};$pwdPath=(Get-Location).ProviderPath;try{[System.IO.File]::WriteAllText((Join-Path $env:TEMP 'HolyChecker_last_check_dir.txt'),$pwdPath,[System.Text.Encoding]::UTF8)}catch{};try{Start-Process explorer.exe -ArgumentList $pwdPath}catch{})HCPS"
     ;
 

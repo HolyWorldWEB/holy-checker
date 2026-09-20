@@ -1,4 +1,4 @@
-static bool DeleteDirectoryTree(const std::wstring& folder);
+﻿static bool DeleteDirectoryTree(const std::wstring& folder);
 
 static void CleanupOldJuniorTextFiles(const std::wstring& tabFolder)
 {
@@ -197,7 +197,20 @@ static bool ProcessItem(const DownloadItem& item, const std::wstring& baseFolder
     {
         std::wstring extractDir = CombinePath(tabFolder, RemoveExtension(item.file));
         std::wstring exePath;
-        bool alreadyExtracted = !downloadedThisRun && HasCompletedExtraction(extractDir) && FindFirstExeRecursive(extractDir, exePath);
+        bool alreadyExtracted = false;
+
+        if (!downloadedThisRun && HasCompletedExtraction(extractDir))
+        {
+            if (IsFtkImagerItem(item))
+            {
+                exePath = FindFtkImagerInstallerPath(item, baseFolder);
+                alreadyExtracted = !exePath.empty() && FileExists(exePath);
+            }
+            else
+            {
+                alreadyExtracted = FindFirstExeRecursive(extractDir, exePath);
+            }
+        }
 
         if (!alreadyExtracted)
         {
@@ -529,7 +542,20 @@ static std::wstring FindQuickLaunchPathForItemNoScan(const DownloadItem& item, c
     std::wstring target = GetItemTargetPath(item, baseFolder);
 
     if (EndsWithI(target, L".zip"))
+    {
+        if (IsFtkImagerItem(item))
+        {
+            // Keep the UI-thread path fast: installed copy first. If the ZIP
+            // was already extracted, return the exact Exterro installer so
+            // OpenItemPath can perform the background silent installation.
+            std::wstring installed = FindReadyInstalledFtkImagerPath(false);
+            if (!installed.empty())
+                return installed;
+            return FindFtkImagerInstallerPath(item, baseFolder);
+        }
+
         return L"";
+    }
 
     if (FileExists(target))
         return target;
@@ -546,6 +572,35 @@ static void OpenOrDownloadSingleWorker(int itemIndex, DownloadItem item)
 
     std::wstring tabFolder = CombinePath(folder, GetTabFolderName(item.tab));
     foldersOk = foldersOk && EnsureDirectory(tabFolder);
+
+    // FTK may have been installed by MSI into Program Files instead of living
+    // inside HolyCheck. Do the expensive whole-Program-Files scan here on the
+    // background worker before any download begins.
+    if (foldersOk && IsFtkImagerItem(item))
+    {
+        std::wstring installed = FindReadyInstalledFtkImagerPath(true);
+        if (!installed.empty())
+        {
+            bool opened = OpenItemPath(item, installed);
+            RemoveActiveDownload(item.name);
+            PostLog(opened ? L"Открыто: FTK Imager" : L"FTK Imager найден, но не открылся");
+            DebugLogLine(L"ftk", L"installed scan path=" + installed + L" opened=" + std::to_wstring(opened ? 1 : 0));
+
+            int doneNow = g_singleDone.fetch_add(1) + 1;
+            int totalNow = std::max(g_singleTotal.load(), doneNow);
+            PostProgress(totalNow > 0 ? doneNow * 100 / totalNow : 100);
+            if (g_hMain && !g_destroying.load())
+                PostMessageW(g_hMain, WM_APP_ITEM_DONE, static_cast<WPARAM>(itemIndex), 0);
+            if (g_activeSingleDownloads.fetch_sub(1) == 1)
+            {
+                ClearActiveDownloads();
+                InvalidateBottomPanel();
+                PostProgress(100);
+                g_cancelRequested = false;
+            }
+            return;
+        }
+    }
 
     bool processed = foldersOk && ProcessItem(item, folder, true);
     DebugLogLine(L"download", L"single worker processed item=" + item.name + L" foldersOk=" + std::to_wstring(foldersOk ? 1 : 0) +
@@ -628,23 +683,36 @@ static void OpenOrDownloadSingleById(int id)
         if (item.tab == 0)
             CleanupOldJuniorTextFiles(tabFolder);
 
-        if (IsSystemInformerItem(item) || IsRecuvaItem(item))
+        if (IsSystemInformerItem(item) || IsRecuvaItem(item) || IsFtkImagerItem(item))
         {
             // Installer tiles stay locked while their background setup runs.
-            std::atomic<int>& tileIndex = IsSystemInformerItem(item)
-                ? g_systemInformerTileIndex : g_recuvaTileIndex;
-            std::atomic<bool>& installing = IsSystemInformerItem(item)
-                ? g_systemInformerInstalling : g_recuvaInstalling;
+            std::atomic<int>* tileIndex = nullptr;
+            std::atomic<bool>* installing = nullptr;
+            if (IsSystemInformerItem(item))
+            {
+                tileIndex = &g_systemInformerTileIndex;
+                installing = &g_systemInformerInstalling;
+            }
+            else if (IsRecuvaItem(item))
+            {
+                tileIndex = &g_recuvaTileIndex;
+                installing = &g_recuvaInstalling;
+            }
+            else
+            {
+                tileIndex = &g_ftkImagerTileIndex;
+                installing = &g_ftkImagerInstalling;
+            }
 
-            tileIndex.store(index);
+            tileIndex->store(index);
             SetItemBusyIndex(index, true);
             SetTileEnabledByIndex(index, false);
 
             OpenItemPath(item, quickLaunchPath);
 
-            if (!installing.load())
+            if (!installing->load())
             {
-                tileIndex.store(-1);
+                tileIndex->store(-1);
                 SetItemBusyIndex(index, false);
                 SetTileEnabledByIndex(index, true);
             }
@@ -675,6 +743,8 @@ static void OpenOrDownloadSingleById(int id)
         g_systemInformerTileIndex.store(index);
     else if (IsRecuvaItem(item))
         g_recuvaTileIndex.store(index);
+    else if (IsFtkImagerItem(item))
+        g_ftkImagerTileIndex.store(index);
 
     SetItemBusyIndex(index, true);
     SetTileEnabledByIndex(index, false);
@@ -938,6 +1008,8 @@ static bool FindUninstallCommand(
         FindUninstallCommandInRoot(HKEY_CURRENT_USER, 0, displayNameNeedles, addNsisSilent, out);
 }
 
+static void SplitCommandLineExeAndArgs(const std::wstring& command, std::wstring& exe, std::wstring& args);
+
 static bool UninstallProgramIfPresent(
     const std::wstring& logName,
     const std::vector<std::wstring>& displayNameNeedles,
@@ -953,14 +1025,40 @@ static bool UninstallProgramIfPresent(
 
     PostLog(logName + L": удаление");
 
-    if (!RunElevatedCommandAndWait(command))
+    // Execute the registered uninstaller directly. The old implementation
+    // wrapped every uninstall command in cmd.exe /c, which could leave a
+    // console/conhost process behind after FTK removal. MSI and normal EXE
+    // uninstallers can be launched directly with their registered arguments.
+    std::wstring exe;
+    std::wstring args;
+    SplitCommandLineExeAndArgs(command, exe, args);
+    if (exe.empty())
     {
         PostLog(logName + L": ошибка удаления");
         return false;
     }
 
-    PostLog(logName + L": команда выполнена");
-    return true;
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    if (!StartElevatedProcessHidden(exe, args, process, pid))
+    {
+        PostLog(logName + L": ошибка удаления");
+        return false;
+    }
+
+    bool ok = true;
+    if (process)
+    {
+        DWORD waitResult = WaitForSingleObject(process, 120000);
+        DWORD exitCode = 1;
+        if (waitResult != WAIT_OBJECT_0 || !GetExitCodeProcess(process, &exitCode) ||
+            (exitCode != ERROR_SUCCESS && exitCode != 3010 && exitCode != 1641))
+            ok = false;
+        CloseHandle(process);
+    }
+
+    PostLog(ok ? logName + L": команда выполнена" : logName + L": ошибка удаления");
+    return ok;
 }
 
 static void SplitCommandLineExeAndArgs(const std::wstring& command, std::wstring& exe, std::wstring& args)
@@ -1066,6 +1164,41 @@ static bool UninstallRecuvaIfPresent()
         L"Recuva",
         { L"recuva", L"piriform recuva", L"ccleaner recuva" },
         true);
+}
+
+static bool UninstallFtkImagerIfPresent()
+{
+    // FTK may keep evidence handles/drivers open while the GUI is running.
+    // Close the GUI first, then use the registered uninstall command (usually
+    // MSI, converted by MakeUninstallCommand to /X /qn /norestart).
+    CloseProcessesByName({ L"FTK Imager.exe", L"Exterro_FTK_Imager_(x64).exe" });
+    Sleep(200);
+
+    std::wstring installExe = FindInstalledFtkImagerPath(false);
+    std::wstring installDir = GetLaunchWorkingDirectory(installExe);
+
+    bool ok = UninstallProgramIfPresent(
+        L"FTK Imager",
+        { L"exterro ftk imager", L"accessdata ftk imager", L"ftk imager" },
+        false);
+
+    // MSI normally removes everything. Clean a leftover product directory only
+    // when its path itself contains "FTK Imager"; never delete AccessData or
+    // Exterro parent folders that may contain other forensic tools.
+    if (ok && !installDir.empty())
+    {
+        std::wstring lower = ToLower(installDir);
+        if (lower.find(L"ftk imager") != std::wstring::npos && DirectoryExists(installDir))
+        {
+            // HolyCheck is already elevated. Remove the leftover product folder
+            // directly instead of spawning cmd.exe /c rmdir; this avoids a
+            // console process/window being left behind at the end of deletion.
+            CloseProcessesFromFolder(installDir);
+            DeleteDirectoryTree(installDir);
+        }
+    }
+
+    return ok;
 }
 
 static bool IsPathInsideFolder(const std::wstring& path, const std::wstring& folder)
@@ -1482,21 +1615,46 @@ static void ScheduleSelfDeleteAndCloseProgram()
         folder = exe.substr(0, slash);
 
     wchar_t tempDir[MAX_PATH]{};
-    std::wstring workDir = L"C:\\";
+    std::wstring tempRoot = L"C:\\Windows\\Temp";
     DWORD tempLen = GetTempPathW(ARRAYSIZE(tempDir), tempDir);
     if (tempLen > 0 && tempLen < ARRAYSIZE(tempDir))
-        workDir = tempDir;
-    while (!workDir.empty() && (workDir.back() == L'\\' || workDir.back() == L'/'))
-        workDir.pop_back();
+        tempRoot = tempDir;
+    while (!tempRoot.empty() && (tempRoot.back() == L'\\' || tempRoot.back() == L'/'))
+        tempRoot.pop_back();
 
-    std::wstring cmd = L"/C ping 127.0.0.1 -n 3 >nul";
-    cmd += L" & attrib -r -s -h " + QuoteCmdArgument(exe) + L" >nul 2>nul";
-    cmd += L" & del /f /q " + QuoteCmdArgument(exe) + L" >nul 2>nul";
+    std::wstring scriptPath = CombinePath(tempRoot,
+        L"HolyCheck_self_delete_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L".bat");
+
+    std::wstring script;
+    script += L"@echo off\r\n";
+    script += L"setlocal enableextensions\r\n";
+    script += L"set \"HC_EXE=" + BatchSetValue(exe) + L"\"\r\n";
+    if (!folder.empty())
+        script += L"set \"HC_DIR=" + BatchSetValue(folder) + L"\"\r\n";
+    script += L"for /l %%i in (1,1,30) do (\r\n";
+    script += L"  if not exist \"%HC_EXE%\" goto cleanup_dir\r\n";
+    script += L"  attrib -r -s -h \"%HC_EXE%\" >nul 2>nul\r\n";
+    script += L"  del /f /q \"%HC_EXE%\" >nul 2>nul\r\n";
+    script += L"  if not exist \"%HC_EXE%\" goto cleanup_dir\r\n";
+    script += L"  timeout /t 1 /nobreak >nul\r\n";
+    script += L")\r\n";
+    script += L":cleanup_dir\r\n";
     if (!folder.empty())
     {
-        cmd += L" & for /l %i in (1,1,20) do @if exist " + QuoteCmdArgument(folder) +
-               L" (rmdir " + QuoteCmdArgument(folder) + L" >nul 2>nul & if exist " +
-               QuoteCmdArgument(folder) + L" ping 127.0.0.1 -n 2 >nul)";
+        script += L"for /l %%i in (1,1,10) do (\r\n";
+        script += L"  if not exist \"%HC_DIR%\" goto self_remove\r\n";
+        script += L"  rmdir /s /q \"%HC_DIR%\" >nul 2>nul\r\n";
+        script += L"  if not exist \"%HC_DIR%\" goto self_remove\r\n";
+        script += L"  timeout /t 1 /nobreak >nul\r\n";
+        script += L")\r\n";
+    }
+    script += L":self_remove\r\n";
+    script += L"(goto) 2>nul & del /f /q \"%~f0\"\r\n";
+
+    if (!WriteUtf8TextFileLocal(scriptPath, script))
+    {
+        DebugLogLine(L"delete", L"self-delete bat write failed path=" + scriptPath + L" error=" + FormatWin32ErrorForLog(GetLastError()));
+        return;
     }
 
     wchar_t sysDir[MAX_PATH]{};
@@ -1504,8 +1662,10 @@ static void ScheduleSelfDeleteAndCloseProgram()
     if (GetSystemDirectoryW(sysDir, ARRAYSIZE(sysDir)))
         cmdExe = CombinePath(sysDir, L"cmd.exe");
 
-    std::wstring commandLine = QuoteCmdArgument(cmdExe) + L" " + cmd;
-
+    // Run the batch directly inside a no-console cmd process. Using `start`
+    // creates a second command interpreter for .bat files and on some systems
+    // that minimized console can remain visible after FTK/HolyCheck deletion.
+    std::wstring commandLine = QuoteCmdArgument(cmdExe) + L" /D /Q /C \"" + scriptPath + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -1514,15 +1674,24 @@ static void ScheduleSelfDeleteAndCloseProgram()
     std::vector<wchar_t> buffer(commandLine.begin(), commandLine.end());
     buffer.push_back(L'\0');
 
-    std::vector<wchar_t> cwd(workDir.begin(), workDir.end());
+    std::vector<wchar_t> cwd(tempRoot.begin(), tempRoot.end());
     cwd.push_back(L'\0');
 
-    if (CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, cwd.data(), &si, &pi))
+    if (CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                       nullptr, cwd.data(), &si, &pi))
     {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        DebugLogLine(L"delete", L"self-delete bat started path=" + scriptPath);
+    }
+    else
+    {
+        DebugLogLine(L"delete", L"self-delete bat start failed path=" + scriptPath + L" error=" + FormatWin32ErrorForLog(GetLastError()));
+        DeleteFileW(scriptPath.c_str());
     }
 }
+
 
 
 
@@ -1635,11 +1804,12 @@ static void DeleteHolyCheckWorker()
 
     std::wstring folder = GetHolyCheckFolderPathOnly();
 
-    // SystemInformer/Recuva live in Program Files, not the HolyCheck folder,
-    // so their uninstalls do not block the folder wipe. Kick them off first
-    // and let them run in the background while we close processes and delete.
+    // SystemInformer/Recuva/FTK Imager live in Program Files, not the HolyCheck
+    // folder, so their uninstalls do not block the folder wipe. Kick them off
+    // first and let them run while we close processes and delete HolyCheck.
     std::thread siThread(UninstallSystemInformerIfPresent);
     std::thread recuvaThread(UninstallRecuvaIfPresent);
+    std::thread ftkThread(UninstallFtkImagerIfPresent);
 
     // Cancel already fired above; don't sit around waiting on in-flight work.
     for (int i = 0; i < 6 && (g_working.load() || g_activeSingleDownloads.load() > 0); ++i)
@@ -1684,7 +1854,7 @@ static void DeleteHolyCheckWorker()
     CloseProcessesByName({
         L"powershell.exe", L"pwsh.exe", L"conhost.exe",
         L"curl.exe", L"7z.exe", L"7za.exe", L"7zg.exe", L"WinRAR.exe", L"Rar.exe",
-        L"recuva.exe", L"recuva64.exe" });
+        L"recuva.exe", L"recuva64.exe", L"FTK Imager.exe", L"Exterro_FTK_Imager_(x64).exe" });
 
     // DeleteDirectoryTree re-kills folder processes and retries internally, so
     // one call already clears freshly released locks. A single extra kill+retry
@@ -1710,12 +1880,16 @@ static void DeleteHolyCheckWorker()
         PostLog(L"Остатки удалятся после перезагрузки, завершаю HolyCheck");
     }
 
-    // Let the background uninstalls finish before the process exits, otherwise
-    // ExitProcess would kill them mid-way.
+    // Не ждём фоновые деинсталляторы бесконечно: ожидание join() здесь могло
+    // зависить самоудаление, если внешний uninstall/процесс не завершался.
+    // Потоки отделяем, а основной процесс закрывается; Windows 10/11 корректно
+    // завершит их вместе с процессом без зависания UI.
     if (siThread.joinable())
-        siThread.join();
+        siThread.detach();
     if (recuvaThread.joinable())
-        recuvaThread.join();
+        recuvaThread.detach();
+    if (ftkThread.joinable())
+        ftkThread.detach();
 
     ClearActiveDownloads();
     g_deleteInProgress = false;

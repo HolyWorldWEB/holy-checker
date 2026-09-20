@@ -1,4 +1,4 @@
-#ifndef UNICODE
+﻿#ifndef UNICODE
 #define UNICODE
 #endif
 
@@ -137,6 +137,7 @@ using namespace Gdiplus;
 
 #define TIMER_PARTICLES     9001
 #define TIMER_AUTOSTART_SCANS 9002
+#define PARTICLE_FRAME_MS     33 // about 30 FPS for the background animation
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -295,7 +296,7 @@ HWND g_hAutomationBamUnsignedOnly = nullptr;
 HWND g_hAutomationJarPage = nullptr;
 
 // --- Вкладка "file check" (page 5): кнопки, буферы вывода и флаг работы ---
-HWND g_hFileCheckScan = nullptr;   // кнопка запуска сканирования файлов
+HWND g_hFileCheckScan = nullptr;   // кнопка запуска сканирования ф��йлов
 HWND g_hClipShow = nullptr;        // кнопка "показать текущий текст буфера"
 HWND g_hClipProc = nullptr;        // кнопка "процессы cbdhsvc"
 std::vector<std::wstring> g_fileCheckLines;   // строки результатов file check
@@ -332,6 +333,11 @@ std::vector<Particle> g_particles;
 std::vector<Star> g_staticStars;
 std::vector<Comet> g_comets;
 ULONGLONG g_lastCometSpawn = 0;
+HDC g_sceneBufferDc = nullptr;
+HBITMAP g_sceneBufferBitmap = nullptr;
+HGDIOBJ g_sceneBufferOldBitmap = nullptr;
+int g_sceneBufferWidth = 0;
+int g_sceneBufferHeight = 0;
 
 std::atomic_bool g_working(false);
 std::atomic_bool g_cancelRequested(false);
@@ -465,6 +471,8 @@ std::atomic<bool> g_systemInformerInstalling(false);
 std::atomic<int> g_systemInformerTileIndex(-1);
 std::atomic<bool> g_recuvaInstalling(false);
 std::atomic<int> g_recuvaTileIndex(-1);
+std::atomic<bool> g_ftkImagerInstalling(false);
+std::atomic<int> g_ftkImagerTileIndex(-1);
 int g_logScrollOffset = 0;
 int g_bamScrollOffset = 0;
 int g_eventVwrScrollOffset = 0;
@@ -733,12 +741,14 @@ static RECT MakeAutomationPanelRect(const RECT& rc, int top, int height)
     return out;
 }
 
+static RECT MakePage3PanelRect(const RECT& rc, int index);
+
 static RECT GetAutomationServicesPanelRect(const RECT& rc)
 {
     RECT out{};
     out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
     out.left = out.right - AUTOMATION_SERVICE_PANEL_W;
-    out.bottom = rc.bottom - 68;
+    out.bottom = rc.bottom - 48;
     out.top = out.bottom - AUTOMATION_SERVICE_PANEL_H;
 
     if (out.top < 470)
@@ -765,39 +775,19 @@ static int GetAutomationMainPanelRight(const RECT& rc)
     return right;
 }
 
+// Вкладка check использует ту же вертикальную сетку и ту же область, что dll | jar:
+// верхняя половина — checkmods, нижняя половина — eventvwr + службы/Вкл ПК.
 static RECT GetAutomationBamPanelRect(const RECT& rc)
 {
-    const int top = 64;
-    const int gap = 10;
-    const int bottomLimit = rc.bottom - 68;
-    const int totalH = std::max<int>(260, bottomLimit - top);
-    const int bamH = std::max<int>(190, ((totalH - gap) * 3) / 5);
-
-    RECT out{};
-    out.left = AUTOMATION_PANEL_X;
-    out.top = top;
-    // checkmods занимает всю доступную ширину окна. Службы остаются внизу и
-    // больше не ограничивают правый край верхней таблицы.
-    out.right = rc.right - AUTOMATION_SERVICE_PANEL_MARGIN;
-    if (out.right - out.left < 360)
-        out.right = out.left + 360;
-    out.bottom = out.top + bamH;
-    return out;
+    return MakePage3PanelRect(rc, 0);
 }
 
 static RECT GetAutomationEventPanelRect(const RECT& rc)
 {
-    RECT bam = GetAutomationBamPanelRect(rc);
-    const int top = bam.bottom + 10;
-    const int bottomLimit = rc.bottom - 68;
-
-    RECT out{};
-    out.left = AUTOMATION_PANEL_X;
-    out.top = top;
+    RECT out = MakePage3PanelRect(rc, 1);
     out.right = GetAutomationMainPanelRight(rc);
     if (out.right - out.left < 360)
         out.right = out.left + 360;
-    out.bottom = std::max<int>(out.top + 150, bottomLimit);
     return out;
 }
 
@@ -1026,6 +1016,6 @@ static std::vector<DownloadItem> g_items =
     { L"AlternateStreamView",  L"https://www.nirsoft.net/utils/alternatestreamview-x64.zip", L"alternatestreamview-x64.zip", 3 },
     { L"WinDefLogView",        L"https://www.nirsoft.net/utils/windeflogview.zip", L"windeflogview.zip", 3 },
     { L"VolatilityWorkbench",  L"https://www.osforensics.com/downloads/VolatilityWorkbench.zip", L"VolatilityWorkbench.zip", 3 },
-    { L"KernelLiveDumpTool",   L"https://github.com/spokwn/KernelLiveDumpTool/releases/download/v1.1/KernelLiveDumpTool.exe", L"KernelLiveDumpTool.exe", 3 }
+    { L"KernelLiveDumpTool",   L"https://github.com/spokwn/KernelLiveDumpTool/releases/download/v1.1/KernelLiveDumpTool.exe", L"KernelLiveDumpTool.exe", 3 },
+    { L"FTK Imager",           L"https://github.com/HolyWorldWEB/holy-checker/releases/download/v1.0.1/FTK.Imager.8.3.0.27.zip", L"FTK.Imager.8.3.0.27.zip", 3 }
 };
-
